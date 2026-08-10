@@ -848,6 +848,25 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "validation": {"min": 1, "max": 500},
         "display_order": 19,
     },
+    "CN_QUANT_DATA_MODE": {
+        "title": "A-share Quant Data Mode",
+        "description": "Optional domestic quant research route. akshare_baostock uses AkShare as the primary A-share daily K-line provider and validates adjusted prices with Baostock without blocking fallback.",
+        "category": "data_source",
+        "data_type": "string",
+        "ui_control": "select",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "",
+        "options": ["", "akshare_baostock"],
+        "validation": {"enum": ["", "akshare_baostock"]},
+        "display_order": 20,
+        "help_key": "settings.data_source.CN_QUANT_DATA_MODE",
+        "examples": [
+            "CN_QUANT_DATA_MODE=akshare_baostock",
+        ],
+        "warning_codes": [],
+    },
     "STOCK_INDEX_REMOTE_UPDATE_ENABLED": {
         "title": "Remote Stock Index Updates",
         "description": "Automatically refresh the local stock autocomplete index from the built-in GitHub main source.",
@@ -4622,6 +4641,11 @@ _FIELD_HELP_METADATA: Dict[str, Dict[str, Any]] = {
     "TICKFLOW_BATCH_SIZE": {
         "help_key": "settings.data_source.TICKFLOW_BATCH_SIZE",
         "examples": ["TICKFLOW_BATCH_SIZE=100"],
+        "docs": _DOC_FULL_GUIDE_DATA_SOURCE,
+    },
+    "CN_QUANT_DATA_MODE": {
+        "help_key": "settings.data_source.CN_QUANT_DATA_MODE",
+        "examples": ["CN_QUANT_DATA_MODE=akshare_baostock"],
         "docs": _DOC_FULL_GUIDE_DATA_SOURCE,
     },
     "SERPAPI_API_KEYS": {

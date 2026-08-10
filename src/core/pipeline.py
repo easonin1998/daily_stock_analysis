@@ -391,6 +391,17 @@ class StockAnalysisPipeline:
             if df is None or df.empty:
                 return False, "获取数据为空"
 
+            source_validation = getattr(df, "attrs", {}).get("source_validation")
+            if isinstance(source_validation, dict):
+                logger.info(
+                    "%s(%s) 日线数据校验: mode=%s status=%s validator=%s",
+                    stock_name,
+                    code,
+                    source_validation.get("mode"),
+                    source_validation.get("status"),
+                    source_validation.get("validator"),
+                )
+
             # 保存到数据库
             saved_count = self.db.save_daily_data(df, code, source_name)
             logger.info(f"{stock_name}({code}) 数据保存成功（来源: {source_name}，新增 {saved_count} 条）")
@@ -684,6 +695,10 @@ class StockAnalysisPipeline:
                     'today': {},
                     'yesterday': {}
                 }
+
+            daily_source_validation = self.fetcher_manager.get_daily_source_validation(code)
+            if isinstance(daily_source_validation, dict):
+                context["daily_source_validation"] = daily_source_validation
             
             # Step 6: 增强上下文数据（添加实时行情、筹码、趋势分析结果、股票名称）
             enhanced_context = self._enhance_context(

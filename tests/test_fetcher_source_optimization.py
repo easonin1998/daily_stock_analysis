@@ -62,21 +62,23 @@ def _make_quote(code: str = "AAPL") -> UnifiedRealtimeQuote:
     )
 
 
-def _make_daily_df() -> pd.DataFrame:
-    return pd.DataFrame(
-        [
+def _make_daily_df(rows: int = 1) -> pd.DataFrame:
+    data = []
+    for index in range(rows):
+        close = 101.0 + index
+        data.append(
             {
-                "date": "2026-05-01",
-                "open": 100.0,
-                "high": 102.0,
-                "low": 99.0,
-                "close": 101.0,
-                "volume": 1000,
-                "amount": 101000.0,
+                "date": f"2026-05-0{index + 1}",
+                "open": 100.0 + index,
+                "high": 102.0 + index,
+                "low": 99.0 + index,
+                "close": close,
+                "volume": 1000 + index,
+                "amount": close * 1000,
                 "pct_chg": 1.0,
             }
-        ]
-    )
+        )
+    return pd.DataFrame(data)
 
 
 class TestFetcherSourceOptimization(unittest.TestCase):
@@ -191,6 +193,85 @@ class TestFetcherSourceOptimization(unittest.TestCase):
             efinance.get_daily_data.assert_called_once()
             akshare.get_daily_data.assert_called_once()
             tencent.get_daily_data.assert_not_called()
+        finally:
+            DataFetcherManager.reset_daily_source_health()
+
+    @patch("src.config.get_config")
+    def test_cn_quant_mode_prioritizes_akshare_and_validates_with_baostock(self, mock_get_config):
+        mock_get_config.return_value = SimpleNamespace(cn_quant_data_mode="akshare_baostock")
+        DataFetcherManager.reset_daily_source_health()
+        try:
+            efinance = MagicMock()
+            efinance.name = "EfinanceFetcher"
+            efinance.priority = 0
+            efinance.get_daily_data.return_value = _make_daily_df(rows=3)
+
+            akshare = MagicMock()
+            akshare.name = "AkshareFetcher"
+            akshare.priority = 1
+            akshare.get_daily_data.return_value = _make_daily_df(rows=3)
+
+            baostock = MagicMock()
+            baostock.name = "BaostockFetcher"
+            baostock.priority = 3
+            baostock.get_daily_data.return_value = _make_daily_df(rows=3)
+
+            manager = DataFetcherManager(fetchers=[efinance, baostock, akshare])
+            df, source = manager.get_daily_data(
+                "000001",
+                start_date="2026-05-01",
+                end_date="2026-05-03",
+            )
+
+            self.assertFalse(df.empty)
+            self.assertEqual(source, "AkshareFetcher")
+            efinance.get_daily_data.assert_not_called()
+            akshare.get_daily_data.assert_called_once()
+            baostock.get_daily_data.assert_called_once()
+            validation = manager.get_daily_source_validation("000001")
+            self.assertIsNotNone(validation)
+            self.assertEqual(validation["status"], "ok")
+            self.assertEqual(validation["primary"], "AkshareFetcher")
+            self.assertEqual(validation["validator"], "BaostockFetcher")
+        finally:
+            DataFetcherManager.reset_daily_source_health()
+
+    @patch("src.config.get_config")
+    def test_cn_quant_mode_validation_fail_open_on_baostock_error(self, mock_get_config):
+        mock_get_config.return_value = SimpleNamespace(cn_quant_data_mode="akshare_baostock")
+        DataFetcherManager.reset_daily_source_health()
+        try:
+            akshare = MagicMock()
+            akshare.name = "AkshareFetcher"
+            akshare.priority = 1
+            akshare.get_daily_data.return_value = _make_daily_df(rows=3)
+
+            baostock = MagicMock()
+            baostock.name = "BaostockFetcher"
+            baostock.priority = 3
+            baostock.get_daily_data.side_effect = RuntimeError("baostock timeout")
+
+            tencent = MagicMock()
+            tencent.name = "TencentFetcher"
+            tencent.priority = 5
+            tencent.get_daily_data.return_value = _make_daily_df(rows=3)
+
+            manager = DataFetcherManager(fetchers=[tencent, baostock, akshare])
+            df, source = manager.get_daily_data(
+                "000001",
+                start_date="2026-05-01",
+                end_date="2026-05-03",
+            )
+
+            self.assertFalse(df.empty)
+            self.assertEqual(source, "AkshareFetcher")
+            akshare.get_daily_data.assert_called_once()
+            baostock.get_daily_data.assert_called_once()
+            tencent.get_daily_data.assert_not_called()
+            validation = manager.get_daily_source_validation("000001")
+            self.assertIsNotNone(validation)
+            self.assertEqual(validation["status"], "failed")
+            self.assertEqual(validation["error_type"], "RuntimeError")
         finally:
             DataFetcherManager.reset_daily_source_health()
 

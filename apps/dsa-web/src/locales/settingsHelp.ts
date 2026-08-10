@@ -316,6 +316,14 @@ const settingsHelpZhCN: SettingsHelpMap = {
     impact: ['影响 TickFlow 批量预取的请求次数和单次请求压力。'],
     notes: ['该配置仅影响 TickFlow 批量路径。'],
   },
+  'settings.data_source.CN_QUANT_DATA_MODE': {
+    title: 'A 股量化数据模式',
+    summary: '控制国内量化研究的 A 股日线取数链路。',
+    usage: '留空表示使用默认优先级；设为 akshare_baostock 时，A 股日线优先使用 AkShare，并用 Baostock 校验前复权数据。',
+    valueNotes: ['当前支持 akshare_baostock；Baostock 校验失败或不可用时会记录状态并继续分析。'],
+    impact: ['影响 A 股日线历史行情来源和数据质量上下文；实时行情仍由 REALTIME_SOURCE_PRIORITY 控制。'],
+    notes: ['适合希望用 AkShare 获取全面行情、再用 Baostock 做复权与行情一致性校验的国内量化研究场景。'],
+  },
   'settings.data_source.stock_index_remote': {
     title: '股票索引远程更新',
     summary: '从 GitHub main 分支获取最新股票自动补全索引，并缓存到本地。',
@@ -1513,6 +1521,14 @@ const settingsHelpEnUS: SettingsHelpMap = {
     valueNotes: ['Very large batches may hit plan or server limits; the default is usually appropriate.'],
     impact: ['Affects request count and per-request pressure for TickFlow batch prefetch.'],
     notes: ['This setting only affects TickFlow batch paths.'],
+  },
+  'settings.data_source.CN_QUANT_DATA_MODE': {
+    title: 'A-share Quant Data Mode',
+    summary: 'Controls the A-share daily-data route for domestic quant research.',
+    usage: 'Leave empty to use the default priority chain. Set akshare_baostock to fetch A-share daily K-lines from AkShare first and validate front-adjusted bars with Baostock.',
+    valueNotes: ['Currently supports akshare_baostock. Baostock validation failures are recorded but do not block analysis.'],
+    impact: ['Affects A-share historical daily-data sourcing and data-quality context. Realtime quotes still follow REALTIME_SOURCE_PRIORITY.'],
+    notes: ['Use this when you want AkShare for broad market coverage plus Baostock as an adjusted-data consistency check.'],
   },
   'settings.data_source.stock_index_remote': {
     title: 'Remote Stock Index',

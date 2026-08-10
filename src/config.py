@@ -101,6 +101,18 @@ _FALSEY_ENV_VALUES = {"0", "false", "no", "off"}
 PROMPT_CACHE_DIAGNOSTICS_LEVELS = {"off", "basic", "debug"}
 SUPPORTED_AGENT_BACKENDS = {"auto", "litellm", "codex_app_server"}
 TICKFLOW_KLINE_ADJUST_VALUES = {"none", "forward", "backward", "forward_additive", "backward_additive"}
+CN_QUANT_DATA_MODE_AKSHARE_BAOSTOCK = "akshare_baostock"
+CN_QUANT_DATA_MODE_ALIASES = {
+    "",
+    "0",
+    "false",
+    "none",
+    "off",
+    CN_QUANT_DATA_MODE_AKSHARE_BAOSTOCK,
+    "akshare+baostock",
+    "akshare-baostock",
+    "akshare_baostock",
+}
 # Fallback defaults used when ANSPIRE_API_KEYS is reused as legacy OpenAI-compatible source.
 # These are compatibility examples; actual availability should be validated by Anspire console/model entitlement.
 ANSPIRE_LLM_BASE_URL_DEFAULT = "https://open-gateway.anspire.cn/v6"
@@ -142,6 +154,20 @@ def normalize_tickflow_kline_adjust(value: Optional[str]) -> str:
         value,
     )
     return "none"
+
+
+def normalize_cn_quant_data_mode(value: Optional[str]) -> str:
+    """Normalize optional A-share quant research data-source mode."""
+    normalized = (value or "").strip().lower()
+    if normalized not in CN_QUANT_DATA_MODE_ALIASES:
+        logger.warning(
+            "Invalid CN_QUANT_DATA_MODE=%r; falling back to off",
+            value,
+        )
+        return ""
+    if normalized in {"", "0", "false", "none", "off"}:
+        return ""
+    return CN_QUANT_DATA_MODE_AKSHARE_BAOSTOCK
 
 
 def parse_prompt_cache_diagnostics_level(value: Optional[str]) -> str:
@@ -721,6 +747,7 @@ class Config:
     tickflow_priority: int = 2
     tickflow_batch_daily_enabled: bool = True
     tickflow_batch_size: int = 100
+    cn_quant_data_mode: str = ""
     finnhub_api_key: Optional[str] = None
     alphavantage_api_key: Optional[str] = None
     longbridge_app_key: Optional[str] = None
@@ -1628,6 +1655,7 @@ class Config:
             tickflow_priority=parse_env_int(os.getenv('TICKFLOW_PRIORITY'), 2, field_name='TICKFLOW_PRIORITY', minimum=0),
             tickflow_batch_daily_enabled=parse_env_bool(os.getenv('TICKFLOW_BATCH_DAILY_ENABLED'), default=True),
             tickflow_batch_size=parse_env_int(os.getenv('TICKFLOW_BATCH_SIZE'), 100, field_name='TICKFLOW_BATCH_SIZE', minimum=1),
+            cn_quant_data_mode=normalize_cn_quant_data_mode(os.getenv('CN_QUANT_DATA_MODE')),
             finnhub_api_key=os.getenv('FINNHUB_API_KEY') or None,
             alphavantage_api_key=os.getenv('ALPHAVANTAGE_API_KEY') or None,
             longbridge_app_key=os.getenv('LONGBRIDGE_APP_KEY') or None,

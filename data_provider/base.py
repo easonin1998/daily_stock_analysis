@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 # === 标准化列名定义 ===
 STANDARD_COLUMNS = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']
+CN_QUANT_DATA_MODE_AKSHARE_BAOSTOCK = "akshare_baostock"
 
 
 def unwrap_exception(exc: Exception) -> Exception:
@@ -629,6 +630,14 @@ class DataFetcherManager:
         "AlphaVantageFetcher": {"us"},
     }
     _daily_source_health = CircuitBreaker(failure_threshold=3, cooldown_seconds=300.0)
+    _CN_QUANT_AKSHARE_BAOSTOCK_ORDER = (
+        "AkshareFetcher",
+        "BaostockFetcher",
+        "PytdxFetcher",
+        "TencentFetcher",
+        "EfinanceFetcher",
+        "YfinanceFetcher",
+    )
     _CONCEPT_RANKINGS_CACHE_TTL_SECONDS = 300.0
     _CONCEPT_RANKINGS_EMPTY_CACHE_TTL_SECONDS = 30.0
     _concept_rankings_cache_lock = RLock()
@@ -648,6 +657,8 @@ class DataFetcherManager:
         self._fetcher_call_locks_lock = RLock()
         self._stock_name_cache: Dict[str, str] = {}
         self._stock_name_cache_lock = RLock()
+        self._daily_validation_results: Dict[str, Dict[str, Any]] = {}
+        self._daily_validation_results_lock = RLock()
         
         if fetchers:
             # 按优先级排序
@@ -680,6 +691,10 @@ class DataFetcherManager:
             self._stock_name_cache = {}
         if not hasattr(self, "_stock_name_cache_lock") or self._stock_name_cache_lock is None:
             self._stock_name_cache_lock = RLock()
+        if not hasattr(self, "_daily_validation_results") or self._daily_validation_results is None:
+            self._daily_validation_results = {}
+        if not hasattr(self, "_daily_validation_results_lock") or self._daily_validation_results_lock is None:
+            self._daily_validation_results_lock = RLock()
 
     def _get_fetchers_snapshot(self) -> List[BaseFetcher]:
         self._ensure_concurrency_guards()
@@ -746,6 +761,18 @@ class DataFetcherManager:
         method = getattr(fetcher, method_name)
         with self._get_fetcher_call_lock(fetcher):
             return method(*args, **kwargs)
+
+    @classmethod
+    def _order_fetchers_by_name(
+        cls,
+        fetchers: List[BaseFetcher],
+        preferred_order: Tuple[str, ...],
+    ) -> List[BaseFetcher]:
+        rank = {name: index for index, name in enumerate(preferred_order)}
+        return sorted(
+            fetchers,
+            key=lambda fetcher: (rank.get(fetcher.name, len(rank)), fetcher.priority),
+        )
 
     @classmethod
     def _filter_daily_fetchers_for_market(
@@ -846,6 +873,246 @@ class DataFetcherManager:
         with self._stock_name_cache_lock:
             self._stock_name_cache[stock_code] = name
         return name
+
+    def _set_daily_source_validation(self, stock_code: str, validation: Dict[str, Any]) -> None:
+        self._ensure_concurrency_guards()
+        normalized_code = normalize_stock_code(stock_code)
+        with self._daily_validation_results_lock:
+            self._daily_validation_results[normalized_code] = dict(validation)
+
+    def _clear_daily_source_validation(self, stock_code: str) -> None:
+        self._ensure_concurrency_guards()
+        normalized_code = normalize_stock_code(stock_code)
+        with self._daily_validation_results_lock:
+            self._daily_validation_results.pop(normalized_code, None)
+
+    def get_daily_source_validation(self, stock_code: str) -> Optional[Dict[str, Any]]:
+        """Return the latest fail-open daily-source validation result for a stock."""
+        self._ensure_concurrency_guards()
+        normalized_code = normalize_stock_code(stock_code)
+        with self._daily_validation_results_lock:
+            validation = self._daily_validation_results.get(normalized_code)
+            return dict(validation) if isinstance(validation, dict) else None
+
+    def _apply_cn_quant_daily_validation(
+        self,
+        stock_code: str,
+        primary_df: pd.DataFrame,
+        primary_fetcher: BaseFetcher,
+        routed_fetchers: List[BaseFetcher],
+        start_date: Optional[str],
+        end_date: Optional[str],
+        days: int,
+    ) -> pd.DataFrame:
+        if primary_fetcher.name != "AkshareFetcher":
+            return primary_df
+
+        validator = next(
+            (fetcher for fetcher in routed_fetchers if fetcher.name == "BaostockFetcher"),
+            None,
+        )
+        if validator is None:
+            validator = self._get_fetcher_by_name("BaostockFetcher", capability="daily_data")
+
+        validation: Dict[str, Any] = {
+            "mode": CN_QUANT_DATA_MODE_AKSHARE_BAOSTOCK,
+            "primary": primary_fetcher.name,
+            "validator": "BaostockFetcher",
+            "status": "skipped",
+            "warnings": [],
+        }
+
+        if validator is None or not self._is_daily_source_available(validator, "cn"):
+            validation["reason"] = "validator_unavailable"
+            primary_df.attrs["source_validation"] = validation
+            self._set_daily_source_validation(stock_code, validation)
+            logger.warning(
+                "[cn_quant] %s AkShare daily data validation skipped: Baostock unavailable",
+                stock_code,
+            )
+            return primary_df
+
+        validation_start, validation_end = self._derive_daily_validation_range(
+            primary_df,
+            start_date,
+            end_date,
+        )
+
+        try:
+            validator_df = self._call_fetcher_method(
+                validator,
+                "get_daily_data",
+                stock_code=stock_code,
+                start_date=validation_start,
+                end_date=validation_end,
+                days=days,
+            )
+            validation = self._validate_daily_bars_against_baostock(
+                primary_df,
+                validator_df,
+                primary=primary_fetcher.name,
+                validator=validator.name,
+            )
+        except Exception as exc:
+            error_type, error_reason = summarize_exception(exc)
+            validation.update(
+                {
+                    "status": "failed",
+                    "error_type": error_type,
+                    "reason": error_reason,
+                }
+            )
+            logger.warning(
+                "[cn_quant] %s AkShare daily data validation failed open via Baostock: %s",
+                stock_code,
+                error_reason,
+            )
+
+        primary_df.attrs["data_source_mode"] = CN_QUANT_DATA_MODE_AKSHARE_BAOSTOCK
+        primary_df.attrs["source_validation"] = validation
+        self._set_daily_source_validation(stock_code, validation)
+
+        if validation.get("status") == "ok":
+            logger.info(
+                "[cn_quant] %s AkShare daily data validated by Baostock: overlap=%s latest=%s",
+                stock_code,
+                validation.get("overlap_rows"),
+                validation.get("latest_date"),
+            )
+        else:
+            logger.warning(
+                "[cn_quant] %s AkShare daily data validation status=%s warnings=%s",
+                stock_code,
+                validation.get("status"),
+                validation.get("warnings") or validation.get("reason"),
+            )
+        return primary_df
+
+    @staticmethod
+    def _derive_daily_validation_range(
+        df: pd.DataFrame,
+        start_date: Optional[str],
+        end_date: Optional[str],
+    ) -> Tuple[Optional[str], Optional[str]]:
+        if start_date and end_date:
+            return start_date, end_date
+        if df is None or df.empty or "date" not in df.columns:
+            return start_date, end_date
+
+        dates = pd.to_datetime(df["date"], errors="coerce").dropna()
+        if dates.empty:
+            return start_date, end_date
+        return (
+            start_date or dates.min().strftime("%Y-%m-%d"),
+            end_date or dates.max().strftime("%Y-%m-%d"),
+        )
+
+    @staticmethod
+    def _validate_daily_bars_against_baostock(
+        primary_df: pd.DataFrame,
+        validator_df: Optional[pd.DataFrame],
+        *,
+        primary: str,
+        validator: str,
+    ) -> Dict[str, Any]:
+        close_tolerance_pct = 0.5
+        pct_chg_tolerance_abs = 0.2
+        validation: Dict[str, Any] = {
+            "mode": CN_QUANT_DATA_MODE_AKSHARE_BAOSTOCK,
+            "primary": primary,
+            "validator": validator,
+            "status": "warning",
+            "warnings": [],
+            "checks": {
+                "close_tolerance_pct": close_tolerance_pct,
+                "pct_chg_tolerance_abs": pct_chg_tolerance_abs,
+            },
+        }
+
+        primary_norm = DataFetcherManager._normalize_validation_daily_frame(primary_df)
+        validator_norm = DataFetcherManager._normalize_validation_daily_frame(validator_df)
+
+        if primary_norm.empty:
+            validation["warnings"].append("primary_empty")
+            return validation
+        if validator_norm.empty:
+            validation["warnings"].append("validator_empty")
+            return validation
+
+        overlap = primary_norm.index.intersection(validator_norm.index)
+        overlap_rows = int(len(overlap))
+        validation["overlap_rows"] = overlap_rows
+        min_overlap_rows = min(3, len(primary_norm))
+        validation["min_overlap_rows"] = int(min_overlap_rows)
+        if overlap_rows == 0:
+            validation["warnings"].append("no_overlap")
+            return validation
+
+        latest_date = max(overlap)
+        primary_latest = primary_norm.loc[latest_date]
+        validator_latest = validator_norm.loc[latest_date]
+        validation["latest_date"] = latest_date.strftime("%Y-%m-%d")
+
+        close_delta_pct = DataFetcherManager._relative_delta_pct(
+            primary_latest.get("close"),
+            validator_latest.get("close"),
+        )
+        if close_delta_pct is not None:
+            validation["checks"]["close_delta_pct"] = round(close_delta_pct, 4)
+            if close_delta_pct > close_tolerance_pct:
+                validation["warnings"].append("close_mismatch")
+
+        pct_chg_delta_abs = DataFetcherManager._absolute_delta(
+            primary_latest.get("pct_chg"),
+            validator_latest.get("pct_chg"),
+        )
+        if pct_chg_delta_abs is not None:
+            validation["checks"]["pct_chg_delta_abs"] = round(pct_chg_delta_abs, 4)
+            if pct_chg_delta_abs > pct_chg_tolerance_abs:
+                validation["warnings"].append("pct_chg_mismatch")
+
+        if overlap_rows < min_overlap_rows:
+            validation["warnings"].append("low_overlap")
+
+        validation["status"] = "warning" if validation["warnings"] else "ok"
+        return validation
+
+    @staticmethod
+    def _normalize_validation_daily_frame(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+        if df is None or df.empty or "date" not in df.columns:
+            return pd.DataFrame()
+        normalized = df.copy()
+        normalized["date"] = pd.to_datetime(normalized["date"], errors="coerce")
+        normalized = normalized.dropna(subset=["date"])
+        if normalized.empty:
+            return pd.DataFrame()
+        for column in ("close", "pct_chg"):
+            if column in normalized.columns:
+                normalized[column] = pd.to_numeric(normalized[column], errors="coerce")
+        return normalized.set_index("date").sort_index()
+
+    @staticmethod
+    def _relative_delta_pct(left: Any, right: Any) -> Optional[float]:
+        try:
+            left_value = float(left)
+            right_value = float(right)
+        except (TypeError, ValueError):
+            return None
+        if np.isnan(left_value) or np.isnan(right_value):
+            return None
+        denominator = max(abs(right_value), 1e-9)
+        return abs(left_value - right_value) / denominator * 100
+
+    @staticmethod
+    def _absolute_delta(left: Any, right: Any) -> Optional[float]:
+        try:
+            left_value = float(left)
+            right_value = float(right)
+        except (TypeError, ValueError):
+            return None
+        if np.isnan(left_value) or np.isnan(right_value):
+            return None
+        return abs(left_value - right_value)
 
     def _get_tickflow_fetcher(self):
         """Lazily create a TickFlow fetcher for market-review-only calls."""
@@ -1276,6 +1543,7 @@ class DataFetcherManager:
 
         # Normalize code (strip SH/SZ prefix etc.)
         stock_code = normalize_stock_code(stock_code)
+        self._clear_daily_source_validation(stock_code)
 
         fetchers = self._get_fetchers_snapshot()
         errors = []
@@ -1295,6 +1563,24 @@ class DataFetcherManager:
         if market != "cn":
             fetchers = self._filter_daily_fetchers_for_market(fetchers, market)
         fetchers = self._filter_fetchers_by_capability(fetchers, capability="daily_data")
+        cn_quant_data_mode = ""
+        if market == "cn":
+            try:
+                from src.config import get_config
+
+                cn_quant_data_mode = (
+                    getattr(get_config(), "cn_quant_data_mode", "") or ""
+                )
+            except Exception as exc:
+                logger.debug("[cn_quant] failed to read CN_QUANT_DATA_MODE: %s", exc)
+            if cn_quant_data_mode == CN_QUANT_DATA_MODE_AKSHARE_BAOSTOCK:
+                fetchers = self._order_fetchers_by_name(
+                    fetchers,
+                    self._CN_QUANT_AKSHARE_BAOSTOCK_ORDER,
+                )
+                logger.info(
+                    "[cn_quant] A-share daily route enabled: AkShare primary + Baostock validation"
+                )
         total_fetchers = len(fetchers)
 
         if total_fetchers == 0:
@@ -1445,6 +1731,16 @@ class DataFetcherManager:
                         f"rows={len(df)}, elapsed={elapsed:.2f}s"
                     )
                     self._record_daily_source_success(fetcher, market)
+                    if cn_quant_data_mode == CN_QUANT_DATA_MODE_AKSHARE_BAOSTOCK:
+                        df = self._apply_cn_quant_daily_validation(
+                            stock_code,
+                            df,
+                            fetcher,
+                            fetchers,
+                            start_date,
+                            end_date,
+                            days,
+                        )
                     return df, fetcher.name
                 duration_ms = int((time.time() - attempt_start) * 1000)
                 record_provider_run(
