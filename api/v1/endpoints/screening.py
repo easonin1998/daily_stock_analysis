@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import ipaddress
+import logging
 import uuid
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -12,19 +15,23 @@ from pydantic import BaseModel, Field
 from api.deps import get_config_dep, get_database_manager
 from api.v1.errors import api_error
 from src.config import Config
+from src.notification_sender.feishu_sender import FeishuSender
 from src.services.screening_service import ScreeningService
 from src.services.task_queue import TaskStatus as QueueTaskStatus
 from src.services.task_queue import get_task_queue
 from src.storage import DatabaseManager
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 class ScreeningScreenRequest(BaseModel):
     market: str = Field("cn", min_length=1, max_length=16)
-    strategy: str = Field("dual_low", min_length=1, max_length=64)
+    strategy: str = Field("martin_momentum_pullback", min_length=1, max_length=64)
     max_results: int = Field(20, ge=1, le=100)
     variant_seed: str = Field("", max_length=128)
+    notify: bool = False
+    web_base_url: str = Field("", max_length=2048)
 
 
 class ScreeningStrategyResponse(BaseModel):
@@ -71,6 +78,127 @@ def _screening_task_not_found(task_id: str) -> HTTPException:
         "screening_screen_task_not_found",
         f"选股任务 {task_id} 不存在或已过期",
     )
+
+
+def _normalize_web_base_url(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return ""
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username
+        or parsed.password
+    ):
+        return ""
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc, parsed.path.rstrip("/"), "", ""))
+
+
+def _same_web_origin(left: str, right: str) -> bool:
+    left_url = urlsplit(_normalize_web_base_url(left))
+    right_url = urlsplit(_normalize_web_base_url(right))
+    try:
+        left_port = left_url.port
+        right_port = right_url.port
+    except ValueError:
+        return False
+    return bool(
+        left_url.scheme
+        and right_url.scheme
+        and left_url.scheme == right_url.scheme
+        and left_url.hostname == right_url.hostname
+        and left_port == right_port
+    )
+
+
+def _trusted_request_web_base_url(http_request: Request, submitted_url: str) -> str:
+    """Use a client origin only when it matches the request that submitted it."""
+    request_url = _normalize_web_base_url(getattr(http_request, "base_url", ""))
+    candidate = _normalize_web_base_url(submitted_url)
+    if candidate and request_url and not _same_web_origin(candidate, request_url):
+        logger.warning(
+            "忽略与当前请求不同源的选股详情地址: submitted=%s request=%s",
+            urlsplit(candidate).netloc,
+            urlsplit(request_url).netloc,
+        )
+        candidate = ""
+    return candidate or request_url
+
+
+def _screening_detail_url(web_base_url: str, run_id: Any) -> str:
+    base_url = _normalize_web_base_url(web_base_url)
+    normalized_run_id = str(run_id or "").strip()
+    if not base_url or not normalized_run_id:
+        return ""
+    parsed = urlsplit(base_url)
+    hostname = (parsed.hostname or "").strip().lower()
+    if parsed.scheme != "https" or hostname == "localhost" or hostname.endswith(".local"):
+        return ""
+    try:
+        if not ipaddress.ip_address(hostname).is_global:
+            return ""
+    except ValueError:
+        pass
+    return f"{base_url}/screening?runId={quote(normalized_run_id, safe='')}"
+
+
+def _screening_notification_content(result: Dict[str, Any]) -> str:
+    candidates = result.get("candidates") if isinstance(result.get("candidates"), list) else []
+    candidate_names = [
+        str(item.get("name") or item.get("code") or "").strip()
+        for item in candidates[:5]
+        if isinstance(item, dict)
+    ]
+    lines = [
+        "## 选股任务已完成",
+        f"策略：{result.get('strategy') or 'martin_momentum_pullback'}",
+        f"市场：{'A股' if str(result.get('market') or 'cn').lower() == 'cn' else result.get('market')}",
+        f"候选：{result.get('candidate_count', len(candidates))} 只",
+    ]
+    if candidate_names:
+        lines.append(f"前列候选：{'、'.join(candidate_names)}")
+    else:
+        lines.append("本次没有股票通过全部硬条件，请保持观察。")
+    return "\n\n".join(lines)
+
+
+def _notify_screening_result(
+    *,
+    config: Config,
+    result: Dict[str, Any],
+    web_base_url: str,
+) -> Dict[str, Any]:
+    detail_url = _screening_detail_url(web_base_url, result.get("run_id"))
+    payload = {
+        "kind": "screening_result",
+        "strategy": result.get("strategy"),
+        "market": result.get("market"),
+        "run_id": result.get("run_id"),
+        "candidate_count": result.get("candidate_count"),
+        "snapshot_count": result.get("snapshot_count"),
+        "after_filter_count": result.get("after_filter_count"),
+        "ranking_mode": result.get("ranking_mode"),
+        "candidates": result.get("candidates") or [],
+        "detail_url": detail_url,
+    }
+    try:
+        sent = FeishuSender(config).send_to_feishu(
+            _screening_notification_content(result),
+            structured_payload=payload,
+        )
+    except Exception as exc:  # Notification must never fail completed screening work.
+        logger.warning("选股完成后的飞书推送异常: %s", exc)
+        sent = False
+    return {
+        "requested": True,
+        "channel": "feishu",
+        "sent": bool(sent),
+        "detail_url": detail_url or None,
+    }
 
 
 @router.get("/status")
@@ -139,6 +267,7 @@ def screening_start_screen_task(
 ) -> ScreeningScreenAccepted:
     task_id = uuid.uuid4().hex
     task_queue = get_task_queue()
+    request_base_url = _trusted_request_web_base_url(http_request, request.web_base_url)
 
     def run_screen() -> Dict[str, Any]:
         task_queue.update_task_progress(
@@ -162,6 +291,13 @@ def screening_start_screen_task(
             98,
             f"选股已完成，正在整理 {result.get('candidate_count', 0)} 条候选",
         )
+        if request.notify:
+            task_queue.update_task_progress(task_id, 99, "正在推送飞书结果卡片")
+            result["notification"] = _notify_screening_result(
+                config=config,
+                result=result,
+                web_base_url=request_base_url,
+            )
         return result
 
     task = task_queue.submit_background_task(
@@ -209,12 +345,19 @@ def screening_screen(
     config: Config = Depends(get_config_dep),
     db_manager: DatabaseManager = Depends(get_database_manager),
 ) -> Dict[str, Any]:
-    return _service(config, db_manager).screen(
+    result = _service(config, db_manager).screen(
         strategy=request.strategy,
         market=request.market,
         max_results=request.max_results,
         selection_seed=request.variant_seed,
     )
+    if request.notify:
+        result["notification"] = _notify_screening_result(
+            config=config,
+            result=result,
+            web_base_url=_trusted_request_web_base_url(http_request, request.web_base_url),
+        )
+    return result
 
 
 @router.get("/history")

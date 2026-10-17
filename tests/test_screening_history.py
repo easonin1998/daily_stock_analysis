@@ -24,7 +24,7 @@ class ScreeningHistoryTestCase(unittest.TestCase):
     def test_completed_screen_run_is_persisted_and_loaded(self) -> None:
         raw_result = {
             "run_id": "screen-run-1",
-            "strategy": "dual_low",
+            "strategy": "martin_momentum_pullback",
             "market": "cn",
             "snapshot_source": "sina",
             "snapshot_count": 5000,
@@ -67,7 +67,7 @@ class ScreeningHistoryTestCase(unittest.TestCase):
                 ),
             ),
         ):
-            response = service.screen(strategy="dual_low", market="cn", max_results=3)
+            response = service.screen(strategy="martin_momentum_pullback", market="cn", max_results=3)
 
         self.assertEqual(response["run_id"], "screen-run-1")
         stored = self.db.get_screening_run("screen-run-1")
@@ -76,14 +76,14 @@ class ScreeningHistoryTestCase(unittest.TestCase):
         self.assertEqual(stored["candidate_count"], 1)
         self.assertEqual(stored["result"]["candidates"][0]["code"], "600519")
 
-        history = service.history(limit=10, strategy="dual_low", market="cn")
+        history = service.history(limit=10, strategy="martin_momentum_pullback", market="cn")
         self.assertEqual(history["run_count"], 1)
         self.assertNotIn("result", history["runs"][0])
 
     def test_screen_maps_pipeline_degradation_into_warning_contract(self) -> None:
         raw_result = {
             "run_id": "screen-run-degradation",
-            "strategy": "dual_low",
+            "strategy": "martin_momentum_pullback",
             "market": "cn",
             "snapshot_source": "sina",
             "snapshot_count": 5000,
@@ -129,7 +129,7 @@ class ScreeningHistoryTestCase(unittest.TestCase):
                 ),
             ),
         ):
-            response = service.screen(strategy="dual_low", market="cn", max_results=3)
+            response = service.screen(strategy="martin_momentum_pullback", market="cn", max_results=3)
 
         self.assertEqual(
             response["warnings"],
@@ -152,7 +152,7 @@ class ScreeningHistoryTestCase(unittest.TestCase):
         self.assertEqual(stored["result"]["warnings"], response["warnings"])
         self.assertEqual(stored["result"]["degradation"], response["degradation"])
 
-        history = service.history(limit=10, strategy="dual_low", market="cn")
+        history = service.history(limit=10, strategy="martin_momentum_pullback", market="cn")
         self.assertEqual(history["runs"][0]["warnings"], response["warnings"])
 
         source_history = service.source_history(limit=10)
@@ -161,7 +161,7 @@ class ScreeningHistoryTestCase(unittest.TestCase):
     def test_save_is_idempotent_and_source_history_aggregates_failures(self) -> None:
         payload = {
             "run_id": "screen-run-2",
-            "strategy": "volume_breakout",
+            "strategy": "legacy_removed_strategy",
             "market": "cn",
             "snapshot_source": "sina",
             "candidate_count": 2,
@@ -194,10 +194,9 @@ class ScreeningHistoryTestCase(unittest.TestCase):
     def test_screening_strategies_declare_dsa_analysis_skill_handoffs(self) -> None:
         strategies = {item.name: item for item in list_strategies()}
 
-        self.assertEqual(strategies["volume_breakout"].analysis_skills, ["volume_breakout"])
         self.assertEqual(
-            strategies["capital_heat"].analysis_skills,
-            ["hot_theme", "emotion_cycle"],
+            strategies["martin_momentum_pullback"].analysis_skills,
+            ["bull_trend", "shrink_pullback"],
         )
 
     def test_fresh_post_rank_context_includes_dsa_events(self) -> None:

@@ -21,8 +21,28 @@ import requests
 from src.services.screening.source_guard import call_with_timeout, parse_source_timeout_seconds
 
 _DAILY_FEATURE_DEFAULTS = {
+    "daily_latest_date": "",
     "daily_data_points": pd.NA,
+    "change_20d": pd.NA,
     "change_60d": pd.NA,
+    "adr_20_pct": pd.NA,
+    "ema9": pd.NA,
+    "ema21": pd.NA,
+    "ema50": pd.NA,
+    "ema_stack_bullish": pd.NA,
+    "ema21_rising": pd.NA,
+    "ema50_rising": pd.NA,
+    "distance_to_120d_high_pct": pd.NA,
+    "pullback_depth_10d_pct": pd.NA,
+    "range_contraction_ratio": pd.NA,
+    "volume_contraction_ratio": pd.NA,
+    "anchored_vwap_60d_high": pd.NA,
+    "support_confluence_count": pd.NA,
+    "trigger_distance_pct": pd.NA,
+    "trigger_close_location_pct": pd.NA,
+    "trigger_volume_vs_previous": pd.NA,
+    "one_word_limit_up": pd.NA,
+    "avg_amount_20d": pd.NA,
     "ma5": pd.NA,
     "ma20": pd.NA,
     "ma60": pd.NA,
@@ -45,7 +65,9 @@ _DAILY_FEATURE_DEFAULTS = {
     "daily_quality_score": pd.NA,
     "daily_quality_flags": "",
     "daily_source": "",
+    "daily_price_adjustment": "",
 }
+DAILY_FEATURE_COLUMNS = tuple(_DAILY_FEATURE_DEFAULTS)
 _DAILY_ENRICH_MAX_WORKERS = 1
 _DAILY_HISTORY_CACHE_VERSION = 1
 _DAILY_HISTORY_CACHE_TTL_SECONDS = 24 * 60 * 60
@@ -70,6 +92,7 @@ def enrich_daily_features(
     cache_ttl_seconds: float | None = None,
     max_workers: int | None = None,
     history_fetcher: Callable[..., pd.DataFrame] | None = None,
+    price_adjustment: str | None = None,
 ) -> pd.DataFrame:
     """Attach daily technical features to the first ``max_rows`` candidates.
 
@@ -101,18 +124,25 @@ def enrich_daily_features(
     def fetch_one(request: tuple[object, str]) -> tuple[object, dict[str, object], str | None, dict[str, object]]:
         idx, code = request
         try:
+            fetch_kwargs = {
+                "lookback_days": lookback_days,
+                "source": source,
+                "retries": fetch_retries,
+                "cache_dir": cache_dir,
+                "cache_ttl_seconds": cache_ttl_seconds,
+            }
+            if price_adjustment is not None:
+                fetch_kwargs["price_adjustment"] = price_adjustment
             hist = fetch_history(
                 code,
-                lookback_days=lookback_days,
-                source=source,
-                retries=fetch_retries,
-                cache_dir=cache_dir,
-                cache_ttl_seconds=cache_ttl_seconds,
+                **fetch_kwargs,
             )
             features = compute_daily_features(hist)
             features["daily_source"] = str(hist.attrs.get("daily_source", ""))
+            features["daily_price_adjustment"] = _history_price_adjustment(hist)
             metadata = {
                 "daily_source": features["daily_source"],
+                "daily_price_adjustment": features["daily_price_adjustment"],
                 "daily_quality_flags": features.get("daily_quality_flags", ""),
                 "daily_source_order_notes": list(hist.attrs.get("daily_source_order_notes", []) or []),
                 "daily_source_health": dict(hist.attrs.get("daily_source_health", {}) or {}),
@@ -171,6 +201,7 @@ def fetch_daily_history(
     retries: int = 2,
     cache_dir: str | Path | None = None,
     cache_ttl_seconds: float | None = None,
+    price_adjustment: str | None = None,
 ) -> pd.DataFrame:
     """Fetch daily history for one stock code.
 
@@ -185,6 +216,7 @@ def fetch_daily_history(
     normalized_code = _normalize_daily_code(code)
     normalized_lookback_days = int(lookback_days)
     src = _normalize_daily_source(source)
+    required_adjustment = _normalize_price_adjustment(price_adjustment)
     if src == "auto":
         sources: tuple[str, ...] = (
             ("tushare", "tencent", "sina", "akshare", "baostock")
@@ -198,6 +230,17 @@ def fetch_daily_history(
     else:
         raise ValueError(f"Unsupported daily source: {source}")
 
+    if required_adjustment is not None:
+        sources = tuple(
+            current
+            for current in sources
+            if _source_price_adjustment(current) == required_adjustment
+        )
+        if not sources:
+            raise ValueError(
+                f"Daily source {source!r} cannot provide {required_adjustment!r} prices"
+            )
+
     cache_path = None
     if cache_dir is not None:
         cache_path = _daily_history_cache_path(
@@ -207,7 +250,7 @@ def fetch_daily_history(
             lookback_days=normalized_lookback_days,
         )
         cached = _read_daily_history_cache(cache_path, ttl_seconds=cache_ttl_seconds)
-        if cached is not None:
+        if cached is not None and _matches_price_adjustment(cached, required_adjustment):
             return cached
 
     attempts = max(int(retries), 0) + 1
@@ -265,6 +308,7 @@ def fetch_daily_history(
                     )
                 _record_source_success(current, rows=len(result))
                 result.attrs["daily_source"] = current
+                result.attrs["daily_price_adjustment"] = _source_price_adjustment(current)
                 result.attrs["daily_requested_source"] = src
                 result.attrs["daily_source_order"] = list(sources)
                 result.attrs["daily_source_order_notes"] = list(source_order_notes)
@@ -293,7 +337,7 @@ def fetch_daily_history(
             ttl_seconds=cache_ttl_seconds,
             allow_stale=True,
         )
-        if stale is not None:
+        if stale is not None and _matches_price_adjustment(stale, required_adjustment):
             stale.attrs["daily_stale"] = True
             stale.attrs["daily_source_order"] = list(sources)
             stale.attrs["daily_source_order_notes"] = list(source_order_notes)
@@ -304,6 +348,71 @@ def fetch_daily_history(
     raise RuntimeError(
         f"daily history fetch failed for {normalized_code}: {'; '.join(errors)}"
     )
+
+
+def load_cached_daily_history(
+    code: str,
+    *,
+    source: str,
+    lookback_days: int,
+    cache_dir: str | Path,
+    price_adjustment: str | None = None,
+) -> pd.DataFrame | None:
+    """Load an exact or longer compatible cache without a network refresh."""
+    path = _daily_history_cache_path(
+        cache_dir,
+        code=_normalize_daily_code(code),
+        source=_normalize_daily_source(source),
+        lookback_days=int(lookback_days),
+    )
+    cached = _read_daily_history_cache(path, ttl_seconds=None, allow_stale=True)
+    required_adjustment = _normalize_price_adjustment(price_adjustment)
+    if cached is not None and _matches_price_adjustment(cached, required_adjustment):
+        return cached
+    compatible_path = _find_compatible_daily_history_cache(
+        cache_dir,
+        code=_normalize_daily_code(code),
+        source=_normalize_daily_source(source),
+        minimum_lookback_days=int(lookback_days),
+    )
+    if compatible_path is None:
+        return None
+    compatible = _read_daily_history_cache(
+        compatible_path,
+        ttl_seconds=None,
+        allow_stale=True,
+    )
+    if compatible is not None and _matches_price_adjustment(compatible, required_adjustment):
+        compatible.attrs["daily_cache_compatible_fallback"] = True
+        return compatible
+    return None
+
+
+def save_cached_daily_history(
+    code: str,
+    history: pd.DataFrame,
+    *,
+    source: str,
+    lookback_days: int,
+    cache_dir: str | Path,
+) -> Path:
+    """Persist a normalized cache entry used by the local daily library."""
+    normalized_code = _normalize_daily_code(code)
+    normalized_source = _normalize_daily_source(source)
+    path = _daily_history_cache_path(
+        cache_dir,
+        code=normalized_code,
+        source=normalized_source,
+        lookback_days=int(lookback_days),
+    )
+    _write_daily_history_cache(
+        path,
+        history,
+        code=normalized_code,
+        source=normalized_source,
+        lookback_days=int(lookback_days),
+    )
+    return path
 
 
 def _normalize_daily_code(value: object) -> str:
@@ -320,6 +429,46 @@ def _normalize_daily_code(value: object) -> str:
 
 def _normalize_daily_source(source: str | None) -> str:
     return (source or "akshare").strip().lower()
+
+
+def _normalize_price_adjustment(value: str | None) -> str | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    aliases = {"forward": "qfq", "forward_adjusted": "qfq", "unadjusted": "none"}
+    normalized = aliases.get(text, text)
+    if normalized not in {"qfq", "hfq", "none"}:
+        raise ValueError(f"Unsupported daily price adjustment: {value}")
+    return normalized
+
+
+def _source_price_adjustment(source: str | None) -> str:
+    normalized = _normalize_daily_source(source)
+    if normalized == "sina":
+        return "none"
+    if normalized == "tushare":
+        return _normalize_tushare_adj(os.getenv("TUSHARE_DAILY_ADJ", "qfq"))
+    if normalized in {"tencent", "akshare", "baostock"}:
+        return "qfq"
+    if normalized.startswith("dsa:") and any(
+        marker in normalized for marker in ("akshare", "baostock", "tencent")
+    ):
+        return "qfq"
+    return "unknown"
+
+
+def _history_price_adjustment(history: pd.DataFrame) -> str:
+    explicit = str(history.attrs.get("daily_price_adjustment") or "").strip().lower()
+    if explicit:
+        return explicit
+    return _source_price_adjustment(history.attrs.get("daily_source"))
+
+
+def _matches_price_adjustment(
+    history: pd.DataFrame,
+    required_adjustment: str | None,
+) -> bool:
+    return required_adjustment is None or _history_price_adjustment(history) == required_adjustment
 
 
 def _normalize_max_workers(value: int | None) -> int:
@@ -449,6 +598,35 @@ def _daily_history_cache_path(
     return Path(cache_dir) / f"{safe_code}_{safe_source}_{int(lookback_days)}_{digest}.json"
 
 
+def _find_compatible_daily_history_cache(
+    cache_dir: str | Path,
+    *,
+    code: str,
+    source: str,
+    minimum_lookback_days: int,
+) -> Path | None:
+    """Return the smallest cache whose requested window covers this request."""
+    safe_source = "".join(ch if ch.isalnum() else "-" for ch in source).strip("-") or "source"
+    safe_code = "".join(ch if ch.isalnum() else "-" for ch in code).strip("-") or "code"
+    candidates: list[tuple[int, Path]] = []
+    for path in Path(cache_dir).glob(f"{safe_code}_{safe_source}_*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            key = payload.get("key") if isinstance(payload, dict) else None
+            if not isinstance(key, dict):
+                continue
+            if str(key.get("code")) != code or str(key.get("source")) != source:
+                continue
+            candidate_lookback = int(key.get("lookback_days"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if candidate_lookback >= minimum_lookback_days:
+            candidates.append((candidate_lookback, path))
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: item[0])[1]
+
+
 def _read_daily_history_cache(
     path: Path,
     *,
@@ -479,7 +657,7 @@ def _read_daily_history_cache(
         df = pd.DataFrame(data, columns=columns)
         metadata = payload.get("metadata")
         if isinstance(metadata, dict):
-            for key in ("daily_source", "daily_requested_source", "daily_source_order", "daily_source_order_notes", "source_errors", "daily_source_health"):
+            for key in ("daily_source", "daily_price_adjustment", "daily_requested_source", "daily_source_order", "daily_source_order_notes", "source_errors", "daily_source_health"):
                 if key in metadata:
                     df.attrs[key] = metadata[key]
         if is_stale:
@@ -508,6 +686,7 @@ def _write_daily_history_cache(
             },
             "metadata": {
                 "daily_source": df.attrs.get("daily_source", source),
+                "daily_price_adjustment": _history_price_adjustment(df),
                 "daily_requested_source": df.attrs.get("daily_requested_source", source),
                 "daily_source_order": list(df.attrs.get("daily_source_order", [])),
                 "daily_source_order_notes": list(df.attrs.get("daily_source_order_notes", [])),
@@ -548,8 +727,9 @@ def _fetch_daily_tencent(code: str, *, lookback_days: int) -> pd.DataFrame:
     stable A-share market data access: no wrapper dependency, browser-like HTTP,
     and much lower IP-ban risk than Eastmoney-heavy endpoints. Tencent returns
     daily K-lines as rows shaped like ``date, open, close, high, low, volume``;
-    amount is not always present, so it is exposed as ``NA`` when absent to keep
-    the common daily schema stable.
+    amount is not always present. Tencent's A-share volume is reported in lots,
+    so missing amount is estimated as ``volume * close * 100``. This proxy is
+    used only for the liquidity gate; price/volume shape factors stay unchanged.
     """
     symbol = _to_tencent_code(code)
     count = max(int(lookback_days), 30)
@@ -593,6 +773,7 @@ def _fetch_daily_tencent(code: str, *, lookback_days: int) -> pd.DataFrame:
     )
     for col in ("open", "close", "high", "low", "volume", "amount"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    _estimate_missing_amount(df, source="tencent")
     return df.tail(count).copy()
 
 
@@ -639,7 +820,34 @@ def _fetch_daily_sina(code: str, *, lookback_days: int) -> pd.DataFrame:
         df = df.sort_values("date")
     for col in ("open", "close", "high", "low", "volume", "amount"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    _estimate_missing_amount(df, source="sina")
     return df.tail(count).copy()
+
+
+def _estimate_missing_amount(df: pd.DataFrame, *, source: str) -> None:
+    """Fill absent A-share turnover values using source-specific volume units."""
+    if not {"amount", "volume", "close"}.issubset(df.columns):
+        return
+
+    normalized_source = str(source or "").strip().lower()
+    if normalized_source.startswith("tencent"):
+        multiplier = 100.0  # Tencent A-share volume is expressed in lots.
+        method = "tencent_volume_lots_x_close_x_100"
+    elif normalized_source.startswith("sina"):
+        multiplier = 1.0  # Sina's K-line endpoint expresses volume in shares.
+        method = "sina_volume_shares_x_close"
+    else:
+        return
+
+    missing_amount = df["amount"].isna() & df["volume"].gt(0) & df["close"].gt(0)
+    if not missing_amount.any():
+        return
+    df.loc[missing_amount, "amount"] = (
+        df.loc[missing_amount, "volume"]
+        * df.loc[missing_amount, "close"]
+        * multiplier
+    )
+    df.attrs["amount_estimation"] = method
 
 
 def _fetch_daily_tushare(code: str, *, lookback_days: int) -> pd.DataFrame:
@@ -853,7 +1061,7 @@ def _is_baostock_network_outage(error_code: object, error_msg: object) -> bool:
 
 
 def compute_daily_features(hist: pd.DataFrame) -> dict[str, object]:
-    """Compute compact trend/reversal features from a daily K-line DataFrame."""
+    """Compute trend, pullback and trigger features for Martin momentum screening."""
     df = _normalize_daily_history(hist)
     if df.empty:
         raise RuntimeError("daily history is empty after normalization")
@@ -865,6 +1073,9 @@ def compute_daily_features(hist: pd.DataFrame) -> dict[str, object]:
     ma5 = close.rolling(5).mean()
     ma20 = close.rolling(20).mean()
     ma60 = close.rolling(60).mean()
+    ema9 = close.ewm(span=9, adjust=False).mean()
+    ema21 = close.ewm(span=21, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
     last_close = float(close.iloc[-1])
     last_ma5 = _last_float(ma5)
     last_ma20 = _last_float(ma20)
@@ -872,9 +1083,15 @@ def compute_daily_features(hist: pd.DataFrame) -> dict[str, object]:
     shape = _compute_shape_features(df, last_close=last_close, last_ma20=last_ma20)
     quality = _compute_daily_quality(hist, df)
 
-    lookback_idx = max(0, len(close) - 61)
-    base_close = float(close.iloc[lookback_idx])
-    change_60d = (last_close / base_close - 1.0) * 100 if base_close > 0 else None
+    change_20d = _period_change_pct(close, 20)
+    change_60d = _period_change_pct(close, 60)
+    martin = _compute_martin_features(
+        df,
+        close=close,
+        ema9=ema9,
+        ema21=ema21,
+        ema50=ema50,
+    )
 
     macd_status = _compute_macd_status(close)
     rsi_value = _compute_rsi(close)
@@ -891,7 +1108,9 @@ def compute_daily_features(hist: pd.DataFrame) -> dict[str, object]:
     )
 
     return {
+        "daily_latest_date": _latest_daily_date(df),
         "daily_data_points": int(len(close)),
+        "change_20d": _round_or_none(change_20d),
         "change_60d": None if change_60d is None else round(float(change_60d), 4),
         "ma5": last_ma5,
         "ma20": last_ma20,
@@ -902,9 +1121,23 @@ def compute_daily_features(hist: pd.DataFrame) -> dict[str, object]:
         "rsi_status": rsi_status,
         "rsi14": None if rsi_value is None else round(float(rsi_value), 4),
         "signal_score": round(float(signal_score), 4),
+        **martin,
         **shape,
         **quality,
     }
+
+
+def _latest_daily_date(df: pd.DataFrame) -> str:
+    if "date" not in df.columns or df.empty:
+        return ""
+    parsed = pd.to_datetime(
+        df["date"].astype(str).str.slice(0, 10),
+        format="%Y-%m-%d",
+        errors="coerce",
+    ).dropna()
+    if parsed.empty:
+        return ""
+    return parsed.iloc[-1].strftime("%Y-%m-%d")
 
 
 def _normalize_daily_history(hist: pd.DataFrame) -> pd.DataFrame:
@@ -919,12 +1152,23 @@ def _normalize_daily_history(hist: pd.DataFrame) -> pd.DataFrame:
     }
     df = hist.rename(columns=rename_map).copy()
     if "date" in df.columns:
+        df["date"] = pd.to_datetime(
+            df["date"].astype(str).str.slice(0, 10),
+            format="%Y-%m-%d",
+            errors="coerce",
+        )
         df = df.sort_values("date")
     if "close" not in df.columns:
         raise RuntimeError("daily history has no close column")
-    for col in ("open", "high", "low", "close", "volume"):
+    for col in ("open", "high", "low", "close", "volume", "amount"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+    source = str(
+        hist.attrs.get("daily_source")
+        or hist.attrs.get("source")
+        or ""
+    ).strip().lower()
+    _estimate_missing_amount(df, source=source)
     df = df.dropna(subset=["close"]).copy()
     for col in ("open", "high", "low"):
         if col not in df.columns:
@@ -932,6 +1176,172 @@ def _normalize_daily_history(hist: pd.DataFrame) -> pd.DataFrame:
         else:
             df[col] = df[col].fillna(df["close"])
     return df
+
+
+def _period_change_pct(close: pd.Series, sessions: int) -> float | None:
+    if len(close) <= sessions:
+        return None
+    base = float(close.iloc[-(sessions + 1)])
+    if base <= 0:
+        return None
+    return (float(close.iloc[-1]) / base - 1.0) * 100
+
+
+def _compute_martin_features(
+    df: pd.DataFrame,
+    *,
+    close: pd.Series,
+    ema9: pd.Series,
+    ema21: pd.Series,
+    ema50: pd.Series,
+) -> dict[str, object]:
+    last_close = float(close.iloc[-1])
+    last_ema9 = _last_float(ema9)
+    last_ema21 = _last_float(ema21)
+    last_ema50 = _last_float(ema50)
+    ema_stack = bool(
+        last_ema9 is not None
+        and last_ema21 is not None
+        and last_ema50 is not None
+        and last_ema9 > last_ema21 > last_ema50
+    )
+    ema21_rising = _series_rising(ema21, sessions=5)
+    ema50_rising = _series_rising(ema50, sessions=5)
+
+    high = pd.to_numeric(df["high"], errors="coerce")
+    low = pd.to_numeric(df["low"], errors="coerce")
+    adr_values = ((high / low) - 1.0).replace([float("inf"), float("-inf")], pd.NA) * 100
+    adr_20_pct = _last_mean(adr_values, 20)
+
+    high_120 = _series_max(high.tail(120))
+    distance_to_120d_high_pct = (
+        (last_close / high_120 - 1.0) * 100
+        if high_120 is not None and high_120 > 0
+        else None
+    )
+    high_10 = _series_max(high.tail(10))
+    pullback_depth_10d_pct = (
+        (last_close / high_10 - 1.0) * 100
+        if high_10 is not None and high_10 > 0
+        else None
+    )
+
+    daily_range_pct = ((high / low) - 1.0).replace([float("inf"), float("-inf")], pd.NA) * 100
+    latest_range = _last_mean(daily_range_pct, 3)
+    prior_range = _last_mean(daily_range_pct.iloc[:-3], 10)
+    range_contraction_ratio = _safe_ratio(latest_range, prior_range)
+
+    volume = pd.to_numeric(df.get("volume"), errors="coerce") if "volume" in df.columns else pd.Series(dtype=float)
+    latest_volume = _last_mean(volume, 3)
+    prior_volume = _last_mean(volume.iloc[:-3], 20)
+    volume_contraction_ratio = _safe_ratio(latest_volume, prior_volume)
+
+    anchored_vwap = _anchored_vwap_from_60d_high(df)
+    support_levels = [last_ema9, last_ema21, anchored_vwap]
+    support_confluence_count = sum(
+        1
+        for level in support_levels
+        if level is not None and level > 0 and abs(last_close / level - 1.0) <= 0.03
+    )
+
+    previous_high = float(high.iloc[-2]) if len(high) >= 2 and pd.notna(high.iloc[-2]) else None
+    trigger_distance_pct = (
+        (last_close / previous_high - 1.0) * 100
+        if previous_high is not None and previous_high > 0
+        else None
+    )
+    previous_close = float(close.iloc[-2]) if len(close) >= 2 else None
+    latest_high = float(high.iloc[-1]) if pd.notna(high.iloc[-1]) else None
+    latest_low = float(low.iloc[-1]) if pd.notna(low.iloc[-1]) else None
+    latest_volume = float(volume.iloc[-1]) if len(volume) and pd.notna(volume.iloc[-1]) else None
+    previous_volume = float(volume.iloc[-2]) if len(volume) >= 2 and pd.notna(volume.iloc[-2]) else None
+    trigger_close_location_pct = (
+        (last_close - latest_low) / (latest_high - latest_low) * 100.0
+        if latest_high is not None
+        and latest_low is not None
+        and latest_high > latest_low
+        else None
+    )
+    trigger_volume_vs_previous = (
+        latest_volume / previous_volume
+        if latest_volume is not None and previous_volume is not None and previous_volume > 0
+        else None
+    )
+    one_word_limit_up = bool(
+        previous_close is not None
+        and previous_close > 0
+        and latest_high is not None
+        and latest_low is not None
+        and abs(latest_high - latest_low) <= max(latest_high, 1.0) * 1e-6
+        and (last_close / previous_close - 1.0) * 100 >= 9.5
+    )
+    avg_amount_20d = (
+        _last_mean(pd.to_numeric(df["amount"], errors="coerce"), 20)
+        if "amount" in df.columns
+        else None
+    )
+
+    return {
+        "adr_20_pct": _round_or_none(adr_20_pct),
+        "ema9": last_ema9,
+        "ema21": last_ema21,
+        "ema50": last_ema50,
+        "ema_stack_bullish": ema_stack,
+        "ema21_rising": ema21_rising,
+        "ema50_rising": ema50_rising,
+        "distance_to_120d_high_pct": _round_or_none(distance_to_120d_high_pct),
+        "pullback_depth_10d_pct": _round_or_none(pullback_depth_10d_pct),
+        "range_contraction_ratio": _round_or_none(range_contraction_ratio),
+        "volume_contraction_ratio": _round_or_none(volume_contraction_ratio),
+        "anchored_vwap_60d_high": _round_or_none(anchored_vwap),
+        "support_confluence_count": support_confluence_count,
+        "trigger_distance_pct": _round_or_none(trigger_distance_pct),
+        "trigger_close_location_pct": _round_or_none(trigger_close_location_pct),
+        "trigger_volume_vs_previous": _round_or_none(trigger_volume_vs_previous),
+        "one_word_limit_up": one_word_limit_up,
+        "avg_amount_20d": _round_or_none(avg_amount_20d),
+    }
+
+
+def _series_rising(series: pd.Series, *, sessions: int) -> bool:
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    return bool(len(values) > sessions and float(values.iloc[-1]) > float(values.iloc[-(sessions + 1)]))
+
+
+def _last_mean(series: pd.Series, periods: int) -> float | None:
+    values = pd.to_numeric(series, errors="coerce").dropna().tail(periods)
+    if values.empty:
+        return None
+    return float(values.mean())
+
+
+def _safe_ratio(numerator: float | None, denominator: float | None) -> float | None:
+    if numerator is None or denominator is None or denominator <= 0:
+        return None
+    return numerator / denominator
+
+
+def _anchored_vwap_from_60d_high(df: pd.DataFrame) -> float | None:
+    if not {"high", "low", "close", "volume"}.issubset(df.columns):
+        return None
+    recent = df.tail(60).copy()
+    high = pd.to_numeric(recent["high"], errors="coerce")
+    if high.dropna().empty:
+        return None
+    anchor_position = int(high.reset_index(drop=True).idxmax())
+    anchored = recent.iloc[anchor_position:]
+    volume = pd.to_numeric(anchored["volume"], errors="coerce").fillna(0)
+    if volume.sum() <= 0:
+        return None
+    typical = (
+        pd.to_numeric(anchored["high"], errors="coerce")
+        + pd.to_numeric(anchored["low"], errors="coerce")
+        + pd.to_numeric(anchored["close"], errors="coerce")
+    ) / 3.0
+    valid = typical.notna() & volume.gt(0)
+    if not valid.any():
+        return None
+    return float((typical[valid] * volume[valid]).sum() / volume[valid].sum())
 
 
 def _compute_daily_quality(raw: pd.DataFrame, normalized: pd.DataFrame) -> dict[str, object]:

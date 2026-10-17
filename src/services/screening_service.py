@@ -1271,6 +1271,10 @@ class ScreeningService:
             "market": raw_data.get("market") or market,
             "snapshot_count": raw_data.get("snapshot_count"),
             "snapshot_source": raw_data.get("snapshot_source") or "",
+            "snapshot_filtered_count": raw_data.get("snapshot_filtered_count"),
+            "seed_pool_count": raw_data.get("seed_pool_count") or 0,
+            "seed_pool_limit": raw_data.get("seed_pool_limit") or 0,
+            "seed_pool_diagnostics": raw_data.get("seed_pool_diagnostics") or {},
             "after_filter_count": raw_data.get("after_filter_count"),
             "llm_ranked": raw_data.get("llm_ranked"),
             "llm_market_view": raw_data.get("llm_market_view") or "",
@@ -1295,6 +1299,9 @@ class ScreeningService:
             "risk_enabled": raw_data.get("risk_enabled"),
             "portfolio_diversity_enabled": raw_data.get("portfolio_diversity_enabled"),
             "portfolio_concentration_notes": raw_data.get("portfolio_concentration_notes") or [],
+            "sector_quota_applied": bool(raw_data.get("sector_quota_applied")),
+            "sector_quota_replacements": raw_data.get("sector_quota_replacements") or 0,
+            "sector_quota_max_per_bucket": raw_data.get("sector_quota_max_per_bucket") or 0,
             "result_variant_applied": bool(raw_data.get("result_variant_applied")),
             "result_variant_pool_size": raw_data.get("result_variant_pool_size") or 0,
             "result_variant_rotated_slots": raw_data.get("result_variant_rotated_slots") or 0,
@@ -1780,9 +1787,10 @@ def _screening_runtime_env(config: Config, *, max_results: Optional[int] = None)
 def _build_screening_dsa_daily_history_fetcher() -> Optional[Callable[..., Any]]:
     """Build one request-local DSA-first daily-history fetcher.
 
-    The returned closure captures the bundled Screening fetcher as its
-    fallback. It never replaces ``daily.fetch_daily_history``, so overlapping
-    screening requests cannot restore stale wrappers or build wrapper chains.
+    DSA owns the configured AkShare-primary/Baostock-validation contract. The
+    lightweight Screening providers remain a fallback. The closure never
+    replaces ``daily.fetch_daily_history``, so overlapping requests cannot
+    restore stale wrappers or build wrapper chains.
     """
     try:
         daily_module = importlib.import_module("src.services.screening.daily")
@@ -1802,6 +1810,7 @@ def _build_screening_dsa_daily_history_fetcher() -> Optional[Callable[..., Any]]
         cache_dir: str | Path | None = None,
         cache_ttl_seconds: float | None = None,
     ) -> Any:
+        dsa_error: Exception | None = None
         try:
             dsa_df, dsa_source = get_dsa_daily_history(code, lookback_days=lookback_days)
             normalized = _normalize_dsa_daily_history(dsa_df)
@@ -1836,20 +1845,33 @@ def _build_screening_dsa_daily_history_fetcher() -> Optional[Callable[..., Any]]
                             lookback_days=int(lookback_days),
                         )
                 return normalized
+            dsa_error = RuntimeError("DSA daily history returned no usable rows")
         except Exception as exc:
+            dsa_error = exc
             logger.warning(
-                "Screening DSA daily history fetch failed for %s; falling back to Screening source %s: %s",
+                "Screening DSA daily history failed for %s; falling back to local source %s: %s",
                 code,
                 source,
                 exc,
             )
-        return original_fetch(
-            code,
-            lookback_days=lookback_days,
-            source=source,
-            retries=retries,
-            cache_dir=cache_dir,
-            cache_ttl_seconds=cache_ttl_seconds,
+
+        try:
+            local_result = original_fetch(
+                code,
+                lookback_days=lookback_days,
+                source=source,
+                retries=retries,
+                cache_dir=cache_dir,
+                cache_ttl_seconds=cache_ttl_seconds,
+            )
+            if local_result is not None and not bool(getattr(local_result, "empty", False)):
+                return local_result
+        except Exception as local_error:
+            raise RuntimeError(
+                f"No daily history returned for {code}; DSA: {dsa_error}; local: {local_error}"
+            ) from local_error
+        raise RuntimeError(
+            f"No daily history returned for {code}; DSA: {dsa_error}; local source returned no usable rows"
         )
 
     return fetch_daily_history_with_dsa
@@ -3290,6 +3312,43 @@ def get_dsa_daily_history(stock_code: str, *, lookback_days: int = 120) -> Tuple
     return load_history_df(normalized_code, days=days)
 
 
+def get_dsa_daily_validation(stock_code: str, *, lookback_days: int = 160) -> Dict[str, Any]:
+    """Run the configured final-pick daily source and expose its validation audit."""
+    normalized_code = _env_text(stock_code).zfill(6)
+    days = max(int(lookback_days or 0), 30)
+    manager = _get_dsa_fetcher_manager()
+    frame, source = manager.get_daily_data(normalized_code, days=days)
+    if frame is None or bool(getattr(frame, "empty", True)):
+        return {
+            "enabled": True,
+            "status": "unavailable",
+            "primary_source": source or "none",
+            "rows": 0,
+        }
+
+    attrs = dict(getattr(frame, "attrs", {}) or {})
+    validation = attrs.get("source_validation")
+    if not isinstance(validation, dict) and hasattr(manager, "get_daily_source_validation"):
+        validation = manager.get_daily_source_validation(normalized_code)
+    validation = dict(validation) if isinstance(validation, dict) else {}
+    latest_date = ""
+    for column in ("date", "trade_date", "日期"):
+        if column in frame.columns:
+            values = frame[column].dropna()
+            if not values.empty:
+                latest_date = _env_text(values.iloc[-1])
+            break
+    return _remove_non_finite_json_values({
+        "enabled": True,
+        "mode": validation.get("mode") or attrs.get("data_source_mode") or "",
+        "status": validation.get("status") or "not_validated",
+        "primary_source": source or "",
+        "rows": len(frame),
+        "latest_date": latest_date,
+        "validation": validation,
+    })
+
+
 def _normalize_dsa_daily_history(raw_df: Any) -> Any:
     if raw_df is None:
         return None
@@ -3359,15 +3418,42 @@ def get_dsa_fundamental_context(stock_code: str) -> Dict[str, Any]:
 
 def search_dsa_stock_news(stock_code: str, stock_name: str = "", max_results: int = 3) -> Dict[str, Any]:
     service = _get_dsa_search_service()
-    if not getattr(service, "is_available", False):
-        return {
-            "success": False,
-            "error": "DSA search service unavailable",
-            "results": [],
-        }
+    primary: Dict[str, Any] = {
+        "success": False,
+        "error": "DSA search service unavailable",
+        "results": [],
+    }
+    if getattr(service, "is_available", False):
+        response = service.search_stock_news(stock_code, stock_name or stock_code, max_results=max_results)
+        primary = _normalize_dsa_search_response(response, max_results=max_results)
+        if primary.get("results"):
+            return primary
 
-    response = service.search_stock_news(stock_code, stock_name or stock_code, max_results=max_results)
-    return _normalize_dsa_search_response(response, max_results=max_results)
+    try:
+        from src.services.screening.candidate_context import fetch_stock_news_items
+
+        results = fetch_stock_news_items(
+            stock_code,
+            limit=max_results,
+            max_age_days=2,
+        )
+    except Exception as exc:  # noqa: BLE001 - search fallback stays fail-open.
+        if not primary.get("error"):
+            primary["error"] = str(exc)
+        return primary
+
+    if results:
+        return {
+            "query": f"{stock_name or stock_code} {stock_code}",
+            "provider": "akshare_stock_news_em",
+            "success": True,
+            "error": None,
+            "results": results,
+            "fallback_from": primary.get("provider") or "dsa_search",
+        }
+    if not primary.get("error"):
+        primary["error"] = "No dated stock news within the last 2 days"
+    return primary
 
 
 def search_dsa_stock_events(stock_code: str, stock_name: str = "", max_results: int = 3) -> Dict[str, Any]:
@@ -3529,6 +3615,11 @@ def _build_dsa_candidate_context(
     news: Dict[str, Any] = dict(existing_news) if existing_news else {"success": False, "results": []}
     existing_events = existing_context.get("events") if isinstance(existing_context.get("events"), dict) else {}
     events: Dict[str, Any] = dict(existing_events) if existing_events else {"success": False, "results": []}
+    daily_validation = (
+        existing_context.get("daily_validation")
+        if isinstance(existing_context.get("daily_validation"), dict)
+        else {}
+    )
     existing_warnings = existing_context.get("warnings") or []
     if isinstance(existing_warnings, list):
         warnings.extend(str(item) for item in existing_warnings if item)
@@ -3566,6 +3657,21 @@ def _build_dsa_candidate_context(
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"fundamental_context_failed: {exc}")
             fundamentals = {}
+
+    if profile == "post_rank_full" and _cn_quant_daily_validation_enabled() and not daily_validation:
+        try:
+            daily_validation = get_dsa_daily_validation(code, lookback_days=160)
+            if daily_validation.get("status") not in {"ok", "warning"}:
+                warnings.append(
+                    f"daily_validation_{daily_validation.get('status') or 'unavailable'}"
+                )
+        except Exception as exc:  # noqa: BLE001 - final validation is fail-open.
+            warnings.append(f"daily_validation_failed: {exc}")
+            daily_validation = {
+                "enabled": True,
+                "status": "failed",
+                "error": str(exc),
+            }
 
     if include_news:
         if not _news_has_results(news):
@@ -3607,7 +3713,9 @@ def _build_dsa_candidate_context(
 
     summary = _build_dsa_analysis_summary(candidate, quote, fundamentals, news, events)
     context = {
-        "enriched": bool(quote or fundamentals or news.get("results") or events.get("results")),
+        "enriched": bool(
+            quote or fundamentals or news.get("results") or events.get("results") or daily_validation
+        ),
         "profile": profile,
         "news_included": bool(include_news),
         "events_included": bool(include_events),
@@ -3615,6 +3723,7 @@ def _build_dsa_candidate_context(
         "fundamentals": fundamentals,
         "news": news,
         "events": events,
+        "daily_validation": daily_validation,
         "warnings": _dedupe_strings(warnings),
     }
     return {
@@ -3623,6 +3732,10 @@ def _build_dsa_candidate_context(
         "dsa_events": events.get("results") or [],
         "dsa_analysis_summary": summary,
     }
+
+
+def _cn_quant_daily_validation_enabled() -> bool:
+    return os.getenv("CN_QUANT_DATA_MODE", "").strip().lower() == "akshare_baostock"
 
 
 def _first_non_empty(*values: Any) -> Any:
@@ -3770,8 +3883,22 @@ def _normalize_candidate(raw: Any, rank: int) -> Dict[str, Any]:
         "price": _first_present(item, source, "price"),
         "change_pct": _first_present(item, source, "change_pct"),
         "amount": _first_present(item, source, "amount"),
+        "seed_pool_score": _first_present(item, source, "seed_pool_score"),
+        "seed_pool_reason": item.get("seed_pool_reason") or source.get("seed_pool_reason") or "",
         "industry": item.get("industry") or source.get("industry") or "",
+        "adr_20_pct": _first_present(item, source, "adr_20_pct"),
+        "change_20d": _first_present(item, source, "change_20d"),
+        "change_60d": _first_present(item, source, "change_60d"),
+        "relative_strength_20d_pctile": _first_present(item, source, "relative_strength_20d_pctile"),
+        "relative_strength_60d_pctile": _first_present(item, source, "relative_strength_60d_pctile"),
+        "pullback_depth_10d_pct": _first_present(item, source, "pullback_depth_10d_pct"),
+        "range_contraction_ratio": _first_present(item, source, "range_contraction_ratio"),
+        "volume_contraction_ratio": _first_present(item, source, "volume_contraction_ratio"),
+        "support_confluence_count": _first_present(item, source, "support_confluence_count"),
+        "trigger_distance_pct": _first_present(item, source, "trigger_distance_pct"),
+        "sector_breadth_count": _first_present(item, source, "sector_breadth_count"),
         "factor_scores": item.get("factor_scores") or source.get("factor_scores") or {},
+        "trade_plan": item.get("trade_plan") or source.get("trade_plan") or {},
         "dsa_context": dsa_context,
         "dsa_news": dsa_news,
         "dsa_events": dsa_events,

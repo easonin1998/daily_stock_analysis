@@ -7,6 +7,7 @@ DSA 将选股能力作为主项目的一部分维护。实现参考 [AlphaSift](
 - `src/services/screening/`：快照、日 K、策略加载、过滤、评分、风险、LLM 重排与热点实现。
 - `src/services/screening/strategies/`：随 DSA 版本发布的策略 YAML。
 - `src/services/screening/pipeline.py`：筛选流程的直接入口。
+- `src/services/screening/strategy_backtest.py`：基于本地日线缓存的 Martin 点时信号与组合回测，不替代历史 AI 报告验证。
 - `src/services/screening_service.py`：DSA 业务编排，直接调用 pipeline，负责配置、数据源上下文、响应归一化、缓存与错误映射。
 - `src/storage.py`：使用 DSA 现有 SQLAlchemy/SQLite 基础设施持久化已完成的选股运行，不另建文件数据库。
 - `api/v1/endpoints/screening.py`：`/api/v1/screening` API。
@@ -24,6 +25,12 @@ SCREENING_ENABLED=false
 
 Web“基础设置”页展示“选股”开关。开启后左侧显示“选股”入口并允许执行策略、热点和选股任务；关闭后入口隐藏，选股 API 继续拒绝业务请求。
 
+## Web 交互与飞书通知
+
+Web 是选股的主交互入口。用户选择市场、策略和返回数量后提交后台任务，页面会持续显示进度；默认勾选“完成后推送飞书”，任务成功后发送专用结果卡片，列出候选数量、前列标的和入选依据。推送失败不会回滚或覆盖已经完成并持久化的选股结果。
+
+飞书卡片中的详情链接使用浏览器提交任务时的网页来源，并附带 `runId`。打开 `/screening?runId=<run_id>` 会直接读取对应的历史结果，而不是重新执行筛选。为避免向手机发送无法使用或不安全的链接，只有 HTTPS 公网来源才会显示详情链接；`127.0.0.1`、`localhost`、局域网 IP 和普通 HTTP 来源仍会收到完整候选卡片，但不附网页链接。远程访问必须先启用管理员登录保护，再通过受保护的 HTTPS 域名或隧道接入。
+
 常用可选项：
 
 ```dotenv
@@ -36,9 +43,127 @@ SCREENING_SNAPSHOT_CALL_TIMEOUT_SEC=60
 SCREENING_DAILY_CALL_TIMEOUT_SEC=20
 SCREENING_EASTMONEY_MIN_INTERVAL_SEC=1.0
 SCREENING_EASTMONEY_JITTER_SEC=0.3
+SCREENING_DAILY_FEATURE_LIBRARY_ENABLED=true
+SCREENING_DAILY_FEATURE_LIBRARY_PATH=data/screening/daily_feature_library.json
+SCREENING_DAILY_FEATURE_LIBRARY_MAX_AGE_DAYS=7
+DAILY_LOOKBACK_DAYS=160
+DAILY_ENRICH_MAX_CANDIDATES=120
+DAILY_FETCH_MAX_WORKERS=4
+INDUSTRY_PROVIDER=baostock
+SCREENING_SEED_POOL_CORE_RATIO=0.55
+SCREENING_SEED_POOL_STRENGTH_RATIO=0.20
+SCREENING_SEED_POOL_ACTIVITY_RATIO=0.15
+SCREENING_SEED_POOL_MAX_SECTOR_RATIO=0.20
 ```
 
 路径、缓存、超时和限流项只影响选股链路。`SCREENING_SNAPSHOT_CACHE_TTL_SEC` 默认 300 秒，设为 `0` 可关闭新鲜快照复用。`SCREENING_HOTSPOT_CALL_TIMEOUT_SEC` 的正数值是默认热点 provider 单次板块、成分股或直接详情 fallback 调用的总预算，后续 fallback 和并行成分股源共用同一截止时间，并把剩余时间传入可终止的 AkShare 子进程与 HTTP socket；设为 `0/off/disabled` 只关闭这层总预算，各真实数据源仍保留自身硬超时。`SCREENING_HOTSPOT_SEARCH_TIMEOUT_SEC` 是用户主动新闻搜索的端到端截止时间，缓存 owner 等待、重新竞争和 provider 子进程共享同一个绝对 deadline；`0/off/disabled` 会回退到安全默认值 12 秒，而不是无限等待。完整示例以 `.env.example` 为准。
+
+`martin_momentum_pullback` 至少需要 120 个有效交易日，默认抓取 160 个交易日。`DAILY_ENRICH_MAX_CANDIDATES` 同时是种子池上限：引擎不会再只按成交额截取前 N，而是从流动性核心、中期动量优先的强度池、交易活跃度和每日确定性轮换覆盖四条通道组池；有行业字段时，单一行业默认不超过种子池 20%，不足时再回填以保证样本数。本地指标库已有覆盖时，强度池优先使用真实 20/60 日涨幅和 EMA 趋势；未覆盖股票仍可通过轮换通道进入，避免一次建库失败后永久失去机会。增加该值会扩大相对强度比较池，同时增加首次运行的网络请求；后续运行优先复用 24 小时日线缓存。默认不启用会改写最终分数的 `POST_ANALYZERS`；需要 DSA 或外部深度分析时再显式开启。
+
+## 当前内置策略
+
+内置策略只保留 `martin_momentum_pullback`（Martin 动量回调），适配 A 股 T+1、涨跌停和流动性约束。原有双低、价值、低波、超跌反转、资金热度、放量突破等策略文件已移除，不再出现在策略列表中，也不能发起新的运行；数据库中已有的旧策略结果仍可按 `run_id` 读取。
+
+硬过滤先要求全市场上涨家数占比不少于 35%、涨跌幅中位数不低于 -1.5%，避免在明显 risk-off 环境逆势开新仓；个股需非 ST、股价不低于 1.5 元、当日成交额和 20 日平均成交额均不少于 1 亿元、市值不少于 30 亿元、至少 120 个日线样本，并排除一字涨停。1.5 元是避免过度接近 1 元交易类退市风险区的执行护栏，不把 4 元误当监管边界；1.5-2 元与 2-4 元股票仍可入围，但在风险层分别施加较强与轻度软惩罚。随后要求 ADR20 位于 3.5%-8%、20 日相对强度位于候选池前 30%、60 日相对强度位于前 5%、EMA9 > EMA21 > EMA50 且 EMA21/EMA50 上行、距 120 日高点不超过 15%、近 10 日已有 1%-12% 回调、近 3 日波幅和成交量相对前序窗口收敛、至少两项支撑共振，并处于前一交易日高点附近的触发区。60 日前 5% 是领涨股硬门槛；触发日收盘在全天区间的位置和相对前一日量能只进入质量评分，不作为容易过拟合的刚性删除条件。
+
+固定七维评分如下，权重合计 100%：
+
+| 维度 | 权重 | 主要证据 |
+| --- | ---: | --- |
+| 趋势质量 | 20% | EMA 多头、EMA21/50 斜率、距 120 日高点 |
+| 相对强度 | 20% | 20/60 日收益在日线候选池内的百分位 |
+| 板块共振 | 15% | 行业热度与同板块强势候选数量；缺失行业数据时保持中性 |
+| 缩量收敛 | 15% | 近 3 日波幅/成交量相对前序窗口的收缩与回调深度 |
+| 支撑共振 | 15% | 价格与 EMA9、EMA21、近 60 日高点锚定 VWAP 的接近程度 |
+| 触发质量 | 10% | 收盘相对前一交易日高点的位置、全天区间收盘位置、相对前一日量能，并惩罚单日追涨 |
+| 流动性 | 5% | 20 日平均成交额优先，缺失时回退快照成交额，并参考换手率 |
+
+ADR20 定义为最近 20 个交易日 `mean((high / low - 1) * 100)`，衡量股票日内可交易波动，不是美国存托凭证，也不等同于包含跳空的 ATR。
+
+每个最终候选都会附带结构化 `trade_plan`。形态合格但尚未突破前一交易日高点时，状态为 `watch_wait_trigger`，明确标记“不下单”；完成收盘确认后状态为 `buy_signal`，同时给出下一开盘集合竞价的最低/最高可接受价、初始防守价、1R 保本观察价、2R 观察价、10 日跟随要求和 20 日最长持有期。开盘区间不再固定为对称 ±2%：波动基准取信号日 `ATR20%` 与 `ADR20%` 的均值（缺一则使用另一个），低开容忍取基准的 30% 并限制在 1%～1.5%，高开容忍取基准的 50% 并限制在 1.5%～2%；高波动只会让区间逐步接近上限，不会把高开追价放宽到 2% 以上。最低价还必须守住前一日高点和 EMA21，实际成交后仍需通过 3% 技术止损距离上限。防守价由前高、EMA21、锚定 VWAP、ADR 缓冲和最大初始风险共同约束，不由 LLM 临时发挥。信号日的 1R/2R 仅按参考收盘价预估，实际成交后由 `rebase_martin_trade_plan_after_fill` 按成交价和初始防守价重算；2R 是移动防守与减仓评估参考，不是未经验证的固定止盈点。仓位不再按候选数量机械等权：默认以账户权益的 0.5% 作为单笔风险预算、2.5% 作为全部持仓技术风险热度上限，并只用实际成交价到初始防守价的技术止损距离反推股数；单只名义仓位不得超过 20%，技术止损距离超过 3% 时放弃交易，A 股数量向下取整到 100 股后仓位不足账户权益 12% 时也不下单。`1.0 × ADR20` 独立作为集合竞价跳空压力指标展示，不参与计仓。未提供账户权益时只输出权重上限、最低有效仓位、风险口径和公式，不伪造股数。
+
+持仓期间每天收盘后更新一次有效防守价：初始止损、当日 EMA21 与“最高收盘价回撤 8%”三者取最高；最高收盘价达到 1R 后，再把真实成交价加入防守线，避免已有利润重新变成明显亏损。若收盘跌破该防线、持有 10 日仍未达到 3% 跟随，或达到 20 日上限，则生成“下一开盘集合竞价卖出”信号。券商条件单只是执行工具；若券商只能按盘中触价触发，或普通限价买单无法同时表达最低/最高开盘价区间，则与本策略的收盘确认语义不同，不能直接拿回测结果等同评价。
+
+## 本地日线指标库
+
+本地指标库把已完成日 K 计算得到的 20/60 日涨幅、ADR20、EMA 趋势、回调深度、量价收敛、支撑与触发位置等特征按股票代码持久化。正常筛选先把有效期内的指标合并到快照初筛结果，再建立种子池；20/60 日相对强度百分位按完整快照合格池计算，不在 120 只种子池内缩小比较基准。种子池中的股票仍会读取原始日线缓存或实时源复核，成功后回写指标库。这样全市场排序不必每次发起数千个日线请求，同时保留最终候选的新鲜度确认。
+
+首次建库或补齐覆盖可运行：
+
+```bash
+# 默认只处理一批 200 只，可重复执行并断点续建
+python scripts/build_screening_daily_library.py
+
+# 一次持续处理当前符合快照基础门槛的全部股票
+python scripts/build_screening_daily_library.py --batch-size 250 --workers 4 --all
+
+# 回测研究专用：完整当前 A 股快照，不做当前成交额/市值/价格预筛
+python scripts/build_screening_daily_library.py \
+  --universe-mode full-a-share \
+  --library-path data/screening/backtests/full_a_share_daily_feature_library.json \
+  --batch-size 250 --workers 4 --all
+```
+
+脚本会先吸收已有 `daily_history` 缓存，再按确定性顺序请求尚未覆盖的股票。建库默认要求 `qfq` 前复权口径；腾讯、AkShare 和 Baostock 的前复权缓存可复用，Sina 不复权缓存及旧的未知口径缓存会被拒绝并重新抓取，禁止在同一横截面混算收益、均线和止损。仅当实时快照、交易日历和盘后/非交易日状态均可确认时，才会把口径兼容的最近完整快照补成已完成日 K；不能确认时宁可跳过，不伪造交易日。初始建库完成后，正常选股会在检测到指标库落后于最近完整交易日时执行相同的本地增量维护，只读取已有缓存和当日快照，不为全市场重新发起日线请求。中断不会破坏现有库，后续再次运行会跳过有效期内已完成的股票。指标库是派生索引，删除后可从日线缓存或数据源重建；原始日线缓存仍是可追溯依据。
+
+## Martin 日线组合回测
+
+策略回测与现有 `BacktestService` 职责不同：`BacktestService` 验证已经保存的 AI 分析记录，本模块则把 Martin 硬过滤和七因子排序还原到历史日线横截面，并模拟一个可交易组合。二者不会共用结果表，也不会互相覆盖。
+
+默认运行示例：
+
+```bash
+python scripts/run_martin_strategy_backtest.py \
+  --start-date 2026-08-01 \
+  --end-date 2026-10-16
+
+# 对绝对盈亏最大的 5 个成交标的追加 AkShare 主取 + Baostock 复核
+python scripts/run_martin_strategy_backtest.py \
+  --start-date 2026-08-01 \
+  --end-date 2026-10-16 \
+  --validate-samples 5
+
+# 使用独立的完整当前 A 股日线库回测
+python scripts/run_martin_strategy_backtest.py \
+  --start-date 2026-04-01 \
+  --end-date 2026-10-17 \
+  --initial-cash 50000 \
+  --universe-mode full-a-share \
+  --library-path data/screening/backtests/full_a_share_daily_feature_library.json
+
+```
+
+回测会按“120 根策略预热 + 回测区间预计交易日 + 15 日缓冲”自动提高所需日线窗口，并可复用更长窗口的兼容缓存；报告同时展示区间起点具备完整 120 根历史的覆盖率。覆盖率低于 90% 时会写入限制项，不能把早期缺失信号解读为策略主动空仓。两个月区间建议先建立至少 220 根日线缓存：
+
+```bash
+python scripts/build_screening_daily_library.py \
+  --lookback-days 220 \
+  --max-age-days 0 \
+  --batch-size 250 \
+  --workers 4 \
+  --all
+```
+
+回测只保留一套 Martin 选股与持仓系统，不再把“左侧/右侧”作为两个策略。次日开盘低开与高开边界均按 ATR20/ADR20 自适应，高开上限不超过 2%。先用动量、相对强度、EMA 趋势、ADR、缩量收敛和支撑共振识别形态；60 日相对强度必须位于点时全市场前 5%。当前实现把“收盘重新站上前一交易日高点”作为日线突破确认代理，尚未确认的形态只进入观察统计，不再对突破幅度设置固定硬上限。这里的“等待回调后重新转强”符合 Martin 风格，但以前一日最高价为触发线仍是 DSA 为可回测、可执行而设定的代理规则，并非已确认的 Martin 原始硬条件。防追高由多层互不重复的约束承担：信号日涨幅不得超过 6%、排除一字涨停、突破距离与收盘位置及相对量能参与软排序、次日开盘必须位于自适应价格区间，且实际成交后的技术止损距离不得超过 3%。这样既保留确认强度，也避免固定 2% 上限机械漏掉高 ADR 主升股。信号只读取当日收盘及以前的数据，统一在下一交易日开盘集合竞价成交，并继续要求守住突破位和 EMA21。全程不使用分时、盘中高低点止损或同日反向成交。
+
+组合默认最多 5 只、100 股整数手，退出后冷却 3 个交易日。每笔以账户权益 0.5% 为风险预算，全部持仓技术风险热度不超过 2.5%，单只名义仓位不超过 20%；用于计仓的每股风险只取实际成交价到初始防守价的距离。实际成交后技术止损距离超过 3% 时放弃交易；100 股取整后的仓位低于账户权益 12% 时也放弃，避免小额头寸对组合没有实际意义。`1.0 × ADR20` 仍作为独立跳空压力场景记录，用来提醒集合竞价退出可能远离图表止损，但不再直接压缩股数。退出信号为收盘跌破 EMA21、相对持仓期最高收盘回撤 8%、持有 10 日仍未获得 3% 跟随，或最多持有 20 日，均在下一交易日开盘集合竞价执行。这里的“集合竞价成交”由日线开盘价近似，不表示能够还原委托、排队、撤单和真实成交概率；收盘只用于确认信号，不允许在已知当日收盘后反推按同一收盘价成交。
+
+默认成本为买卖佣金各 3bp、买卖滑点各 5bp、卖出印花税 5bp。佣金按券商综合佣金处理，不重复叠加交易所经手费；不模拟单笔最低 5 元佣金。开盘接近对应板块涨跌停幅度时不假设可以买入或卖出，期末未平仓头寸按最后收盘价扣除预计卖出成本。自适应开盘区间的比例和上下限均可通过脚本参数覆盖；`--entry-gap-min-pct` 与 `--entry-gap-max-pct` 仅用于固定阈值对照实验，默认不传。报告会完整记录实际参数，每笔成交也保存当时的波动基准和允许区间。
+
+产物写入 `data/screening/backtests/`：Markdown 用于阅读，JSON 保存完整规则、数据诊断、信号统计、净值与逐笔成交，CSV 分别保存单策略净值和交易。目录位于 `data/` 下，不作为代码提交。报告必须同时阅读以下限制：
+
+手机端可将最新回测结果直接推送为飞书 JSON 2.0 卡片：
+
+```bash
+python scripts/push_martin_backtest_feishu.py
+```
+
+也可通过 `--report-json` 指定某个回测 JSON。默认依次发送总览、月度资金曲线与退出归因、分页逐笔交易卡片；逐笔页明确展示股数、买卖成交价、买入总支出、卖出净回款、净盈亏与退出原因，其中总支出包含买入佣金，净回款已扣除卖出佣金和印花税。`--summary-only` 可只发总览。完整 JSON/Markdown/CSV 仍保留在本地产物中供复核。
+
+- 默认股票池由当前快照基础门槛建成，存在幸存者偏差和当前流动性偏差。`full-a-share` 模式覆盖当前完整 A 股快照并取消当前成交额、市值和价格预筛，但历史已退市股票仍不在当前快照中；历史 ST、总市值、退市与停复牌状态尚未点时重建，当前 ST 名称会在完整市场模式下保守排除。
+- 没有可靠历史板块成分与逐日板块热度时，板块因子保持中性且关闭板块配额，避免使用未来信息。
+- 回测默认只接受明确标记为 `qfq` 的腾讯、AkShare、Baostock、Tushare 或 DSA 降级链缓存；Sina 不复权数据会被排除。`--validate-samples` 对成交影响最大的股票执行 AkShare/Baostock 双源复核，按归一化价格路径和日收益差异判定，避免仅因固定复权缩放差异误报；它仍是抽查，不等同于全池双源认证。
+- 两个月级别样本只能用于验证实现和观察分布，不能证明策略长期有效；应继续扩展点时股票池、历史窗口和滚动样本外测试。
 
 ## API 契约
 
@@ -48,8 +173,8 @@ SCREENING_EASTMONEY_JITTER_SEC=0.3
 | `/api/v1/screening/strategies` | GET | 返回选股策略 |
 | `/api/v1/screening/hotspots` | GET | 读取缓存或显式刷新热点题材 |
 | `/api/v1/screening/hotspots/{topic}` | GET | 返回题材路线、成分股与核心股；`include_search=true` 时按需搜索近期消息 |
-| `/api/v1/screening/screen` | POST | 同步执行选股；可传匿名 `variant_seed` 在每次运行中生成有界的近分候选组合 |
-| `/api/v1/screening/screen/tasks` | POST | 提交后台选股任务；请求字段与同步接口一致 |
+| `/api/v1/screening/screen` | POST | 同步执行选股；可传匿名 `variant_seed` 生成有界的近分候选组合，并以 `notify=true` 请求飞书完成通知 |
+| `/api/v1/screening/screen/tasks` | POST | 提交后台选股任务；请求字段与同步接口一致，可附 `web_base_url` 生成运行详情链接 |
 | `/api/v1/screening/screen/tasks/{task_id}` | GET | 查询任务进度、错误或最终结果 |
 | `/api/v1/screening/history` | GET | 按策略、市场查询最近完成的选股运行摘要 |
 | `/api/v1/screening/history/{run_id}` | GET | 读取一条持久化的完整选股结果 |
@@ -62,21 +187,25 @@ SCREENING_EASTMONEY_JITTER_SEC=0.3
 ```text
 策略加载
   -> 全市场快照与字段标准化
-  -> 硬过滤
-  -> 因子评分与风险调整
+  -> 流动性/市值快照初筛
+  -> 多通道种子池与行业配额
+  -> 本地缓存/直连日 K 特征与跨股票相对强度
+  -> Martin 硬过滤与七维评分
   -> 候选上下文补充
   -> LLM 重排（可降级）
-  -> 风险/组合约束与近分候选轮换
-  -> Top 候选 DSA 行情/基本面/新闻增强
+  -> 风险、近分轮换与保质量行业配额
+  -> Top 候选 DSA 行情/基本面/新闻增强及 AkShare/Baostock 终选复核
   -> API 归一化响应与 DSA 数据库持久化
   -> 用户按需进入 DSA 单股深度分析
 ```
 
 - 全市场快照在短 TTL 内优先复用最近成功结果；新缓存会记录完整且有序的数据源优先级，只在当前优先级与写入时一致时复用，因此同一来源链中的后备源结果可以加速后续请求，修改来源配置后则会重新读取实时数据。缓存过期后按配置优先级逐源尝试，单一数据源失败后继续降级，并记录 source health 与 last-good 缓存。当前 Sina、Efinance、AkShare/东财和 Tushare 快照接口均不提供增量游标或变更序列，因此 TTL 内可以零请求复用，TTL 到期后仍需重新读取全表；本地比较前后差异不能减少上游传输量，不作为“增量拉取”宣传。
 - 有 `TUSHARE_TOKEN` 时默认优先 Tushare，否则默认从 Sina 开始；显式 `SNAPSHOT_SOURCE_PRIORITY` 始终优先。
-- 日 K 优先通过请求级 fetcher 复用 DSA 历史行情链路，无结果时再走筛选引擎的数据源降级；该桥接不会替换进程级函数，因此重叠选股请求之间不会共享 wrapper 或阻塞彼此。
+- 种子池日 K 优先读取选股缓存并使用腾讯、Sina、AkShare、Baostock 等本地直连降级链；仅在这些来源失败时进入较重的 DSA `DataFetcherManager`。该桥接是请求级闭包，不替换进程级函数，因此重叠请求之间不会共享 wrapper。腾讯日线缺少成交额时，按其“手”口径使用 `成交量 × 收盘价 × 100` 估算；Sina 按其“股”口径使用 `成交量 × 收盘价`。估算值只参与流动性门槛，不改变价格或量价形态因子，历史缓存会在计算前应用相同口径。
+- 最终组合先执行软集中度惩罚，再应用每板块最多 2 只的保质量配额；只有跨板块备选与被替代候选分差不超过 3 分时才替换，否则保留更强候选并记录原因。配置 `CN_QUANT_DATA_MODE=akshare_baostock` 时，最终候选额外运行 AkShare 主取、Baostock 前复权校验，并把校验状态写入 `dsa_context.daily_validation`；校验失败按 fail-open 处理并明确记录。
+- 候选新闻优先复用 DSA 搜索服务；主搜索不可用或无结果时，降级到 AkShare `stock_news_em` 国内资讯，并硬性剔除缺少发布时间、超过 48 小时或明显未来时间的数据。
 - LLM 重排前只补充有限候选上下文，最终候选再补行情、基本面、新闻和摘要，控制请求量。
-- 默认本地 `scorecard` 会覆盖完整短名单，保证所有可能进入近分轮换的候选使用同一最终评分口径；多个后置分析器串联时，每一步完成后都会按最新分数重排，因此后续 `dsa` 与 `external_http` 的 `POST_ANALYSIS_MAX_PICKS` 上限作用于当前真实前列。远程状态按实际提交候选记录，外部响应中的超限代码不会改写未提交候选；启用远程分析时轮换只会在已完成相同分析的候选之间发生。
+- 默认最终本地分数直接采用 Martin 七维评分，不再由旧 `scorecard` 二次改写。显式配置多个后置分析器时，每一步完成后仍按最新分数重排，因此后续 `dsa` 与 `external_http` 的 `POST_ANALYSIS_MAX_PICKS` 上限作用于当前真实前列。远程状态按实际提交候选记录，外部响应中的超限代码不会改写未提交候选；启用远程分析时轮换只会在已完成相同分析的候选之间发生。
 - 模型、渠道、base URL、额外 headers、fallback、timeout 和 token 上限在单次调用范围内注入，不改写用户配置；主模型即使 HTTP 调用成功，但返回空内容、非 JSON 或覆盖率不足，也会继续尝试已配置的备用模型。最终 JSON 必须在 `content` 块或 `output` 块中；`reasoning_content`（链式思考）被视为内部辅助，不作为最终结果。
 - 热点榜单刷新与选股长流程可并行执行；列表默认不批量预取详情，用户选中具体题材时才加载该题材详情；显式刷新后若继续保留当前题材，Web 会同步绕过详情缓存重拉该题材，保证榜单与详情来自同次刷新。
 - 热点成分股并行获取东方财富与同花顺数据，并按固定数据源优先级合并，避免响应先后改变重复股票的字段：正数 `SCREENING_HOTSPOT_CALL_TIMEOUT_SEC` 作为默认 provider 整次调用的共享预算，板块列表、成分股以及引擎失败后的直接详情 fallback 都进入该预算；AkShare/东方财富的可终止子进程与同花顺 HTTP connect/read timeout 每一步只使用剩余时间，fallback 不会重新获得完整预算。直接详情 fallback 不再额外启动无法由该预算强制回收的实时行情预取，行情字段以已受控的成分股源结果为准。超时子进程会 terminate/kill 并回收；进程级并发槽限制活跃任务数量，方法返回前会等待已接纳的 worker 结束，不遗留后台线程。关闭整次调用预算时，各单源仍保留默认硬超时；单源失败不会阻止另一源和本地核心股回退。
@@ -95,7 +224,9 @@ Web 会在浏览器本地生成一个不含用户信息的匿名种子，并随�
 | --- | --- | --- |
 | 全市场快照 | `data/screening/snapshot.last_good.json` | 默认 5 分钟内直接复用且不标记 fallback；过期后请求实时源，实时源全部失败时仍可按最大陈旧时间约束回退并标记 stale/fallback |
 | 个股日 K | `data/screening/daily_history/` | 按代码、来源和回看窗口分键，默认 TTL 24 小时；实时源全部失败时可使用过期缓存并标记 stale |
-| 行业/概念映射 | `data/screening/industry_provider_cache/` | 默认 TTL 24 小时，并保存板块热度历史用于趋势计算 |
+| 日线指标库 | `data/screening/daily_feature_library.json` | 按代码保存日 K 派生指标；默认只将最近 7 天内的条目合并进种子池，支持脚本分批断点续建 |
+| Martin 策略回测 | `data/screening/backtests/` | 按起止日期输出 Markdown、JSON、逐笔交易和每日净值；属于可重建研究产物，不写 DSA 业务数据库 |
+| 行业/概念映射 | `data/screening/industry_provider_cache/` | Baostock 全市场行业映射或 AkShare 板块映射默认 TTL 24 小时，并保存可用的板块热度历史 |
 | 热点列表与历史 | `data/screening/hotspots.json`、`hotspot.history.jsonl` | 显式刷新写入；实时失败时回退最近可用快照 |
 | 热点详情 | `data/screening/hotspot_details/` | 默认 TTL 30 分钟；只缓存结构化基础详情，显式消息搜索不写入或续期该缓存；实时失败时可回退过期详情并返回陈旧时长 |
 | DSA 实时行情 | `DataFetcherManager` 的行情缓存 | 默认 TTL 10 分钟，沿用 `REALTIME_CACHE_TTL` |
@@ -114,17 +245,17 @@ DSA 中存在两类用途不同的策略文件：
 | `src/services/screening/strategies/*.yaml` | 从全市场筛出哪些候选 | `src/services/screening/strategy.py` | 快照过滤、因子评分、风险和排序 |
 | `strategies/*.yaml` | 对单只股票如何分析和形成结论 | `src/agent/skills/base.py` | DSA Agent/报告分析 |
 
-即使 `shrink_pullback`、`volume_breakout` 同名，两者也使用不同目录、Schema 和 loader，不会相互覆盖。筛选策略可通过 `analysis_skills` 声明下一阶段建议使用的分析 skill；Web 的“进一步深度分析”会显式携带这些 skill。未声明映射的筛选策略继续使用用户当前选择或默认分析策略，不做含义不可靠的强行映射。
+当前筛选策略 `martin_momentum_pullback` 会把 `bull_trend` 与 `shrink_pullback` 作为后续单股分析 skill；这些 skill 不是可独立启动的旧筛选策略。Web 的“进一步深度分析”会显式携带该映射，两个目录仍使用不同 Schema 和 loader。
 
 ## DSA 原生能力复用
 
-- 行情：日 K 优先调用 DSA `DataFetcherManager`，无结果才进入筛选模块自己的多源 fallback；最终候选继续补 DSA 实时行情。
+- 行情：大样本日 K 使用筛选模块本地缓存与轻量多源链，全部失败时才调用 DSA `DataFetcherManager`；最终候选继续补 DSA 实时行情，并按国内量化模式执行 AkShare/Baostock 复核。
 - 基本面与资讯：最终候选复用 DSA 基本面上下文和 `SearchService`；资本流向来自 DSA 基本面上下文，重要公告/业绩/减持事件调用 DSA `search_stock_events`，热点消息搜索沿用其数据源优先级、时效过滤、缓存和同请求合并，仅将真实供应商调用隔离到可终止子进程，不重复维护独立资讯入口。
 - 模型：沿用 DSA LiteLLM 模型、渠道、fallback、base URL、额外 headers、超时和 token 配置。
 - 任务与页面：复用 DSA 后台任务队列、Web 轮询和桌面端同源 Web 资源。
 - 存储与后续分析：运行结果写入 DSA 数据库；候选可进入 DSA 原生单股分析并携带策略 skill。
 
-对照固定参考提交，快照、日 K、美股、行业/概念、热点、候选新闻/公告/资金流、字段标准化、过滤、评分、风险、排序和数据源熔断等原始数据与选股能力均已纳入；其中公告/事件和资金流在 DSA 编排层分别接入原生事件搜索与基本面上下文。参考项目另外提供独立 CLI/server、JSON 文件 store、报告渲染、doctor、运行/数据源历史和 T+N 评估：本实现只吸收 DSA 确实缺少的运行历史与数据源历史，并接到 DSA 数据库；CLI/server 不重复建设，T+N 评估与表现统计继续复用 DSA 已有 BacktestService，避免形成第二套回测真源。实时 source health 已在 `/status` 返回，历史稳定性由 `/source-history` 补齐。
+对照固定参考提交，快照、日 K、美股、行业/概念、热点、候选新闻/公告/资金流、字段标准化、过滤、评分、风险、排序和数据源熔断等原始数据与选股能力均已纳入；其中公告/事件和资金流在 DSA 编排层分别接入原生事件搜索与基本面上下文。参考项目另外提供独立 CLI/server、JSON 文件 store、报告渲染、doctor、运行/数据源历史和 T+N 评估：本实现只吸收 DSA 确实缺少的运行历史与数据源历史，并接到 DSA 数据库；CLI/server 不重复建设。历史 AI 报告的 T+N 评估与表现统计继续复用 DSA `BacktestService`；新增 Martin 组合模拟只读取本地日线研究产物，不写该服务的数据表，两种口径在命令、文档和存储上保持隔离。实时 source health 已在 `/status` 返回，历史稳定性由 `/source-history` 补齐。
 
 ## 收益
 

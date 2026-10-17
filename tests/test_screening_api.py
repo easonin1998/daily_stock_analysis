@@ -61,7 +61,7 @@ def _make_screening_core(
 ) -> SimpleNamespace:
     return SimpleNamespace(
         screen=screen or MagicMock(return_value=[]),
-        list_strategies=list_strategies or (lambda: [{"id": "dual_low", "name": "双低选股", "description": "", "category": "价值"}]),
+        list_strategies=list_strategies or (lambda: [{"id": "martin_momentum_pullback", "name": "Martin动量回调", "description": "", "category": "趋势"}]),
         get_status=get_status or (lambda: {"supported_markets": ["cn"], "contract_version": "1", "version": "0.2.0", "strategy_count": 1}),
     )
 
@@ -99,8 +99,8 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
         return Config(screening_enabled=enabled)
 
     @staticmethod
-    def _request(cookies=None) -> SimpleNamespace:
-        return SimpleNamespace(cookies=cookies or {})
+    def _request(cookies=None, *, base_url: str = "http://testserver/") -> SimpleNamespace:
+        return SimpleNamespace(cookies=cookies or {}, base_url=base_url)
 
     def _screen(self, config: Config, *, mock_enrichment: bool = True, **kwargs):
         if not mock_enrichment:
@@ -149,7 +149,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
         self.assertEqual(status["engine"], "builtin")
         self.assertEqual(status["reference_revision"], REFERENCE_REVISION)
         self.assertEqual(status["strategy_count"], len(strategies))
-        self.assertIn("dual_low", {item["id"] for item in strategies})
+        self.assertIn("martin_momentum_pullback", {item["id"] for item in strategies})
 
     def test_status_exposes_builtin_engine_provenance(self) -> None:
         payload = screening_endpoint.screening_status(config=self._config(enabled=True))
@@ -237,7 +237,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
         config = self._config(enabled=True)
         fake_module = _make_screening_core(
             list_strategies=lambda: [
-                {"id": "dual_low", "name": "双低选股", "description": "value", "category": "价值"},
+                {"id": "martin_momentum_pullback", "name": "Martin动量回调", "description": "momentum pullback", "category": "趋势"},
                 {"id": "trend_quality", "title": "趋势质量", "description": "trend", "tag": "框架"},
             ],
         )
@@ -247,8 +247,8 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
 
         self.assertEqual(payload["enabled"], True)
         self.assertEqual(payload["strategy_count"], 2)
-        self.assertEqual(payload["strategies"][0]["id"], "dual_low")
-        self.assertEqual(payload["strategies"][0]["name"], "双低选股")
+        self.assertEqual(payload["strategies"][0]["id"], "martin_momentum_pullback")
+        self.assertEqual(payload["strategies"][0]["name"], "Martin动量回调")
         self.assertEqual(payload["strategies"][1]["name"], "趋势质量")
 
     def test_hotspots_returns_screening_hotspot_summaries(self) -> None:
@@ -885,7 +885,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
         def run_screen() -> None:
             try:
                 screening_service._call_screening_screen(
-                    "dual_low",
+                    "martin_momentum_pullback",
                     "cn",
                     5,
                     config,
@@ -966,7 +966,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
                 self.assertTrue(hotspot_started.wait(timeout=1))
                 try:
                     screening_service._call_screening_screen(
-                        "dual_low",
+                        "martin_momentum_pullback",
                         "cn",
                         5,
                         config,
@@ -2364,7 +2364,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             ) as screen_mock,
         ):
             payload = screening_endpoint.screening_start_screen_task(
-                screening_endpoint.ScreeningScreenRequest(market="cn", strategy="dual_low", max_results=3),
+                screening_endpoint.ScreeningScreenRequest(market="cn", strategy="martin_momentum_pullback", max_results=3),
                 http_request=self._request(),
                 config=config,
             )
@@ -2376,7 +2376,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
         fake_queue.submit_background_task.assert_called_once()
         self.assertEqual(fake_queue.submit_background_task.call_args.kwargs["report_type"], "screening_screen")
         screen_mock.assert_called_once_with(
-            strategy="dual_low",
+            strategy="martin_momentum_pullback",
             market="cn",
             max_results=3,
             selection_seed="",
@@ -2393,6 +2393,109 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             "screen-task-1",
             66,
             "正在执行 LLM 候选重排",
+        )
+
+    def test_start_screen_task_sends_fail_open_feishu_notification(self) -> None:
+        config = self._config(enabled=True)
+        fake_queue = MagicMock()
+        fake_queue.submit_background_task.return_value = SimpleNamespace(
+            task_id="screen-task-1",
+            trace_id="screen-task-1",
+            status=QueueTaskStatus.PENDING,
+            message="选股任务已提交",
+        )
+        notification = {
+            "requested": True,
+            "channel": "feishu",
+            "sent": True,
+            "detail_url": "http://192.168.1.8:8000/screening?runId=run-1",
+        }
+
+        with (
+            patch("api.v1.endpoints.screening.get_task_queue", return_value=fake_queue),
+            patch("api.v1.endpoints.screening.uuid.uuid4", return_value=SimpleNamespace(hex="screen-task-1")),
+            patch.object(
+                screening_endpoint.ScreeningService,
+                "screen",
+                return_value={
+                    "enabled": True,
+                    "run_id": "run-1",
+                    "candidates": [],
+                    "candidate_count": 0,
+                },
+            ),
+            patch(
+                "api.v1.endpoints.screening._notify_screening_result",
+                return_value=notification,
+            ) as notify_mock,
+        ):
+            screening_endpoint.screening_start_screen_task(
+                screening_endpoint.ScreeningScreenRequest(
+                    market="cn",
+                    strategy="martin_momentum_pullback",
+                    max_results=3,
+                    notify=True,
+                    web_base_url="https://stocks.example.com",
+                ),
+                http_request=self._request(base_url="https://stocks.example.com/"),
+                config=config,
+            )
+            run_task = fake_queue.submit_background_task.call_args.args[0]
+            result = run_task()
+
+        self.assertEqual(result["notification"], notification)
+        notify_mock.assert_called_once_with(
+            config=config,
+            result=ANY,
+            web_base_url="https://stocks.example.com",
+        )
+        fake_queue.update_task_progress.assert_any_call(
+            "screen-task-1",
+            99,
+            "正在推送飞书结果卡片",
+        )
+
+    def test_screening_detail_url_rejects_credentials_and_keeps_app_path(self) -> None:
+        self.assertEqual(
+            screening_endpoint._screening_detail_url("https://example.com/dsa/", "run 1"),
+            "https://example.com/dsa/screening?runId=run%201",
+        )
+        self.assertEqual(
+            screening_endpoint._screening_detail_url("https://user:secret@example.com", "run-1"),
+            "",
+        )
+        self.assertEqual(
+            screening_endpoint._screening_detail_url("http://127.0.0.1:8000", "run-1"),
+            "",
+        )
+        self.assertEqual(
+            screening_endpoint._screening_detail_url("http://192.168.1.8:8000", "run-1"),
+            "",
+        )
+
+    def test_trusted_request_web_base_url_rejects_cross_origin_submission(self) -> None:
+        request = self._request(base_url="https://stocks.example.com/")
+
+        self.assertEqual(
+            screening_endpoint._trusted_request_web_base_url(
+                request,
+                "https://malicious.example.net/phishing",
+            ),
+            "https://stocks.example.com",
+        )
+        self.assertEqual(
+            screening_endpoint._trusted_request_web_base_url(
+                request,
+                "https://stocks.example.com/app",
+            ),
+            "https://stocks.example.com/app",
+        )
+        self.assertEqual(
+            screening_endpoint._trusted_request_web_base_url(
+                request,
+                "https://stocks.example.com:bad/app",
+            ),
+            "https://stocks.example.com",
         )
 
     def test_screen_task_status_returns_screening_result(self) -> None:
@@ -2439,7 +2542,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             screen=MagicMock(
                 return_value={
                     "run_id": "run123",
-                    "strategy": "dual_low",
+                    "strategy": "martin_momentum_pullback",
                     "market": "cn",
                     "snapshot_count": 100,
                     "snapshot_source": "em_datacenter",
@@ -2486,13 +2589,13 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             payload = self._screen(
                 config,
                 market="cn",
-                strategy="dual_low",
+                strategy="martin_momentum_pullback",
                 max_results=5,
                 variant_seed="browser-a",
             )
 
         fake_module.screen.assert_called_once_with(
-            "dual_low",
+            "martin_momentum_pullback",
             market="cn",
             max_output=5,
             use_llm=True,
@@ -2582,7 +2685,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
                 ),
             ) as dsa_history_mock,
         ):
-            payload = self._screen(config, market="cn", strategy="dual_low", max_results=5)
+            payload = self._screen(config, market="cn", strategy="martin_momentum_pullback", max_results=5)
 
         daily_df = captured["daily_df"]
         self.assertEqual(daily_df.attrs["source"], "dsa:EfinanceFetcher")
@@ -2595,6 +2698,33 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
         dsa_history_mock.assert_called_once_with("600519", lookback_days=20)
         original_daily_fetch.assert_not_called()
         self.assertIs(daily_module.fetch_daily_history, builtin_daily_fetch)
+
+    def test_screen_daily_history_falls_back_to_local_after_dsa_failure(self) -> None:
+        from src.services.screening import daily as daily_module
+
+        local_frame = pd.DataFrame({"date": ["2026-06-03"], "close": [10.5]})
+        local_fetch = MagicMock(return_value=local_frame)
+        with (
+            patch.object(daily_module, "fetch_daily_history", local_fetch),
+            patch(
+                "src.services.screening_service.get_dsa_daily_history",
+                side_effect=RuntimeError("DSA unavailable"),
+            ) as dsa_history_mock,
+        ):
+            fetcher = screening_service._build_screening_dsa_daily_history_fetcher()
+            self.assertIsNotNone(fetcher)
+            result = fetcher("600519", lookback_days=20, source="akshare", retries=1)
+
+        self.assertIs(result, local_frame)
+        dsa_history_mock.assert_called_once_with("600519", lookback_days=20)
+        local_fetch.assert_called_once_with(
+            "600519",
+            lookback_days=20,
+            source="akshare",
+            retries=1,
+            cache_dir=None,
+            cache_ttl_seconds=None,
+        )
 
     def test_screen_enriches_top_candidates_with_dsa_context(self) -> None:
         config = self._config(enabled=True)
@@ -2644,7 +2774,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             payload = self._screen(
                 config,
                 market="cn",
-                strategy="dual_low",
+                strategy="martin_momentum_pullback",
                 max_results=5,
                 mock_enrichment=False,
             )
@@ -2691,7 +2821,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             payload = self._screen(
                 config,
                 market="cn",
-                strategy="dual_low",
+                strategy="martin_momentum_pullback",
                 max_results=5,
                 mock_enrichment=False,
             )
@@ -2744,7 +2874,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             payload = self._screen(
                 config,
                 market="cn",
-                strategy="dual_low",
+                strategy="martin_momentum_pullback",
                 max_results=5,
                 mock_enrichment=False,
             )
@@ -2812,7 +2942,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             payload = self._screen(
                 config,
                 market="cn",
-                strategy="dual_low",
+                strategy="martin_momentum_pullback",
                 max_results=5,
                 mock_enrichment=False,
             )
@@ -2894,7 +3024,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             ),
             _patch_screening_core(fake_module),
         ):
-            payload = self._screen(config, market="cn", strategy="dual_low", max_results=5)
+            payload = self._screen(config, market="cn", strategy="martin_momentum_pullback", max_results=5)
             self.assertEqual(screening_service.os.environ.get("GEMINI_API_KEY"), "outer-key")
 
         pipeline_config = captured["config"]
@@ -2980,7 +3110,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             patch.dict(sys.modules, {"litellm": fake_litellm}, clear=False),
             _patch_screening_core(fake_module),
         ):
-            payload = self._screen(config, market="cn", strategy="dual_low", max_results=5)
+            payload = self._screen(config, market="cn", strategy="martin_momentum_pullback", max_results=5)
 
         self.assertEqual(payload["candidate_count"], 0)
         self.assertEqual(completion_calls[0]["extra_headers"], {"x-tenant": "dsa"})
@@ -3016,7 +3146,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             ),
             _patch_screening_core(fake_module),
         ):
-            payload = self._screen(config, market="cn", strategy="dual_low", max_results=5)
+            payload = self._screen(config, market="cn", strategy="martin_momentum_pullback", max_results=5)
             self.assertEqual(screening_service.os.environ.get("OPENAI_API_KEY"), "outer-openai-key")
             self.assertEqual(screening_service.os.environ.get("OPENAI_BASE_URL"), "https://outer-openai.example/v1")
 
@@ -3072,7 +3202,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             patch.dict(sys.modules, {"litellm": fake_litellm}, clear=False),
             _patch_screening_core(fake_module),
         ):
-            payload = self._screen(config, market="cn", strategy="dual_low", max_results=5)
+            payload = self._screen(config, market="cn", strategy="martin_momentum_pullback", max_results=5)
 
         self.assertEqual(payload["candidate_count"], 0)
         self.assertEqual(completion_calls[0]["extra_headers"], {"x-tenant": "dsa"})
@@ -3135,7 +3265,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             patch.dict(sys.modules, {"litellm": fake_litellm}, clear=False),
             _patch_screening_core(fake_module),
         ):
-            payload = self._screen(config, market="cn", strategy="dual_low", max_results=5)
+            payload = self._screen(config, market="cn", strategy="martin_momentum_pullback", max_results=5)
 
         self.assertEqual(payload["candidate_count"], 0)
         self.assertEqual(len(completion_calls), 2)
@@ -3211,7 +3341,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             patch.dict(sys.modules, {"litellm": fake_litellm}, clear=False),
             _patch_screening_core(fake_module),
         ):
-            payload = self._screen(config, market="cn", strategy="dual_low", max_results=5)
+            payload = self._screen(config, market="cn", strategy="martin_momentum_pullback", max_results=5)
 
         self.assertEqual(payload["candidate_count"], 0)
         primary_call = next(
@@ -3290,7 +3420,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
         fake_module = _make_screening_core(screen=MagicMock(side_effect=screen_impl))
 
         def _run_screen(config: Config) -> None:
-            self._screen(config, market="cn", strategy="dual_low", max_results=5, mock_enrichment=False)
+            self._screen(config, market="cn", strategy="martin_momentum_pullback", max_results=5, mock_enrichment=False)
 
         with (
             patch.dict(sys.modules, {"litellm": fake_litellm}, clear=False),
@@ -3326,7 +3456,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             patch("src.services.screening_service._build_screening_runtime_env") as runtime_env_mock,
             self.assertRaises(HTTPException) as caught,
         ):
-            self._screen(config, market="cn", strategy="dual_low", max_results=5)
+            self._screen(config, market="cn", strategy="martin_momentum_pullback", max_results=5)
             for key, value in baseline_env.items():
                 self.assertEqual(screening_service.os.environ.get(key), value)
 
@@ -3350,7 +3480,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             patch.dict(screening_service.os.environ, {"SNAPSHOT_SOURCE_PRIORITY": "tushare,em_datacenter"}, clear=False),
             _patch_screening_core(fake_module),
         ):
-            payload = self._screen(config, market="cn", strategy="dual_low", max_results=5)
+            payload = self._screen(config, market="cn", strategy="martin_momentum_pullback", max_results=5)
 
         self.assertEqual(captured["snapshot_priority"], "tushare,em_datacenter")
         self.assertEqual(payload["candidate_count"], 0)
@@ -3369,12 +3499,12 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             patch.dict(screening_service.os.environ, {"DAILY_SOURCE": "akshare"}, clear=False),
             _patch_screening_core(fake_module),
         ):
-            payload = self._screen(config, market="cn", strategy="dual_low", max_results=5)
+            payload = self._screen(config, market="cn", strategy="martin_momentum_pullback", max_results=5)
 
         self.assertEqual(captured["daily_source"], "akshare")
         self.assertEqual(payload["candidate_count"], 0)
 
-    def test_dsa_daily_history_bridge_preserves_cache_kwargs_for_screening_fallback(self) -> None:
+    def test_daily_history_bridge_uses_local_fetcher_first_and_preserves_kwargs(self) -> None:
         import src.services.screening.daily as daily_module
 
         captured: dict[str, object] = {}
@@ -3387,7 +3517,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
 
         with (
             patch.object(daily_module, "fetch_daily_history", new=fallback_fetch),
-            patch("src.services.screening_service.get_dsa_daily_history", side_effect=RuntimeError("dsa unavailable")),
+            patch("src.services.screening_service.get_dsa_daily_history") as dsa_mock,
         ):
             daily_fetcher = screening_service._build_screening_dsa_daily_history_fetcher()
             self.assertIsNotNone(daily_fetcher)
@@ -3407,21 +3537,17 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
         self.assertEqual(captured["retries"], 4)
         self.assertEqual(captured["cache_dir"], Path("data/screening/daily_history"))
         self.assertEqual(captured["cache_ttl_seconds"], 321.0)
+        dsa_mock.assert_not_called()
 
     def test_dsa_daily_history_fetchers_are_request_local_when_calls_overlap(self) -> None:
         import src.services.screening.daily as daily_module
 
         builtin_fetch = daily_module.fetch_daily_history
-        barrier = threading.Barrier(2)
         fallback_fetch = MagicMock(side_effect=lambda code, **_kwargs: f"fallback:{code}")
-
-        def unavailable_dsa(code: str, *, lookback_days: int = 120):
-            barrier.wait(timeout=5)
-            raise RuntimeError(f"dsa unavailable for {code}:{lookback_days}")
 
         with (
             patch.object(daily_module, "fetch_daily_history", new=fallback_fetch),
-            patch("src.services.screening_service.get_dsa_daily_history", side_effect=unavailable_dsa) as dsa_mock,
+            patch("src.services.screening_service.get_dsa_daily_history") as dsa_mock,
         ):
             first_fetcher = screening_service._build_screening_dsa_daily_history_fetcher()
             second_fetcher = screening_service._build_screening_dsa_daily_history_fetcher()
@@ -3435,7 +3561,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             self.assertEqual(first_future.result(), "fallback:000001")
             self.assertEqual(second_future.result(), "fallback:000002")
             self.assertIs(daily_module.fetch_daily_history, fallback_fetch)
-            self.assertEqual(dsa_mock.call_count, 2)
+            dsa_mock.assert_not_called()
             self.assertEqual(fallback_fetch.call_count, 2)
 
         self.assertIs(daily_module.fetch_daily_history, builtin_fetch)
@@ -3511,7 +3637,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             patch.object(
                 daily_module,
                 "fetch_daily_history",
-                new=MagicMock(side_effect=AssertionError("Screening fallback should not run")),
+                new=MagicMock(side_effect=RuntimeError("local providers unavailable")),
             ),
             patch(
                 "src.services.screening_service.get_dsa_daily_history",
@@ -3593,7 +3719,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             ),
             _patch_screening_core(fake_module),
         ):
-            payload = self._screen(config, market="cn", strategy="dual_low", max_results=5)
+            payload = self._screen(config, market="cn", strategy="martin_momentum_pullback", max_results=5)
 
         self.assertEqual(captured["openai_base_url"], "https://outer-openai.example/v1")
         self.assertEqual(captured["llm_openai_base_url"], "https://outer-openai-channel.example/v1")
@@ -3623,7 +3749,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             patch.dict(screening_service.os.environ, {"LLM_CANDIDATE_CONTEXT_PROVIDERS": "news,announcement"}, clear=False),
             _patch_screening_core(fake_module),
         ):
-            payload = self._screen(config, market="cn", strategy="dual_low", max_results=5)
+            payload = self._screen(config, market="cn", strategy="martin_momentum_pullback", max_results=5)
 
         self.assertEqual(captured["providers"], "news,announcement")
         self.assertEqual(payload["candidate_count"], 0)
@@ -3679,7 +3805,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
         fake_module = _make_screening_core(screen=MagicMock(side_effect=screen_impl))
 
         with _patch_screening_core(fake_module):
-            payload = self._screen(config, market="cn", strategy="dual_low", max_results=5)
+            payload = self._screen(config, market="cn", strategy="martin_momentum_pullback", max_results=5)
 
         pipeline_config = captured["config"]
         self.assertIsInstance(pipeline_config, ScreeningPipelineConfig)
@@ -3706,7 +3832,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             _patch_screening_core(fake_module),
         ):
             with self.assertRaises(HTTPException) as caught:
-                self._screen(config, market="cn", strategy="dual_low", max_results=5)
+                self._screen(config, market="cn", strategy="martin_momentum_pullback", max_results=5)
 
         self.assertEqual(caught.exception.status_code, 424)
         self.assertEqual(caught.exception.detail.get("diagnostics", {}).get("reason"), "unexpected_exception")
@@ -3731,7 +3857,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
         )
 
         with _patch_screening_core(fake_module):
-            payload = self._screen(config, market="cn", strategy="dual_low", max_results=5)
+            payload = self._screen(config, market="cn", strategy="martin_momentum_pullback", max_results=5)
 
         self.assertIsNone(payload["candidates"][0]["score"])
         self.assertIsNone(payload["candidates"][0]["raw"]["score"])
@@ -3741,7 +3867,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
     def test_screen_allows_non_listed_strategy_as_custom(self) -> None:
         config = self._config(enabled=True)
         fake_module = _make_screening_core(
-            list_strategies=lambda: [{"id": "dual_low", "name": "双低选股"}],
+            list_strategies=lambda: [{"id": "martin_momentum_pullback", "name": "双低选股"}],
             screen=MagicMock(return_value={"candidates": []}),
         )
 
@@ -3771,7 +3897,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
 
         with _patch_screening_core(fake_module):
             with self.assertRaises(HTTPException) as caught:
-                self._screen(config, market="cn", strategy="dual_low", max_results=5)
+                self._screen(config, market="cn", strategy="martin_momentum_pullback", max_results=5)
 
         self.assertEqual(caught.exception.status_code, 422)
         self.assertEqual(caught.exception.detail["error"], "screening_invalid_market")
@@ -3784,7 +3910,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
 
         with _patch_screening_core(fake_module):
             with self.assertRaises(HTTPException) as caught:
-                self._screen(config, market="cn", strategy="dual_low", max_results=5)
+                self._screen(config, market="cn", strategy="martin_momentum_pullback", max_results=5)
 
         self.assertEqual(caught.exception.status_code, 400)
         self.assertEqual(caught.exception.detail["error"], "screening_screen_rejected")

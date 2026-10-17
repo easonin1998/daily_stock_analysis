@@ -34,9 +34,7 @@ _SCREENING_KEYS = {
     "enabled",
     "market_scope",
     "hard_filters",
-    "tech_weight",
     "factor_weights",
-    "scoring_profile",
     "risk_profile",
     "portfolio_profile",
     "scorecard_profile",
@@ -45,71 +43,6 @@ _SCREENING_KEYS = {
     "max_output",
 }
 _HARD_FILTER_KEYS = set(HardFilterConfig.__dataclass_fields__.keys())
-_SCORING_PROFILE_KEYS = {
-    "momentum_base",
-    "momentum_intraday_slope",
-    "momentum_chase_start_pct",
-    "momentum_chase_penalty_slope",
-    "momentum_downside_start_pct",
-    "momentum_downside_penalty_slope",
-    "momentum_60d_base",
-    "momentum_60d_slope",
-    "momentum_60d_overheat_pct",
-    "momentum_60d_overheat_penalty_slope",
-    "momentum_60d_breakdown_pct",
-    "momentum_60d_breakdown_penalty_slope",
-    "macd_bullish_bonus",
-    "macd_bearish_penalty",
-    "reversal_ideal_change_pct",
-    "reversal_distance_penalty_slope",
-    "reversal_collapse_start_pct",
-    "reversal_collapse_penalty_slope",
-    "reversal_chase_start_pct",
-    "reversal_chase_penalty_slope",
-    "rsi_oversold_bonus",
-    "rsi_overbought_penalty",
-    "activity_ideal_volume_ratio",
-    "activity_volume_ratio_distance_slope",
-    "activity_high_volume_ratio",
-    "activity_high_volume_ratio_penalty_slope",
-    "activity_ideal_turnover_rate",
-    "activity_turnover_distance_slope",
-    "activity_high_turnover_rate",
-    "activity_high_turnover_penalty_slope",
-    "stability_base",
-    "stability_change_abs_penalty_slope",
-    "stability_hot_change_pct",
-    "stability_hot_change_penalty_slope",
-    "stability_high_turnover_rate",
-    "stability_high_turnover_penalty_slope",
-    "stability_high_volume_ratio",
-    "stability_high_volume_ratio_penalty_slope",
-    "stability_invalid_pe_penalty",
-    "stability_high_volatility_pct",
-    "stability_high_volatility_penalty_slope",
-    "stability_max_drawdown_floor_pct",
-    "stability_drawdown_penalty_slope",
-    "stability_high_atr_pct",
-    "stability_high_atr_penalty_slope",
-    "stability_low_daily_quality_score",
-    "stability_low_daily_quality_penalty_slope",
-    "stability_bad_daily_quality_flag_penalty",
-    "theme_heat_unknown_score",
-    "theme_heat_change_slope",
-    "theme_heat_rank_bonus",
-    "theme_heat_trend_min_observations",
-    "theme_heat_trend_slope",
-    "theme_heat_trend_bonus_cap",
-    "theme_heat_cooling_penalty_slope",
-    "theme_heat_cooling_penalty_cap",
-    "theme_heat_persistence_min_score",
-    "theme_heat_persistence_slope",
-    "theme_heat_persistence_bonus_cap",
-    "theme_heat_cooling_score_penalty_slope",
-    "theme_heat_cooling_score_penalty_cap",
-    "theme_heat_overheat_score",
-    "theme_heat_overheat_penalty_slope",
-}
 _RISK_PROFILE_KEYS = {
     "chase_change_pct",
     "chase_points",
@@ -119,13 +52,14 @@ _RISK_PROFILE_KEYS = {
     "abnormal_volume_ratio_points",
     "high_turnover_rate",
     "high_turnover_points",
-    "invalid_pe_points",
-    "high_pb",
-    "high_pb_points",
-    "weak_signal_score",
-    "weak_signal_points",
-    "macd_bearish_points",
-    "rsi_overbought_points",
+    "high_adr_pct",
+    "high_adr_points",
+    "extended_ema21_pct",
+    "extended_ema21_points",
+    "weak_sector_resonance_score",
+    "weak_sector_resonance_points",
+    "early_trigger_distance_pct",
+    "early_trigger_points",
     "low_llm_confidence",
     "low_llm_confidence_points",
     "llm_risk_points",
@@ -139,21 +73,23 @@ _RISK_PROFILE_KEYS = {
     "fallback_daily_errors_points",
     "fetch_failed_daily_points",
 }
-_PORTFOLIO_PROFILE_KEYS = {"max_same_bucket", "concentration_penalty", "buckets"}
+_PORTFOLIO_PROFILE_KEYS = {
+    "max_same_bucket",
+    "concentration_penalty",
+    "quota_max_score_gap",
+    "buckets",
+}
 _SCORECARD_PROFILE_KEYS = {
-    "value_quality_value_min",
-    "value_quality_stability_min",
-    "value_quality_bonus",
-    "capital_confirmed_momentum_min",
-    "capital_confirmed_activity_min",
-    "capital_confirmed_bonus",
-    "controlled_reversal_min",
-    "controlled_reversal_bonus",
-    "hot_money_activity_min",
-    "hot_money_stability_max",
-    "hot_money_penalty",
-    "volume_spike_ratio",
-    "volume_spike_penalty",
+    "leader_trend_min",
+    "leader_relative_strength_min",
+    "leader_bonus",
+    "pullback_contraction_min",
+    "pullback_support_min",
+    "pullback_bonus",
+    "weak_sector_max",
+    "weak_sector_penalty",
+    "chase_change_pct",
+    "chase_penalty",
     "high_llm_confidence",
     "high_llm_confidence_bonus",
     "low_llm_confidence",
@@ -212,11 +148,7 @@ def load_strategy(filepath: Path) -> Strategy:
         enabled=screening_data.get("enabled", False),
         market_scope=screening_data.get("market_scope", ["cn"]),
         hard_filters=hard_filters,
-        tech_weight=screening_data.get("tech_weight", 0.35),
         factor_weights=screening_data.get("factor_weights", {}),
-        scoring_profile=_optional_mapping(
-            screening_data, "scoring_profile", filepath, allowed_keys=_SCORING_PROFILE_KEYS
-        ),
         risk_profile=_optional_mapping(
             screening_data, "risk_profile", filepath, allowed_keys=_RISK_PROFILE_KEYS
         ),
@@ -650,7 +582,7 @@ def _strategy_data_requirements(strategy: Strategy, *, daily_required: bool) -> 
     if daily_required:
         requirements.append("daily_k")
     factors = set(strategy.screening.factor_weights)
-    if factors & {"theme_heat", "topic_alignment"}:
+    if factors & {"sector_resonance"}:
         requirements.append("industry_context")
     if strategy.screening.event_profile:
         requirements.append("event_context")
@@ -806,13 +738,62 @@ def _required_snapshot_fields(filters_config: HardFilterConfig) -> list[str]:
         fields.append("volume_ratio")
     if filters_config.turnover_rate_min is not None:
         fields.append("turnover_rate")
-    if filters_config.change_pct_min is not None or filters_config.change_pct_max is not None:
+    if any([
+        filters_config.change_pct_min is not None,
+        filters_config.change_pct_max is not None,
+        filters_config.market_positive_ratio_min is not None,
+        filters_config.market_median_change_pct_min is not None,
+    ]):
         fields.append("change_pct")
     return list(dict.fromkeys(fields))
 
 
 def _required_daily_fields(filters_config: HardFilterConfig) -> list[str]:
     checks = [
+        ("daily_data_points", filters_config.daily_data_points_min is not None),
+        ("avg_amount_20d", filters_config.avg_amount_20d_min is not None),
+        (
+            "adr_20_pct",
+            filters_config.adr_20_pct_min is not None or filters_config.adr_20_pct_max is not None,
+        ),
+        (
+            "change_20d",
+            filters_config.change_20d_min is not None or filters_config.change_20d_max is not None,
+        ),
+        ("relative_strength_20d_pctile", filters_config.relative_strength_20d_pctile_min is not None),
+        ("relative_strength_60d_pctile", filters_config.relative_strength_60d_pctile_min is not None),
+        ("ema_stack_bullish", filters_config.require_ema_stack),
+        ("ema21_rising", filters_config.require_ema21_rising),
+        ("ema50_rising", filters_config.require_ema50_rising),
+        ("distance_to_120d_high_pct", filters_config.distance_to_120d_high_pct_min is not None),
+        (
+            "pullback_depth_10d_pct",
+            filters_config.pullback_depth_10d_pct_min is not None
+            or filters_config.pullback_depth_10d_pct_max is not None,
+        ),
+        ("range_contraction_ratio", filters_config.range_contraction_ratio_max is not None),
+        ("volume_contraction_ratio", filters_config.volume_contraction_ratio_max is not None),
+        ("support_confluence_count", filters_config.support_confluence_count_min is not None),
+        (
+            "trigger_distance_pct",
+            filters_config.trigger_distance_pct_min is not None
+            or filters_config.trigger_distance_pct_max is not None,
+        ),
+        (
+            "trigger_close_location_pct",
+            filters_config.trigger_close_location_pct_min is not None
+            or filters_config.trigger_close_location_pct_max is not None,
+        ),
+        (
+            "trigger_volume_vs_previous",
+            filters_config.trigger_volume_vs_previous_min is not None
+            or filters_config.trigger_volume_vs_previous_max is not None,
+        ),
+        (
+            "market_median_change_20d_pct",
+            filters_config.market_median_change_20d_pct_min is not None,
+        ),
+        ("one_word_limit_up", filters_config.exclude_one_word_limit_up),
         ("change_60d", filters_config.change_60d_min is not None or filters_config.change_60d_max is not None),
         ("ma_bullish", filters_config.require_ma_bullish),
         ("price_above_ma20", filters_config.require_price_above_ma20),
@@ -858,7 +839,6 @@ def _required_daily_fields(filters_config: HardFilterConfig) -> list[str]:
 
 def _strategy_profile_keys(screening: ScreeningConfig) -> dict[str, list[str]]:
     profile_values = {
-        "scoring": screening.scoring_profile,
         "risk": screening.risk_profile,
         "portfolio": screening.portfolio_profile,
         "scorecard": screening.scorecard_profile,

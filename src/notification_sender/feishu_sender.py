@@ -9,15 +9,17 @@
 import base64
 import hashlib
 import hmac
+import importlib.util
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
 import uuid as uuid_mod
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -36,38 +38,95 @@ logger = logging.getLogger(__name__)
 # lark-oapi SDK availability
 # ---------------------------------------------------------------------------
 
-FEISHU_SDK_AVAILABLE = False
+FEISHU_SDK_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
 _lark: Any = None  # type: ignore[assignment]
 FEISHU_DOMAIN = "feishu"
 LARK_DOMAIN = "lark"
-try:
-    import lark_oapi as _lark
-    from lark_oapi.api.im.v1 import (
-        CreateMessageRequest,
-        CreateMessageRequestBody,
-    )
-    from lark_oapi.core.const import FEISHU_DOMAIN as _SDK_FEISHU_DOMAIN
-    from lark_oapi.core.const import LARK_DOMAIN as _SDK_LARK_DOMAIN
+_SDK_IMPORT_LOCK = threading.Lock()
+_SDK_IMPORT_ATTEMPTED = False
 
-    FEISHU_DOMAIN = _SDK_FEISHU_DOMAIN
-    LARK_DOMAIN = _SDK_LARK_DOMAIN
-    FEISHU_SDK_AVAILABLE = True
-except ImportError:
-    pass
 
-# File-upload SDK classes (isolated from the core messaging SDK availability
-# so that an older lark-oapi without file support doesn't break App Bot text).
-FEISHU_FILE_SDK_AVAILABLE = False
+class _LazyCreateMessageRequest:
+    """Keep request construction patchable without importing the SDK at startup."""
+
+    @staticmethod
+    def builder() -> Any:
+        if not _load_feishu_sdk():
+            raise RuntimeError("lark-oapi SDK is unavailable")
+        return CreateMessageRequest.builder()
+
+
+class _LazyCreateMessageRequestBody:
+    @staticmethod
+    def builder() -> Any:
+        if not _load_feishu_sdk():
+            raise RuntimeError("lark-oapi SDK is unavailable")
+        return CreateMessageRequestBody.builder()
+
+
+CreateMessageRequest: Any = _LazyCreateMessageRequest
+CreateMessageRequestBody: Any = _LazyCreateMessageRequestBody
+FEISHU_FILE_SDK_AVAILABLE = FEISHU_SDK_AVAILABLE
 _CreateFileRequest: Any = None
 _CreateFileRequestBody: Any = None
-try:
-    from lark_oapi.api.im.v1 import (
-        CreateFileRequest as _CreateFileRequest,
-        CreateFileRequestBody as _CreateFileRequestBody,
-    )
-    FEISHU_FILE_SDK_AVAILABLE = True
-except ImportError:
-    pass
+
+
+def _load_feishu_sdk() -> bool:
+    """Import the large lark-oapi package only when App Bot mode is used."""
+    global _SDK_IMPORT_ATTEMPTED
+    global _lark
+    global CreateMessageRequest
+    global CreateMessageRequestBody
+    global FEISHU_DOMAIN
+    global LARK_DOMAIN
+    global FEISHU_SDK_AVAILABLE
+    global FEISHU_FILE_SDK_AVAILABLE
+    global _CreateFileRequest
+    global _CreateFileRequestBody
+
+    if _lark is not None:
+        return True
+    if _SDK_IMPORT_ATTEMPTED or not FEISHU_SDK_AVAILABLE:
+        return False
+
+    with _SDK_IMPORT_LOCK:
+        if _lark is not None:
+            return True
+        if _SDK_IMPORT_ATTEMPTED:
+            return False
+        _SDK_IMPORT_ATTEMPTED = True
+        try:
+            import lark_oapi as sdk
+            from lark_oapi.api.im.v1 import (
+                CreateMessageRequest as sdk_create_message_request,
+                CreateMessageRequestBody as sdk_create_message_request_body,
+            )
+            from lark_oapi.core.const import FEISHU_DOMAIN as sdk_feishu_domain
+            from lark_oapi.core.const import LARK_DOMAIN as sdk_lark_domain
+        except (ImportError, AttributeError) as exc:
+            logger.warning("加载飞书 App Bot SDK 失败: %s", exc)
+            FEISHU_SDK_AVAILABLE = False
+            FEISHU_FILE_SDK_AVAILABLE = False
+            return False
+
+        _lark = sdk
+        CreateMessageRequest = sdk_create_message_request
+        CreateMessageRequestBody = sdk_create_message_request_body
+        FEISHU_DOMAIN = sdk_feishu_domain
+        LARK_DOMAIN = sdk_lark_domain
+        try:
+            from lark_oapi.api.im.v1 import (
+                CreateFileRequest as sdk_create_file_request,
+                CreateFileRequestBody as sdk_create_file_request_body,
+            )
+        except (ImportError, AttributeError):
+            FEISHU_FILE_SDK_AVAILABLE = False
+        else:
+            _CreateFileRequest = sdk_create_file_request
+            _CreateFileRequestBody = sdk_create_file_request_body
+            FEISHU_FILE_SDK_AVAILABLE = True
+        return True
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -149,6 +208,928 @@ class FeishuSender:
             ],
         }
 
+    @staticmethod
+    def _format_change(value: Any) -> str:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return "--"
+        return f"{number:+.2f}%"
+
+    @staticmethod
+    def _format_decimal(value: Any) -> str:
+        try:
+            return f"{float(value):.2f}"
+        except (TypeError, ValueError):
+            return "--"
+
+    @staticmethod
+    def _strip_markdown_tables(markdown: str) -> str:
+        """Keep narrative in markdown while structured tables render natively."""
+        lines = (markdown or "").splitlines()
+        kept: List[str] = []
+        index = 0
+        while index < len(lines):
+            current = lines[index].strip()
+            next_line = lines[index + 1].strip() if index + 1 < len(lines) else ""
+            next_next_line = lines[index + 2].strip() if index + 2 < len(lines) else ""
+            is_table_start = current.startswith("|") and current.endswith("|") and re.match(r"^\|?\s*:?-{3,}", next_line)
+            heading_before_table = current.startswith("####") and next_line.startswith("|") and next_next_line and re.match(r"^\|?\s*:?-{3,}", next_next_line)
+            if heading_before_table:
+                index += 1
+                continue
+            if is_table_start:
+                index += 2
+                while index < len(lines) and lines[index].strip().startswith("|"):
+                    index += 1
+                continue
+            kept.append(lines[index])
+            index += 1
+        return "\n".join(kept).strip()
+
+    @staticmethod
+    def _build_table(
+        element_id: str,
+        columns: List[Dict[str, Any]],
+        rows: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        return {
+            "tag": "table",
+            "element_id": element_id,
+            "margin": "4px 0",
+            "page_size": min(max(len(rows), 1), 10),
+            "row_height": "auto",
+            "freeze_first_column": True,
+            "header_style": {
+                "text_align": "left",
+                "text_size": "normal",
+                "background_style": "grey",
+                "text_color": "default",
+                "bold": True,
+                "lines": 1,
+            },
+            "columns": columns,
+            "rows": rows,
+        }
+
+    @classmethod
+    def _build_index_table(cls, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        rows = []
+        for item in payload.get("indices", [])[:6]:
+            if not isinstance(item, dict):
+                continue
+            current = item.get("current")
+            amount = item.get("amount")
+            rows.append({
+                "name": str(item.get("name") or "--"),
+                "last": f"{float(current):.2f}" if isinstance(current, (int, float)) else "--",
+                "change": cls._format_change(item.get("change_pct")),
+                "amount": f"{float(amount):.0f}亿" if isinstance(amount, (int, float)) and amount else "--",
+            })
+        if not rows:
+            return None
+        return cls._build_table("index_table", [
+            {"name": "name", "display_name": "指数", "data_type": "text", "width": "30%"},
+            {"name": "last", "display_name": "最新", "data_type": "text", "width": "20%", "horizontal_align": "right"},
+            {"name": "change", "display_name": "涨跌幅", "data_type": "text", "width": "20%", "horizontal_align": "right"},
+            {"name": "amount", "display_name": "成交额", "data_type": "text", "width": "20%", "horizontal_align": "right"},
+        ], rows)
+
+    @classmethod
+    def _build_sector_table(cls, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        rows = []
+        for direction, items in (("领涨", payload.get("sectors", {}).get("top", [])), ("领跌", payload.get("sectors", {}).get("bottom", []))):
+            for item in (items or [])[:3]:
+                if not isinstance(item, dict):
+                    continue
+                rows.append({
+                    "direction": direction,
+                    "name": str(item.get("name") or "--"),
+                    "change": cls._format_change(item.get("change_pct")),
+                })
+        if not rows:
+            return None
+        return cls._build_table("sector_table", [
+            {"name": "direction", "display_name": "方向", "data_type": "text", "width": "20%"},
+            {"name": "name", "display_name": "行业板块", "data_type": "text", "width": "55%"},
+            {"name": "change", "display_name": "涨跌幅", "data_type": "text", "width": "20%", "horizontal_align": "right"},
+        ], rows)
+
+    @classmethod
+    def _build_us_market_table(cls, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        overseas = payload.get("overseas") if isinstance(payload.get("overseas"), dict) else {}
+        rows = []
+        for item in overseas.get("us_indices", [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            current = item.get("current")
+            rows.append({
+                "name": str(item.get("name") or "--"),
+                "last": f"{float(current):.2f}" if isinstance(current, (int, float)) else "--",
+                "change": cls._format_change(item.get("change_pct")),
+            })
+        if not rows:
+            return None
+        return cls._build_table("us_market_table", [
+            {"name": "name", "display_name": "美股指数", "data_type": "text", "width": "45%"},
+            {"name": "last", "display_name": "最新", "data_type": "text", "width": "25%", "horizontal_align": "right"},
+            {"name": "change", "display_name": "涨跌幅", "data_type": "text", "width": "25%", "horizontal_align": "right"},
+        ], rows)
+
+    @classmethod
+    def _build_recommendation_table(
+        cls,
+        element_id: str,
+        items: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        rows = []
+        for item in items[:5]:
+            if not isinstance(item, dict):
+                continue
+            rows.append({
+                "name": f"{item.get('name') or '--'}\n{item.get('code') or '--'}",
+                "theme": str(item.get("theme") or "--"),
+                "change": cls._format_change(item.get("change_pct")),
+                "signal": str(item.get("technical") or "数据不足"),
+                "strength": str(item.get("strength") or "观察"),
+            })
+        if not rows:
+            return None
+        return cls._build_table(element_id, [
+            {"name": "name", "display_name": "标的", "data_type": "text", "width": "22%", "vertical_align": "top"},
+            {"name": "theme", "display_name": "方向", "data_type": "text", "width": "15%", "vertical_align": "top"},
+            {"name": "change", "display_name": "涨跌", "data_type": "text", "width": "13%", "horizontal_align": "right", "vertical_align": "top"},
+            {"name": "signal", "display_name": "技术状态", "data_type": "text", "width": "34%", "vertical_align": "top"},
+            {"name": "strength", "display_name": "强度", "data_type": "text", "width": "14%", "vertical_align": "top"},
+        ], rows)
+
+    @classmethod
+    def _build_market_review_card_body(cls, payload: Dict[str, Any], content: str) -> dict:
+        """Build a full A-share recap card from the persisted market payload."""
+        date_text = str(payload.get("date") or "").strip()
+        generation = payload.get("generation") if isinstance(payload.get("generation"), dict) else {}
+        model = str(generation.get("model") or "").strip()
+        model_label = model.split("/", 1)[-1] if model.startswith("deepseek/") else model
+        analysis_source = f"DeepSeek / {model_label}" if model.startswith("deepseek/") else "行情数据规则整理"
+        if generation.get("mode") == "llm" and not model:
+            analysis_source = "大模型分析"
+
+        sections = payload.get("sections") if isinstance(payload.get("sections"), list) else []
+        elements: List[Dict[str, Any]] = [{
+            "tag": "markdown",
+            "content": f"<font color='grey'>交易日 {date_text or '--'} | 分析来源：{analysis_source}</font>",
+        }]
+        index_table = cls._build_index_table(payload)
+        if index_table:
+            elements.extend([
+                {"tag": "markdown", "content": "### 📈 指数表现"},
+                index_table,
+            ])
+        sector_table = cls._build_sector_table(payload)
+        if sector_table:
+            elements.extend([
+                {"tag": "markdown", "content": "### 🧭 板块强弱"},
+                sector_table,
+            ])
+        us_market_table = cls._build_us_market_table(payload)
+        if us_market_table:
+            elements.extend([
+                {"tag": "markdown", "content": "### 🌎 最新美股动态"},
+                us_market_table,
+            ])
+        has_section = False
+        for item in sections:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key") or "")
+            title = str(item.get("title") or "").strip()
+            markdown = str(item.get("markdown") or "").strip()
+            if not markdown:
+                continue
+            display_title = "核心结论" if key == "overview" else title
+            section_content = format_feishu_markdown(cls._strip_markdown_tables(markdown))
+            section_prefix = f"**{display_title}**\n" if display_title else ""
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "content": section_prefix + section_content,
+                }
+            )
+            if key in {"六_etf_个股关注", "etf_个股关注", "ETF/个股关注"} or "ETF/个股" in title:
+                recommendations = payload.get("recommendations") if isinstance(payload.get("recommendations"), dict) else {}
+                etf_table = cls._build_recommendation_table("etf_watch_table", recommendations.get("etf", []))
+                stock_table = cls._build_recommendation_table("stock_watch_table", recommendations.get("stocks", []))
+                if etf_table:
+                    elements.extend([{"tag": "markdown", "content": "#### 🎯 ETF 关注"}, etf_table])
+                if stock_table:
+                    elements.extend([{"tag": "markdown", "content": "#### 🏷️ 个股关注"}, stock_table])
+            has_section = True
+
+        if not has_section:
+            elements.append(
+                {"tag": "markdown", "content": content}
+            )
+        elements.append({"tag": "markdown", "content": "<font color='grey'>数据仅用于研究复盘，不构成投资建议。</font>"})
+        return {
+            "schema": "2.0",
+            "config": {"update_multi": True},
+            "header": {
+                "template": "blue",
+                "title": {"tag": "plain_text", "content": "A股盘后智能复盘"},
+            },
+            "body": {"direction": "vertical", "padding": "12px 12px 12px 12px", "elements": elements},
+        }
+
+    @staticmethod
+    def _compact_card_text(value: Any, limit: int = 120) -> str:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if len(text) <= limit:
+            return text
+        return text[: max(1, limit - 1)].rstrip() + "…"
+
+    @classmethod
+    def _build_screening_card_body(cls, payload: Dict[str, Any], content: str) -> dict:
+        """Build a compact completion card for one persisted screening run."""
+        candidates = payload.get("candidates") if isinstance(payload.get("candidates"), list) else []
+        candidate_count = payload.get("candidate_count")
+        if candidate_count is None:
+            candidate_count = len(candidates)
+        market = str(payload.get("market") or "cn").strip().lower()
+        market_label = "A股" if market == "cn" else (market.upper() or "--")
+        ranking_mode = str(payload.get("ranking_mode") or "").strip().lower()
+        ranking_label = "智能重排" if ranking_mode == "llm" else "确定性因子"
+        run_id = cls._compact_card_text(payload.get("run_id"), 32) or "--"
+
+        elements: List[Dict[str, Any]] = [{
+            "tag": "markdown",
+            "content": (
+                f"**{market_label} · {cls._compact_card_text(payload.get('strategy'), 64) or '选股策略'}**\n"
+                f"候选 **{candidate_count}** 只 ｜ {ranking_label}\n"
+                f"<font color='grey'>快照 {payload.get('snapshot_count') or '--'} · "
+                f"初筛后 {payload.get('after_filter_count') or '--'} · Run ID {run_id}</font>"
+            ),
+        }]
+
+        rows: List[Dict[str, Any]] = []
+        for index, item in enumerate(candidates[:5], start=1):
+            if not isinstance(item, dict):
+                continue
+            score = item.get("score")
+            try:
+                score_text = f"{float(score):.1f}"
+            except (TypeError, ValueError):
+                score_text = "--"
+            rows.append({
+                "name": f"{index}. {cls._compact_card_text(item.get('name'), 24) or '--'}\n{cls._compact_card_text(item.get('code'), 16) or '--'}",
+                "score": score_text,
+                "reason": cls._compact_card_text(item.get("reason") or item.get("recommendation_reason"), 88) or "通过策略硬条件",
+            })
+        if rows:
+            elements.extend([
+                {"tag": "markdown", "content": "### 🎯 前列候选"},
+                cls._build_table("screening_candidates", [
+                    {"name": "name", "display_name": "标的", "data_type": "text", "width": "28%", "vertical_align": "top"},
+                    {"name": "score", "display_name": "评分", "data_type": "text", "width": "14%", "horizontal_align": "right", "vertical_align": "top"},
+                    {"name": "reason", "display_name": "入选依据", "data_type": "text", "width": "58%", "vertical_align": "top"},
+                ], rows),
+            ])
+        else:
+            elements.append({
+                "tag": "markdown",
+                "content": "**本次无候选**\n没有股票通过全部硬条件，保留现金与观察清单也是结果。",
+            })
+
+        plan_sections: List[str] = []
+        for index, item in enumerate(candidates[:5], start=1):
+            if not isinstance(item, dict):
+                continue
+            plan = item.get("trade_plan") if isinstance(item.get("trade_plan"), dict) else {}
+            if not plan:
+                continue
+            status = str(plan.get("signal_status") or "")
+            name = cls._compact_card_text(item.get("name"), 20) or "--"
+            code = cls._compact_card_text(item.get("code"), 12) or "--"
+            if status == "risk_rejected":
+                plan_sections.append(
+                    f"**{index}. {name} {code}｜风险过滤**\n"
+                    f"{plan.get('risk_rejection_reason') or '技术止损距离超过策略上限，不设置买入条件单。'}"
+                )
+                continue
+            if status != "buy_signal":
+                plan_sections.append(
+                    f"**{index}. {name} {code}｜仅观察**\n"
+                    "尚未完成收盘突破确认，不设置买入条件单。"
+                )
+                continue
+            entry = plan.get("entry") if isinstance(plan.get("entry"), dict) else {}
+            exit_plan = plan.get("exit") if isinstance(plan.get("exit"), dict) else {}
+            sizing = plan.get("position_sizing") if isinstance(plan.get("position_sizing"), dict) else {}
+            weight_cap = sizing.get("max_position_weight_pct")
+            minimum_weight = sizing.get("min_position_weight_pct")
+            risk_budget = sizing.get("max_portfolio_risk_per_trade_pct")
+            heat_cap = sizing.get("max_portfolio_heat_pct")
+            risk_limits = []
+            if risk_budget is not None:
+                risk_limits.append(f"单笔风险预算 {risk_budget}%")
+            if heat_cap is not None:
+                risk_limits.append(f"组合风险热度上限 {heat_cap}%")
+            risk_limits_text = f"（{'｜'.join(risk_limits)}）" if risk_limits else ""
+            sizing_line = (
+                f"仓位区间：**{minimum_weight if minimum_weight is not None else '--'}% - {weight_cap}%**"
+                f"{risk_limits_text}\n"
+                if weight_cap is not None
+                else ""
+            )
+            risk_line = ""
+            technical_risk = exit_plan.get(
+                "sizing_risk_pct",
+                exit_plan.get("effective_risk_pct"),
+            )
+            if technical_risk is not None:
+                risk_line = (
+                    f"技术止损/计仓风险 **{technical_risk}%**；"
+                    f"1 ADR 压力 {exit_plan.get('adr_stress_pct', '--')}%（不参与计仓）\n"
+                )
+            plan_sections.append(
+                f"**{index}. {name} {code}｜买入信号**\n"
+                f"开盘竞价区间：**{entry.get('min_price', '--')} - {entry.get('max_price', '--')}**；"
+                f"确认价 {entry.get('trigger_price', '--')}\n"
+                f"初始防守：**{exit_plan.get('initial_stop_price', '--')}**；"
+                f"1R 保本观察 {exit_plan.get('breakeven_activation_price', '--')}；"
+                f"2R 观察价 {exit_plan.get('two_r_reference_price', exit_plan.get('first_profit_price', '--'))}（非固定止盈）\n"
+                f"{risk_line}"
+                f"{sizing_line}"
+                f"持仓纪律：{exit_plan.get('follow_through_days', 10)} 日至少 "
+                f"{exit_plan.get('follow_through_min_return_pct', 3)}%，最长 "
+                f"{exit_plan.get('max_holding_days', 20)} 日；每日收盘更新 EMA21 与移动防线。\n"
+                "<font color='grey'>1R/2R 为信号日预估，实际成交后按成交价重算；防守触发后于下一开盘竞价卖出。</font>"
+            )
+        if plan_sections:
+            elements.append({
+                "tag": "markdown",
+                "content": "### 🧾 条件单计划\n" + "\n\n".join(plan_sections),
+            })
+
+        detail_url = str(payload.get("detail_url") or "").strip()
+        if detail_url:
+            elements.append({
+                "tag": "markdown",
+                "content": f"[🔎 在网页中查看完整结果]({detail_url})",
+            })
+        elements.append({
+            "tag": "markdown",
+            "content": "<font color='grey'>结果用于量化研究与复盘，不构成投资建议。</font>",
+        })
+        return {
+            "schema": "2.0",
+            "config": {"update_multi": True},
+            "header": {
+                "template": "orange",
+                "title": {"tag": "plain_text", "content": "选股任务完成"},
+            },
+            "body": {"direction": "vertical", "padding": "12px 12px 12px 12px", "elements": elements},
+        }
+
+    @staticmethod
+    def _metric_number(mapping: Any, key: str) -> Optional[float]:
+        if not isinstance(mapping, dict):
+            return None
+        try:
+            return float(mapping.get(key))
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _build_strategy_backtest_card_body(cls, payload: Dict[str, Any], content: str) -> dict:
+        """Build a concise, mobile-readable card from a Martin backtest JSON result."""
+        period = payload.get("period") if isinstance(payload.get("period"), dict) else {}
+        results = payload.get("results") if isinstance(payload.get("results"), dict) else {}
+        benchmark = payload.get("benchmark") if isinstance(payload.get("benchmark"), dict) else {}
+        benchmark_metrics = benchmark.get("metrics") if isinstance(benchmark.get("metrics"), dict) else {}
+        signal_diagnostics = (
+            payload.get("signal_diagnostics")
+            if isinstance(payload.get("signal_diagnostics"), dict)
+            else {}
+        )
+        data_diagnostics = (
+            payload.get("data_diagnostics")
+            if isinstance(payload.get("data_diagnostics"), dict)
+            else {}
+        )
+        strategy = payload.get("strategy") if isinstance(payload.get("strategy"), dict) else {}
+
+        unified = results.get("strategy") if isinstance(results.get("strategy"), dict) else None
+        variants = (
+            (("strategy", "Martin策略"),)
+            if unified is not None
+            else (("left", "左侧承接"), ("right", "右侧突破"))
+        )
+        mode_rows: List[Dict[str, Any]] = []
+        for mode_key, mode_label in variants:
+            result = results.get(mode_key) if isinstance(results.get(mode_key), dict) else {}
+            metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+            mode_rows.append({
+                "mode": mode_label,
+                "return": cls._format_change(metrics.get("total_return_pct")),
+                "excess": cls._format_change(metrics.get("excess_return_pct")),
+                "drawdown": cls._format_change(metrics.get("max_drawdown_pct")),
+                "trades": str(metrics.get("trade_count") if metrics.get("trade_count") is not None else "--"),
+                "win_rate": cls._format_change(metrics.get("win_rate_pct")),
+            })
+
+        primary_result = unified or (
+            results.get("right") if isinstance(results.get("right"), dict) else {}
+        )
+        primary_metrics = (
+            primary_result.get("metrics") if isinstance(primary_result.get("metrics"), dict) else {}
+        )
+        primary_return = cls._metric_number(primary_metrics, "total_return_pct")
+        benchmark_return = cls._metric_number(benchmark_metrics, "total_return_pct")
+
+        conclusions: List[str] = []
+        if unified is not None:
+            if primary_return is not None:
+                conclusions.append("策略取得正收益" if primary_return > 0 else "策略本区间录得亏损")
+            if primary_return is not None and benchmark_return is not None:
+                conclusions.append(
+                    "跑赢同池等权基准"
+                    if primary_return >= benchmark_return
+                    else "仍跑输同池等权基准"
+                )
+        else:
+            left_metrics = (
+                results.get("left", {}).get("metrics", {})
+                if isinstance(results.get("left"), dict)
+                else {}
+            )
+            left_return = cls._metric_number(left_metrics, "total_return_pct")
+            if primary_return is not None and left_return is not None and primary_return > left_return:
+                conclusions.append("右侧突破明显优于左侧承接")
+            if left_return is not None and left_return < 0:
+                conclusions.append("本区间不支持采用左侧版本")
+            if primary_return is not None and benchmark_return is not None and primary_return < benchmark_return:
+                conclusions.append("右侧虽为正收益，但仍跑输同池等权基准")
+        verdict = "；".join(conclusions) or "样本尚不足以形成稳健结论"
+
+        elements: List[Dict[str, Any]] = [
+            {
+                "tag": "markdown",
+                "content": (
+                    f"<font color='grey'>{period.get('start') or '--'} 至 {period.get('end') or '--'} | "
+                    "收盘确认，次日开盘集合竞价成交</font>\n"
+                    f"**结论：{verdict}。**"
+                ),
+            },
+            {"tag": "markdown", "content": "### 📊 策略表现" if unified is not None else "### 📊 历史版本对比"},
+            cls._build_table(
+                "strategy_backtest_summary",
+                [
+                    {"name": "mode", "display_name": "模式", "data_type": "text", "width": "21%"},
+                    {"name": "return", "display_name": "净收益", "data_type": "text", "width": "17%", "horizontal_align": "right"},
+                    {"name": "excess", "display_name": "超额", "data_type": "text", "width": "17%", "horizontal_align": "right"},
+                    {"name": "drawdown", "display_name": "回撤", "data_type": "text", "width": "17%", "horizontal_align": "right"},
+                    {"name": "trades", "display_name": "交易", "data_type": "text", "width": "12%", "horizontal_align": "right"},
+                    {"name": "win_rate", "display_name": "胜率", "data_type": "text", "width": "16%", "horizontal_align": "right"},
+                ],
+                mode_rows,
+            ),
+            {
+                "tag": "markdown",
+                "content": (
+                    f"**同池等权基准：{cls._format_change(benchmark_return)}**（不计费）\n"
+                    f"策略估算成本约 **{float(primary_metrics.get('estimated_total_cost') or 0):,.0f} 元**。\n"
+                    f"<font color='grey'>策略 v{strategy.get('version') or '--'}：技术止损计仓；"
+                    "1 ADR 仅作跳空压力，不压缩股数。</font>"
+                ),
+            },
+        ]
+
+        impactful_trades: List[Dict[str, Any]] = []
+        for mode_key, mode_label in variants:
+            result = results.get(mode_key) if isinstance(results.get(mode_key), dict) else {}
+            trades = result.get("trades") if isinstance(result.get("trades"), list) else []
+            for trade in trades:
+                if not isinstance(trade, dict):
+                    continue
+                try:
+                    pnl = float(trade.get("pnl") or 0)
+                except (TypeError, ValueError):
+                    pnl = 0.0
+                impactful_trades.append({"mode": mode_label, "pnl_value": pnl, **trade})
+        impactful_trades.sort(key=lambda item: abs(float(item.get("pnl_value") or 0)), reverse=True)
+        trade_rows = [
+            {
+                "name": f"{cls._compact_card_text(item.get('name'), 16) or '--'}\n{item.get('code') or '--'}",
+                "return": cls._format_change(item.get("return_pct")),
+                "pnl": f"{float(item.get('pnl_value') or 0):+,.0f}元",
+            }
+            for item in impactful_trades[:6]
+        ]
+        if trade_rows:
+            elements.extend([
+                {"tag": "markdown", "content": "### 🔎 影响最大的交易"},
+                cls._build_table(
+                    "strategy_backtest_trades",
+                    [
+                        {"name": "name", "display_name": "标的", "data_type": "text", "width": "48%", "vertical_align": "top"},
+                        {"name": "return", "display_name": "收益", "data_type": "text", "width": "24%", "horizontal_align": "right"},
+                        {"name": "pnl", "display_name": "盈亏", "data_type": "text", "width": "28%", "horizontal_align": "right"},
+                    ],
+                    trade_rows,
+                ),
+            ])
+
+        validation = (
+            payload.get("source_validation")
+            if isinstance(payload.get("source_validation"), dict)
+            else {}
+        )
+        validation_summary = (
+            validation.get("summary") if isinstance(validation.get("summary"), dict) else {}
+        )
+        full_market = payload.get("universe_mode") == "full-a-share"
+        universe_note = (
+            "• 覆盖完整当前 A 股快照，但历史已退市股票仍缺失；当前 ST 名称按全区间保守排除。\n"
+            if full_market
+            else "• 当前可交易池存在幸存者偏差和当前流动性偏差。\n"
+        )
+        elements.extend([
+            {
+                "tag": "markdown",
+                "content": (
+                    "### 🧪 数据与信号\n"
+                    f"• 日线覆盖 **{data_diagnostics.get('library_codes') or '--'}** 只，"
+                    f"区间 **{data_diagnostics.get('panel_dates') or '--'}** 个交易日\n"
+                    f"• 起点预热覆盖 **{data_diagnostics.get('codes_with_120_bars_at_period_start') or 0}/"
+                    f"{data_diagnostics.get('codes_available_at_period_start') or 0}** 只"
+                    f"（{cls._format_change(data_diagnostics.get('start_history_coverage_pct'))}）\n"
+                    f"• 形态合格 **{signal_diagnostics.get('setup_count') or signal_diagnostics.get('total_setups') or '--'}** 条；"
+                    f"确认入场 {signal_diagnostics.get('entry_signal_count') or signal_diagnostics.get('right_setups') or 0}，"
+                    f"未确认观察 {signal_diagnostics.get('unconfirmed_setup_count') or signal_diagnostics.get('left_setups') or 0}\n"
+                    f"• 首个严格信号日：**{signal_diagnostics.get('first_signal_date') or '--'}**\n"
+                    f"• AkShare + Baostock 抽样复核：**{validation_summary.get('ok') or 0}/"
+                    f"{validation_summary.get('requested') or 0} 通过**"
+                ),
+            },
+            {
+                "tag": "markdown",
+                "content": (
+                    "### ⚠️ 使用边界\n"
+                    f"{universe_note}"
+                    "• 历史 ST / 市值 / 停复牌状态未按日重建。\n"
+                    "• 缺少历史板块成分与热度，本次板块因子中性、未执行板块配额。\n"
+                    "• 日线开盘价仅近似开盘集合竞价成交价，无法还原委托、排队和撤单。\n"
+                    "• 收盘只用于确认信号，成交统一顺延至下一交易日，避免未来函数。\n"
+                    "• 区间较短，暂不能把结果视为稳定超额。"
+                ),
+            },
+            {
+                "tag": "markdown",
+                "content": "<font color='grey'>研究回测，不构成投资建议。完整逐笔明细保留在本地回测产物中。</font>",
+            },
+        ])
+        return {
+            "schema": "2.0",
+            "config": {"update_multi": True},
+            "header": {
+                "template": "turquoise",
+                "title": {"tag": "plain_text", "content": "Martin A股策略回测"},
+            },
+            "body": {"direction": "vertical", "padding": "12px 12px 12px 12px", "elements": elements},
+        }
+
+    @classmethod
+    def _build_strategy_backtest_analysis_card_body(
+        cls,
+        payload: Dict[str, Any],
+        content: str,
+    ) -> dict:
+        """Build capital, monthly-return, and exit diagnostics for a backtest."""
+        period = payload.get("period") if isinstance(payload.get("period"), dict) else {}
+        results = payload.get("results") if isinstance(payload.get("results"), dict) else {}
+        result = results.get("strategy") if isinstance(results.get("strategy"), dict) else {}
+        metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+        config = result.get("config") if isinstance(result.get("config"), dict) else {}
+        diagnostics = result.get("diagnostics") if isinstance(result.get("diagnostics"), dict) else {}
+        initial_cash = float(config.get("initial_cash") or 0)
+        final_equity = float(metrics.get("final_equity") or 0)
+        net_profit = final_equity - initial_cash
+
+        risk_rows = [{
+            "capital": f"{initial_cash:,.0f} → {final_equity:,.0f}元",
+            "return": cls._format_change(metrics.get("total_return_pct")),
+            "drawdown": cls._format_change(metrics.get("max_drawdown_pct")),
+            "sharpe": cls._format_decimal(metrics.get("sharpe_ratio")),
+        }]
+        quality_rows = [{
+            "profit": f"{net_profit:+,.0f}元",
+            "factor": cls._format_decimal(metrics.get("profit_factor")),
+            "average": cls._format_change(metrics.get("average_trade_pct")),
+            "exposure": cls._format_change(metrics.get("average_exposure_pct")),
+        }]
+        sizing_rows = [{
+            "average": cls._format_change(metrics.get("average_entry_position_weight_pct")),
+            "median": cls._format_change(metrics.get("median_entry_position_weight_pct")),
+            "one_lot": str(metrics.get("one_lot_trade_count") or 0),
+            "adr_stress": cls._format_change(metrics.get("max_adr_stress_heat_pct")),
+        }]
+        month_rows = cls._strategy_backtest_month_rows(result)
+        exit_rows = cls._strategy_backtest_exit_rows(result)
+        elements: List[Dict[str, Any]] = [
+            {
+                "tag": "markdown",
+                "content": (
+                    f"<font color='grey'>{period.get('start') or '--'} 至 {period.get('end') or '--'} | "
+                    "完整资金曲线与退出归因</font>"
+                ),
+            },
+            {"tag": "markdown", "content": "### 💰 资金与风险"},
+            cls._build_table(
+                "strategy_backtest_risk",
+                [
+                    {"name": "capital", "display_name": "本金→期末", "data_type": "text", "width": "38%"},
+                    {"name": "return", "display_name": "收益", "data_type": "text", "width": "20%", "horizontal_align": "right"},
+                    {"name": "drawdown", "display_name": "最大回撤", "data_type": "text", "width": "22%", "horizontal_align": "right"},
+                    {"name": "sharpe", "display_name": "夏普", "data_type": "text", "width": "20%", "horizontal_align": "right"},
+                ],
+                risk_rows,
+            ),
+            cls._build_table(
+                "strategy_backtest_quality",
+                [
+                    {"name": "profit", "display_name": "净利润", "data_type": "text", "width": "27%"},
+                    {"name": "factor", "display_name": "利润因子", "data_type": "text", "width": "24%", "horizontal_align": "right"},
+                    {"name": "average", "display_name": "单笔均值", "data_type": "text", "width": "24%", "horizontal_align": "right"},
+                    {"name": "exposure", "display_name": "平均仓位", "data_type": "text", "width": "25%", "horizontal_align": "right"},
+                ],
+                quality_rows,
+            ),
+            cls._build_table(
+                "strategy_backtest_sizing",
+                [
+                    {"name": "average", "display_name": "平均入场仓位", "data_type": "text", "width": "27%", "horizontal_align": "right"},
+                    {"name": "median", "display_name": "中位入场仓位", "data_type": "text", "width": "27%", "horizontal_align": "right"},
+                    {"name": "one_lot", "display_name": "100股交易", "data_type": "text", "width": "20%", "horizontal_align": "right"},
+                    {"name": "adr_stress", "display_name": "最高ADR压力", "data_type": "text", "width": "26%", "horizontal_align": "right"},
+                ],
+                sizing_rows,
+            ),
+        ]
+        if month_rows:
+            elements.extend([
+                {"tag": "markdown", "content": "### 📅 月度资金曲线"},
+                cls._build_table(
+                    "strategy_backtest_months",
+                    [
+                        {"name": "month", "display_name": "月份", "data_type": "text", "width": "34%"},
+                        {"name": "return", "display_name": "月收益", "data_type": "text", "width": "28%", "horizontal_align": "right"},
+                        {"name": "equity", "display_name": "月末权益", "data_type": "text", "width": "38%", "horizontal_align": "right"},
+                    ],
+                    month_rows,
+                ),
+            ])
+        if exit_rows:
+            elements.extend([
+                {"tag": "markdown", "content": "### 🧭 退出归因"},
+                cls._build_table(
+                    "strategy_backtest_exits",
+                    [
+                        {"name": "reason", "display_name": "退出原因", "data_type": "text", "width": "44%"},
+                        {"name": "count", "display_name": "次数", "data_type": "text", "width": "20%", "horizontal_align": "right"},
+                        {"name": "pnl", "display_name": "合计盈亏", "data_type": "text", "width": "36%", "horizontal_align": "right"},
+                    ],
+                    exit_rows,
+                ),
+            ])
+        elements.extend([
+            {
+                "tag": "markdown",
+                "content": (
+                    "### 🚦 执行过滤\n"
+                    f"• 高开超区间跳过 **{diagnostics.get('skipped_gap_up') or 0}** 次；"
+                    f"低开超区间跳过 **{diagnostics.get('skipped_gap_down') or 0}** 次\n"
+                    f"• 开盘破坏支撑跳过 **{diagnostics.get('skipped_broken_support') or 0}** 次；"
+                    f"涨停无法买入 **{diagnostics.get('skipped_limit_up') or 0}** 次\n"
+                    f"• 技术止损超限跳过 **{diagnostics.get('skipped_technical_stop_too_wide') or 0}** 次；"
+                    f"仓位低于最低有效值跳过 **{diagnostics.get('skipped_min_position_weight') or 0}** 次\n"
+                    f"• 期末未平仓 **{diagnostics.get('open_positions_at_end') or 0}** 只；"
+                    f"估算总成本 **{float(metrics.get('estimated_total_cost') or 0):,.0f} 元**"
+                ),
+            },
+            {
+                "tag": "markdown",
+                "content": (
+                    f"胜率仅 **{cls._format_change(metrics.get('win_rate_pct'))}**，但平均盈利 "
+                    f"**{cls._format_change(metrics.get('average_win_pct'))}**、平均亏损 "
+                    f"**{cls._format_change(metrics.get('average_loss_pct'))}**。"
+                    "收益依赖少数大幅盈利交易，策略具有明显右偏分布，必须严格执行小亏退出。"
+                ),
+            },
+        ])
+        return {
+            "schema": "2.0",
+            "config": {"update_multi": True},
+            "header": {
+                "template": "blue",
+                "title": {"tag": "plain_text", "content": "Martin回测详细诊断"},
+            },
+            "body": {"direction": "vertical", "padding": "12px 12px 12px 12px", "elements": elements},
+        }
+
+    @classmethod
+    def _build_strategy_backtest_trades_card_body(
+        cls,
+        payload: Dict[str, Any],
+        content: str,
+    ) -> dict:
+        """Build one paged trade-ledger card."""
+        period = payload.get("period") if isinstance(payload.get("period"), dict) else {}
+        trades = payload.get("trades") if isinstance(payload.get("trades"), list) else []
+        page = int(payload.get("page") or 1)
+        pages = int(payload.get("pages") or 1)
+        total = int(payload.get("total_trades") or len(trades))
+        rows: List[Dict[str, Any]] = []
+        for trade in trades:
+            if not isinstance(trade, dict):
+                continue
+            entry_date = str(trade.get("entry_date") or "--")
+            exit_date = str(trade.get("exit_date") or "--")
+            shares = float(trade.get("shares") or 0)
+            entry_price = float(trade.get("entry_price") or 0)
+            exit_price = float(trade.get("exit_price") or 0)
+            entry_total = float(
+                trade.get("entry_total")
+                or shares * entry_price + float(trade.get("entry_fee") or 0)
+            )
+            exit_proceeds = float(
+                trade.get("exit_proceeds")
+                or shares * exit_price - float(trade.get("exit_fee") or 0)
+            )
+            rows.append({
+                "stock": f"{cls._compact_card_text(trade.get('name'), 12) or '--'}\n{trade.get('code') or '--'}",
+                "dates": f"{entry_date[5:]}\n→ {exit_date[5:]}",
+                "shares": f"{int(shares):,}",
+                "prices": f"买 {entry_price:,.3f}\n卖 {exit_price:,.3f}",
+                "cashflow": f"支 {entry_total:,.2f}\n收 {exit_proceeds:,.2f}",
+                "return": (
+                    f"{cls._format_change(trade.get('return_pct'))}\n"
+                    f"{float(trade.get('pnl') or 0):+,.0f}元"
+                ),
+                "exit": (
+                    f"{int(trade.get('holding_days') or 0)}日\n"
+                    f"{cls._strategy_exit_reason_label(trade.get('exit_reason'))}"
+                ),
+            })
+        elements: List[Dict[str, Any]] = [
+            {
+                "tag": "markdown",
+                "content": (
+                    f"<font color='grey'>{period.get('start') or '--'} 至 {period.get('end') or '--'} | "
+                    f"第 {page}/{pages} 页，共 {total} 笔</font>\n"
+                    "信号在收盘确认，买卖统一于下一交易日开盘集合竞价近似成交。"
+                ),
+            },
+            cls._build_table(
+                f"strategy_backtest_trade_page_{page}",
+                [
+                    {"name": "stock", "display_name": "标的", "data_type": "text", "width": "20%", "vertical_align": "top"},
+                    {"name": "dates", "display_name": "买→卖日", "data_type": "text", "width": "15%", "vertical_align": "top"},
+                    {"name": "shares", "display_name": "股数", "data_type": "text", "width": "9%", "horizontal_align": "right", "vertical_align": "top"},
+                    {"name": "prices", "display_name": "买/卖价", "data_type": "text", "width": "15%", "horizontal_align": "right", "vertical_align": "top"},
+                    {"name": "cashflow", "display_name": "支出/回款", "data_type": "text", "width": "19%", "horizontal_align": "right", "vertical_align": "top"},
+                    {"name": "return", "display_name": "净收益", "data_type": "text", "width": "12%", "horizontal_align": "right", "vertical_align": "top"},
+                    {"name": "exit", "display_name": "持有/退出", "data_type": "text", "width": "10%", "vertical_align": "top"},
+                ],
+                rows,
+            ),
+            {
+                "tag": "markdown",
+                "content": (
+                    "<font color='grey'>支出=买入成交额+买入佣金；回款=卖出成交额-卖出佣金-印花税。"
+                    "逐笔净收益已计滑点；研究回测，不构成投资建议。</font>"
+                ),
+            },
+        ]
+        return {
+            "schema": "2.0",
+            "config": {"update_multi": True},
+            "header": {
+                "template": "wathet",
+                "title": {"tag": "plain_text", "content": f"Martin逐笔交易（含金额） {page}/{pages}"},
+            },
+            "body": {"direction": "vertical", "padding": "12px 12px 12px 12px", "elements": elements},
+        }
+
+    @classmethod
+    def _strategy_backtest_month_rows(cls, result: Dict[str, Any]) -> List[Dict[str, str]]:
+        curve = result.get("equity_curve") if isinstance(result.get("equity_curve"), list) else []
+        config = result.get("config") if isinstance(result.get("config"), dict) else {}
+        previous = float(config.get("initial_cash") or 0)
+        month_ends: Dict[str, float] = {}
+        for row in curve:
+            if not isinstance(row, dict):
+                continue
+            date_text = str(row.get("date") or "")
+            try:
+                month_ends[date_text[:7]] = float(row.get("equity"))
+            except (TypeError, ValueError):
+                continue
+        rows: List[Dict[str, str]] = []
+        for month, equity in month_ends.items():
+            month_return = (equity / previous - 1.0) * 100.0 if previous > 0 else None
+            rows.append({
+                "month": month,
+                "return": cls._format_change(month_return),
+                "equity": f"{equity:,.0f}元",
+            })
+            previous = equity
+        return rows
+
+    @classmethod
+    def _strategy_backtest_exit_rows(cls, result: Dict[str, Any]) -> List[Dict[str, str]]:
+        trades = result.get("trades") if isinstance(result.get("trades"), list) else []
+        grouped: Dict[str, Dict[str, float]] = {}
+        for trade in trades:
+            if not isinstance(trade, dict):
+                continue
+            reason = str(trade.get("exit_reason") or "unknown")
+            item = grouped.setdefault(reason, {"count": 0.0, "pnl": 0.0})
+            item["count"] += 1
+            try:
+                item["pnl"] += float(trade.get("pnl") or 0)
+            except (TypeError, ValueError):
+                pass
+        return [
+            {
+                "reason": cls._strategy_exit_reason_label(reason),
+                "count": str(int(values["count"])),
+                "pnl": f"{values['pnl']:+,.0f}元",
+            }
+            for reason, values in grouped.items()
+        ]
+
+    @staticmethod
+    def _strategy_exit_reason_label(reason: Any) -> str:
+        labels = {
+            "close_below_initial_stop": "初始防守",
+            "close_below_ema21": "跌破EMA21",
+            "close_below_breakeven": "保本防线",
+            "trailing_close_drawdown": "移动回撤",
+            "no_follow_through": "10日未跟随",
+            "max_holding_days": "20日上限",
+            "period_end_mark": "期末估值",
+        }
+        value = str(reason or "unknown")
+        return labels.get(value, value)
+
+    @staticmethod
+    def _is_cn_market_review_payload(payload: Optional[Dict[str, Any]]) -> bool:
+        return bool(
+            isinstance(payload, dict)
+            and payload.get("kind") == "market_review"
+            and str(payload.get("region") or "").strip().lower() == "cn"
+        )
+
+    @staticmethod
+    def _is_screening_result_payload(payload: Optional[Dict[str, Any]]) -> bool:
+        return bool(isinstance(payload, dict) and payload.get("kind") == "screening_result")
+
+    @staticmethod
+    def _is_strategy_backtest_payload(payload: Optional[Dict[str, Any]]) -> bool:
+        return bool(isinstance(payload, dict) and payload.get("kind") == "strategy_backtest")
+
+    @staticmethod
+    def _is_strategy_backtest_analysis_payload(payload: Optional[Dict[str, Any]]) -> bool:
+        return bool(
+            isinstance(payload, dict)
+            and payload.get("kind") == "strategy_backtest_analysis"
+        )
+
+    @staticmethod
+    def _is_strategy_backtest_trades_payload(payload: Optional[Dict[str, Any]]) -> bool:
+        return bool(
+            isinstance(payload, dict)
+            and payload.get("kind") == "strategy_backtest_trades"
+        )
+
+    @classmethod
+    def _build_structured_card_body(
+        cls,
+        payload: Optional[Dict[str, Any]],
+        content: str,
+    ) -> dict:
+        if cls._is_cn_market_review_payload(payload):
+            return cls._build_market_review_card_body(payload or {}, content)
+        if cls._is_screening_result_payload(payload):
+            return cls._build_screening_card_body(payload or {}, content)
+        if cls._is_strategy_backtest_payload(payload):
+            return cls._build_strategy_backtest_card_body(payload or {}, content)
+        if cls._is_strategy_backtest_analysis_payload(payload):
+            return cls._build_strategy_backtest_analysis_card_body(payload or {}, content)
+        if cls._is_strategy_backtest_trades_payload(payload):
+            return cls._build_strategy_backtest_trades_card_body(payload or {}, content)
+        return cls._build_card_body(content)
+
     # ------------------------------------------------------------------
     # Webhook helpers (unchanged legacy path)
     # ------------------------------------------------------------------
@@ -188,7 +1169,7 @@ class FeishuSender:
         with self._app_client_lock:
             if self._app_client is not _NO_CLIENT:
                 return self._app_client
-            if not FEISHU_SDK_AVAILABLE:
+            if not FEISHU_SDK_AVAILABLE or not _load_feishu_sdk():
                 logger.warning(
                     "飞书 App Bot 需要 lark-oapi 库；标准安装请运行: pip install -r requirements.txt"
                 )
@@ -222,7 +1203,12 @@ class FeishuSender:
     # App Bot send helpers
     # ------------------------------------------------------------------
 
-    def _send_via_app_bot(self, content: str) -> bool:
+    def _send_via_app_bot(
+        self,
+        content: str,
+        *,
+        structured_payload: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """Send message through the Feishu App Bot, chunking if necessary."""
         if not self._feishu_chat_id:
             logger.warning("FEISHU_CHAT_ID 未配置，跳过 App Bot 推送")
@@ -241,7 +1227,7 @@ class FeishuSender:
             )
             return self._app_send_chunked(client, formatted)
 
-        return self._app_send_once(client, formatted)
+        return self._app_send_once(client, formatted, structured_payload=structured_payload)
 
     def _app_send_chunked(self, client: Any, content: str) -> bool:
         """Chunk and send long content through App Bot."""
@@ -263,14 +1249,21 @@ class FeishuSender:
                 time.sleep(1)
         return success
 
-    def _app_send_once(self, client: Any, content: str) -> bool:
+    def _app_send_once(
+        self,
+        client: Any,
+        content: str,
+        *,
+        structured_payload: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """Single-shot send via App Bot with card-first / text-fallback.
 
         Content received here has already been through ``format_feishu_markdown``
         which converts all Markdown constructs to ``lark_md``-compatible format.
         The interactive card uses ``tag: lark_md`` for rendering.
         """
-        card_payload = json.dumps(self._build_card_body(content), ensure_ascii=False)
+        card_body = self._build_structured_card_body(structured_payload, content)
+        card_payload = json.dumps(card_body, ensure_ascii=False)
 
         if self._app_send_raw(client, "interactive", card_payload):
             return True
@@ -358,7 +1351,13 @@ class FeishuSender:
     # Public API
     # ------------------------------------------------------------------
 
-    def send_to_feishu(self, content: str, *, timeout_seconds: Optional[float] = None) -> bool:
+    def send_to_feishu(
+        self,
+        content: str,
+        *,
+        timeout_seconds: Optional[float] = None,
+        structured_payload: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """
         Push a message to Feishu.
 
@@ -375,8 +1374,19 @@ class FeishuSender:
             return False
         sanitized_content = strip_hidden_markdown_metadata(content).strip()
         if self._feishu_url:
-            return self._send_via_webhook(sanitized_content, timeout_seconds=timeout_seconds)
-        return self._send_via_app_bot(sanitized_content)
+            if structured_payload is None:
+                return self._send_via_webhook(
+                    sanitized_content,
+                    timeout_seconds=timeout_seconds,
+                )
+            return self._send_via_webhook(
+                sanitized_content,
+                timeout_seconds=timeout_seconds,
+                structured_payload=structured_payload,
+            )
+        if structured_payload is None:
+            return self._send_via_app_bot(sanitized_content)
+        return self._send_via_app_bot(sanitized_content, structured_payload=structured_payload)
 
     def send_feishu_file(self, file_path: str) -> bool:
         """
@@ -445,16 +1455,15 @@ class FeishuSender:
 
     def _send_file_via_app_bot(self, path: Path, *, display_name: Optional[str] = None) -> bool:
         """Upload *path* to Feishu via App Bot SDK and send as file message."""
-        if not FEISHU_FILE_SDK_AVAILABLE:
-            logger.warning("lark-oapi SDK does not support file upload; upgrade lark-oapi")
-            return False
-
         if not self._feishu_chat_id:
             logger.warning("FEISHU_CHAT_ID 未配置，跳过 App Bot 文件推送")
             return False
 
         client = self._ensure_app_client()
         if client is None:
+            return False
+        if not FEISHU_FILE_SDK_AVAILABLE:
+            logger.warning("lark-oapi SDK does not support file upload; upgrade lark-oapi")
             return False
 
         file_name = display_name or path.name
@@ -536,7 +1545,13 @@ class FeishuSender:
     # Webhook path (legacy, unchanged)
     # ------------------------------------------------------------------
 
-    def _send_via_webhook(self, content: str, *, timeout_seconds: Optional[float] = None) -> bool:
+    def _send_via_webhook(
+        self,
+        content: str,
+        *,
+        timeout_seconds: Optional[float] = None,
+        structured_payload: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """Legacy webhook send path."""
         formatted_content = format_feishu_markdown(content)
 
@@ -562,7 +1577,13 @@ class FeishuSender:
             return self._send_feishu_chunked(formatted_content, effective_max_bytes)
 
         try:
-            return self._send_feishu_message(formatted_content, timeout_seconds=timeout_seconds)
+            if structured_payload is None:
+                return self._send_feishu_message(formatted_content, timeout_seconds=timeout_seconds)
+            return self._send_feishu_message(
+                formatted_content,
+                timeout_seconds=timeout_seconds,
+                structured_payload=structured_payload,
+            )
         except Exception as e:
             logger.error("发送飞书消息失败: %s", e)
             return False
@@ -590,7 +1611,13 @@ class FeishuSender:
                 time.sleep(1)
         return success_count == total_chunks
 
-    def _send_feishu_message(self, content: str, *, timeout_seconds: Optional[float] = None) -> bool:
+    def _send_feishu_message(
+        self,
+        content: str,
+        *,
+        timeout_seconds: Optional[float] = None,
+        structured_payload: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """Send a single Feishu webhook message (interactive card, fallback text)."""
         prepared_content = self._apply_keyword_prefix(content)
         security_fields = self._build_security_fields()
@@ -605,9 +1632,11 @@ class FeishuSender:
                     timeout=timeout_seconds or _WEBHOOK_SEND_TIMEOUT_SECONDS,
                     verify=self._webhook_verify_ssl,
                 )
-            except (requests.exceptions.ConnectionError,
-                     requests.exceptions.Timeout,
-                     requests.exceptions.RequestException) as e:
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.RequestException,
+            ) as e:
                 logger.error("飞书 Webhook 网络请求异常: %s", e)
                 return False
             if response.status_code == 200:
@@ -632,7 +1661,8 @@ class FeishuSender:
             logger.error("飞书 Webhook 请求失败: HTTP %d", response.status_code)
             return False
 
-        card_payload = {"msg_type": "interactive", "card": self._build_card_body(prepared_content)}
+        card_body = self._build_structured_card_body(structured_payload, prepared_content)
+        card_payload = {"msg_type": "interactive", "card": card_body}
 
         if _post_payload(card_payload):
             return True

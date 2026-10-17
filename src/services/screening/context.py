@@ -203,14 +203,13 @@ def summarize_candidate_profile(df: pd.DataFrame | None) -> str:
 
     lines = ["【候选池结构】"]
     factor_cols = {
-        "价值": "factor_value_score",
+        "趋势质量": "factor_trend_quality_score",
+        "相对强度": "factor_relative_strength_score",
+        "板块共振": "factor_sector_resonance_score",
+        "缩量收敛": "factor_contraction_score",
+        "支撑共振": "factor_support_confluence_score",
+        "触发质量": "factor_trigger_quality_score",
         "流动性": "factor_liquidity_score",
-        "动量": "factor_momentum_score",
-        "反转": "factor_reversal_score",
-        "活跃度": "factor_activity_score",
-        "稳定性": "factor_stability_score",
-        "市值容量": "factor_size_score",
-        "主题热度": "factor_theme_heat_score",
     }
     available = {label: col for label, col in factor_cols.items() if col in df.columns}
     if available:

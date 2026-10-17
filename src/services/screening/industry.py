@@ -21,6 +21,7 @@ from src.services.screening.normalize import (
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _AKSHARE_BOARD_CACHE_SCHEMA = "v1"
+_BAOSTOCK_INDUSTRY_CACHE_SCHEMA = "v1"
 _CACHE_DIR_UNSET = object()
 _NUMERIC_FIELDS = (
     "industry_rank",
@@ -93,6 +94,13 @@ def enrich_industry_concepts(
         if provider.lower() == "akshare":
             provider_mapping, provider_notes = fetch_akshare_board_map(
                 max_boards=max_boards,
+                cache_dir=provider_cache_dir,
+                cache_ttl_hours=provider_cache_ttl_hours,
+            )
+            _merge_mapping(mapping, provider_mapping)
+            notes.extend(provider_notes)
+        elif provider.lower() == "baostock":
+            provider_mapping, provider_notes = fetch_baostock_industry_map(
                 cache_dir=provider_cache_dir,
                 cache_ttl_hours=provider_cache_ttl_hours,
             )
@@ -265,6 +273,62 @@ def fetch_akshare_board_map(
         cache_note = _write_akshare_board_cache(cache_path, mapping, max_boards=board_limit)
         if cache_note:
             notes.append(cache_note)
+    return mapping, notes
+
+
+def fetch_baostock_industry_map(
+    *,
+    cache_dir: str | Path | None | object = _CACHE_DIR_UNSET,
+    cache_ttl_seconds: float | None = None,
+    cache_ttl_hours: float | None = None,
+) -> tuple[dict[str, dict[str, object]], list[str]]:
+    """Load the full A-share industry classification in one Baostock session."""
+    notes: list[str] = []
+    resolved_cache_dir = _resolve_akshare_board_cache_dir(cache_dir)
+    cache_path = (
+        resolved_cache_dir / f"baostock_industry_map_{_BAOSTOCK_INDUSTRY_CACHE_SCHEMA}.json"
+        if resolved_cache_dir is not None
+        else None
+    )
+    ttl_seconds = _resolve_cache_ttl_seconds(
+        cache_ttl_seconds=cache_ttl_seconds,
+        cache_ttl_hours=cache_ttl_hours,
+    )
+    if cache_path is not None:
+        cached, cache_note = _read_simple_provider_cache(
+            cache_path,
+            provider="baostock",
+            schema=_BAOSTOCK_INDUSTRY_CACHE_SCHEMA,
+            ttl_seconds=ttl_seconds,
+        )
+        if cache_note:
+            notes.append(cache_note)
+        if cached is not None:
+            return cached, notes
+
+    try:
+        from data_provider.baostock_fetcher import BaostockFetcher
+
+        raw_mapping = BaostockFetcher().get_industry_map()
+        mapping = {
+            _normalize_code(code): {"industry": _safe_text(industry), "concepts": ""}
+            for code, industry in raw_mapping.items()
+            if _normalize_code(code) and _safe_text(industry)
+        }
+        notes.append(f"baostock industry rows loaded: {len(mapping)}")
+    except Exception as exc:
+        notes.append(f"baostock industry provider failed: {exc}")
+        return {}, notes
+
+    if cache_path is not None and mapping:
+        notes.append(
+            _write_simple_provider_cache(
+                cache_path,
+                mapping,
+                provider="baostock",
+                schema=_BAOSTOCK_INDUSTRY_CACHE_SCHEMA,
+            )
+        )
     return mapping, notes
 
 
@@ -514,6 +578,56 @@ def _write_akshare_board_cache(
             "schema": _AKSHARE_BOARD_CACHE_SCHEMA,
             "provider": "akshare",
             "max_boards": int(max_boards),
+            "created_at": datetime.now().isoformat(),
+            "mapping": _json_safe_mapping(mapping),
+        }
+        tmp_path = path.with_name(f".{path.name}.{time.time_ns()}.tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(path)
+        return f"industry provider cache saved: {path} rows={len(mapping)}"
+    except Exception as exc:
+        return f"industry provider cache skipped: {path} error={exc}"
+
+
+def _read_simple_provider_cache(
+    path: Path,
+    *,
+    provider: str,
+    schema: str,
+    ttl_seconds: float,
+) -> tuple[dict[str, dict[str, object]] | None, str]:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None, ""
+    if ttl_seconds <= 0 or time.time() - stat.st_mtime > ttl_seconds:
+        return None, f"industry provider cache expired: {path}"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return None, f"industry provider cache skipped: {path} error={exc}"
+    if not isinstance(payload, dict):
+        return None, f"industry provider cache skipped: {path} invalid payload"
+    if payload.get("schema") != schema or payload.get("provider") != provider:
+        return None, f"industry provider cache skipped: {path} schema mismatch"
+    mapping = _normalize_cached_mapping(payload.get("mapping"))
+    if mapping is None:
+        return None, f"industry provider cache skipped: {path} invalid mapping"
+    return mapping, f"industry provider cache hit: {path} rows={len(mapping)}"
+
+
+def _write_simple_provider_cache(
+    path: Path,
+    mapping: dict[str, dict[str, object]],
+    *,
+    provider: str,
+    schema: str,
+) -> str:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema": schema,
+            "provider": provider,
             "created_at": datetime.now().isoformat(),
             "mapping": _json_safe_mapping(mapping),
         }

@@ -16,6 +16,13 @@ from src.services.screening.config import Config
 from src.services.screening.candidate_context import collect_candidate_context
 from src.services.screening.context import build_llm_context
 from src.services.screening.daily import enrich_daily_features
+from src.services.screening.daily_library import (
+    completed_snapshot_bar_date,
+    latest_daily_feature_date,
+    merge_daily_feature_library,
+    refresh_daily_feature_library_from_cache,
+    upsert_daily_feature_library,
+)
 from src.services.screening.dsa_provider import apply_dsa_provider_context
 from src.services.screening.filter import (
     apply_hard_filters,
@@ -35,11 +42,13 @@ from src.services.screening.normalize import (
 )
 from src.services.screening.post_analysis import normalize_post_analyzers, run_post_analyzers
 from src.services.screening.ranker import rank_candidates_with_metadata
-from src.services.screening.risk import apply_portfolio_overlay, apply_risk_overlay
+from src.services.screening.risk import apply_portfolio_overlay, apply_risk_overlay, apply_sector_quota
 from src.services.screening.scorer import compute_screen_scores, factor_score_columns
+from src.services.screening.trade_plan import build_martin_trade_plan
 from src.services.screening.selection_variant import apply_seeded_selection_variant
 from src.services.screening.snapshot import fetch_snapshot_with_fallback
 from src.services.screening.strategy import load_all_strategies
+from src.services.screening.universe import build_seed_pool
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +182,7 @@ def screen(
             provider_cache_ttl_hours=config.industry_provider_cache_ttl_hours,
         )
         degradation.extend(f"Industry/concepts enrichment: {item}" for item in industry_notes)
+    snapshot_df = _attach_market_regime_features(snapshot_df)
     snapshot_count = len(snapshot_df)
     snapshot_source = str(snapshot_df.attrs.get("snapshot_source", ""))
     source_errors = [str(item) for item in snapshot_df.attrs.get("source_errors", [])]
@@ -186,6 +196,37 @@ def screen(
                 f"Snapshot source fallback: last_good_cache stale_age_hours={stale_age}"
             )
 
+    if (
+        market == "cn"
+        and config.daily_feature_library_enabled
+        and config.daily_feature_library_path is not None
+        and config.daily_history_cache_dir is not None
+    ):
+        completed_bar_date = completed_snapshot_bar_date(snapshot_df, market=market)
+        library_latest_date = latest_daily_feature_date(config.daily_feature_library_path)
+        needs_library_refresh = library_latest_date is None or (
+            completed_bar_date is not None
+            and library_latest_date < completed_bar_date
+        )
+        if needs_library_refresh:
+            library_refresh = refresh_daily_feature_library_from_cache(
+                snapshot_df,
+                cache_dir=config.daily_history_cache_dir,
+                library_path=config.daily_feature_library_path,
+                source=config.daily_source,
+                lookback_days=config.daily_lookback_days,
+                price_adjustment="qfq",
+                append_snapshot_bar=completed_bar_date is not None,
+                snapshot_bar_date=completed_bar_date,
+            )
+            degradation.append(
+                "Local daily-feature library maintenance: "
+                f"cached={library_refresh.get('cache_count', 0)}, "
+                f"updated={library_refresh.get('updated_count', 0)}, "
+                f"appended={library_refresh.get('appended_count', 0)}, "
+                f"errors={library_refresh.get('error_count', 0)}"
+            )
+
     # 3. L1 hard filter. If a strategy needs daily features, first apply only
     # snapshot-safe filters, then enrich a narrowed candidate pool.
     if explain_filters:
@@ -196,11 +237,30 @@ def screen(
                 + _format_filter_waterfall(snapshot_waterfall)
             )
     df = apply_hard_filters(snapshot_df, snapshot_filters)
-    after_filter_count = len(df)
+    if (
+        market == "cn"
+        and config.daily_feature_library_enabled
+        and config.daily_feature_library_path is not None
+    ):
+        df, library_diagnostics = merge_daily_feature_library(
+            df,
+            library_path=config.daily_feature_library_path,
+            max_age_days=config.daily_feature_library_max_age_days,
+        )
+        degradation.append(
+            "Local daily-feature library: "
+            f"matched {library_diagnostics.get('matched_count', 0)} of {len(df)} candidates; "
+            f"fresh={library_diagnostics.get('fresh_count', 0)}, "
+            f"stale={library_diagnostics.get('stale_count', 0)}"
+        )
+    snapshot_filtered_count = len(df)
+    after_filter_count = snapshot_filtered_count
+    seed_pool_count = 0
+    seed_pool_diagnostics: dict[str, object] = {}
     _emit_progress(
         progress_callback,
         42,
-        f"快照筛选完成，保留 {after_filter_count} 条候选",
+        f"快照筛选完成，保留 {snapshot_filtered_count} 条候选",
     )
 
     if df.empty:
@@ -208,6 +268,7 @@ def screen(
             strategy=strategy,
             market=market,
             snapshot_count=snapshot_count,
+            snapshot_filtered_count=0,
             after_filter_count=0,
             run_id=run_id,
             degradation=[*degradation, "No candidates after hard filter"],
@@ -224,9 +285,29 @@ def screen(
     daily_enriched = False
     daily_enrich_count = 0
     if daily_needed or daily_requested:
-        provisional = _sort_screened_candidates(compute_screen_scores(df, screening), screening)
-        enrich_count = min(daily_limit, len(provisional))
-        daily_candidates = provisional.head(enrich_count)
+        seed_selection = build_seed_pool(
+            df,
+            limit=daily_limit,
+            period=f"{datetime.now(timezone.utc).date().isoformat()}:{market}:{strategy}",
+            core_ratio=config.seed_pool_core_ratio,
+            strength_ratio=config.seed_pool_strength_ratio,
+            activity_ratio=config.seed_pool_activity_ratio,
+            max_sector_ratio=config.seed_pool_max_sector_ratio,
+        )
+        daily_candidates = seed_selection.dataframe
+        seed_pool_diagnostics = seed_selection.diagnostics
+        seed_pool_count = len(daily_candidates)
+        enrich_count = seed_pool_count
+        degradation.append(
+            "Seed pool selected "
+            f"{seed_pool_count} of {snapshot_filtered_count} snapshot-filtered candidates; "
+            f"sleeves={seed_pool_diagnostics.get('sleeve_counts', {})}"
+        )
+        _emit_progress(
+            progress_callback,
+            48,
+            f"种子池已构建，正在计算 {seed_pool_count} 只股票的日线特征",
+        )
         try:
             enriched = enrich_daily_features(
                 daily_candidates,
@@ -238,6 +319,25 @@ def screen(
                 cache_ttl_seconds=config.daily_history_cache_ttl_hours * 3600,
                 max_workers=config.daily_fetch_max_workers,
                 history_fetcher=daily_history_fetcher,
+                price_adjustment="qfq" if market == "cn" else None,
+            )
+            if (
+                market == "cn"
+                and config.daily_feature_library_enabled
+                and config.daily_feature_library_path is not None
+            ):
+                library_update = upsert_daily_feature_library(
+                    enriched,
+                    library_path=config.daily_feature_library_path,
+                )
+                degradation.append(
+                    "Local daily-feature library updated: "
+                    f"rows={library_update.get('updated_count', 0)}, "
+                    f"total={library_update.get('entry_count', 0)}"
+                )
+            enriched = _attach_martin_cross_sectional_features_from_universe(
+                enriched,
+                universe=df,
             )
             daily_enriched = True
             daily_errors = [str(item) for item in enriched.attrs.get("daily_errors", [])]
@@ -250,7 +350,7 @@ def screen(
             )
             degradation.append(
                 f"Daily K-line enrichment attempted {enrich_count} candidates, "
-                f"succeeded {daily_enrich_count} of {after_filter_count} snapshot-filtered candidates"
+                f"succeeded {daily_enrich_count} of {snapshot_filtered_count} snapshot-filtered candidates"
             )
             if daily_source_counts:
                 source_summary = ", ".join(
@@ -307,6 +407,10 @@ def screen(
             strategy_version=strat.version,
             strategy_category=strat.category,
             snapshot_count=snapshot_count,
+            snapshot_filtered_count=snapshot_filtered_count,
+            seed_pool_count=seed_pool_count,
+            seed_pool_limit=daily_limit,
+            seed_pool_diagnostics=seed_pool_diagnostics,
             after_filter_count=0,
             run_id=run_id,
             degradation=[*degradation, "No candidates after daily hard filter"],
@@ -510,6 +614,7 @@ def screen(
 
     # Apply selection variant after post-analyzers to ensure rotation respects
     # final_score adjustments made by L3 analyzers (e.g. scorecard/dsa).
+    ranked_pool = list(picks)
     selection_variant = apply_seeded_selection_variant(
         picks,
         max_output=output_count,
@@ -520,7 +625,36 @@ def screen(
         ),
         analyzer_names=analyzer_names,
     )
-    picks = selection_variant.picks
+    selected_codes = {pick.code for pick in selection_variant.picks}
+    preferred_pool = [
+        *selection_variant.picks,
+        *(pick for pick in ranked_pool if pick.code not in selected_codes),
+    ]
+    sector_quota_replacements = 0
+    sector_quota_max_per_bucket = 0
+    if config.portfolio_diversity_enabled:
+        sector_quota_max_per_bucket = max(
+            int(screening.portfolio_profile.get("max_same_bucket", 2)),
+            1,
+        )
+        picks, quota_notes, sector_quota_replacements = apply_sector_quota(
+            preferred_pool,
+            max_output=output_count,
+            max_same_sector=sector_quota_max_per_bucket,
+            profile=screening.portfolio_profile,
+        )
+        portfolio_concentration_notes.extend(quota_notes)
+    else:
+        picks = selection_variant.picks
+    for pick in picks:
+        pick.trade_plan = build_martin_trade_plan(
+            price=pick.price,
+            trigger_distance_pct=pick.trigger_distance_pct,
+            adr_20_pct=pick.adr_20_pct,
+            ema21=pick.ema21,
+            atr_20_pct=pick.atr_20_pct,
+            anchored_vwap=pick.anchored_vwap_60d_high,
+        )
     _emit_progress(progress_callback, 88, "选股核心流程完成")
 
     return ScreenResult(
@@ -529,6 +663,10 @@ def screen(
         strategy_version=strat.version,
         strategy_category=strat.category,
         snapshot_count=snapshot_count,
+        snapshot_filtered_count=snapshot_filtered_count,
+        seed_pool_count=seed_pool_count,
+        seed_pool_limit=daily_limit if (daily_needed or daily_requested) else 0,
+        seed_pool_diagnostics=seed_pool_diagnostics,
         after_filter_count=after_filter_count,
         picks=picks,
         run_id=run_id,
@@ -552,6 +690,9 @@ def screen(
         risk_enabled=config.risk_enabled,
         portfolio_diversity_enabled=config.portfolio_diversity_enabled,
         portfolio_concentration_notes=portfolio_concentration_notes,
+        sector_quota_applied=sector_quota_replacements > 0,
+        sector_quota_replacements=sector_quota_replacements,
+        sector_quota_max_per_bucket=sector_quota_max_per_bucket,
         result_variant_applied=selection_variant.applied,
         result_variant_pool_size=selection_variant.pool_size,
         result_variant_rotated_slots=selection_variant.rotated_slots,
@@ -595,6 +736,8 @@ def _df_to_picks(df: pd.DataFrame) -> list[Pick]:
             volume_ratio=_safe_float(row.get("volume_ratio", row.get("量比"))),
             pe_ratio=_safe_float(row.get("pe_ratio", row.get("市盈率"))),
             pb_ratio=_safe_float(row.get("pb_ratio", row.get("市净率"))),
+            seed_pool_score=_safe_float(row.get("seed_pool_score")),
+            seed_pool_reason=_safe_text(row.get("seed_pool_reason")),
             industry=_safe_text(row.get("industry", row.get("行业", row.get("所属行业", "")))),
             concepts=_safe_text(row.get("concepts", row.get("概念", row.get("概念题材", "")))),
             industry_rank=_safe_int(row.get("industry_rank")),
@@ -610,6 +753,26 @@ def _df_to_picks(df: pd.DataFrame) -> list[Pick]:
             board_heat_state=_safe_text(row.get("board_heat_state")),
             board_heat_summary=_safe_text(row.get("board_heat_summary")),
             change_60d=_safe_float(row.get("change_60d")),
+            change_20d=_safe_float(row.get("change_20d")),
+            relative_strength_20d_pctile=_safe_float(row.get("relative_strength_20d_pctile")),
+            relative_strength_60d_pctile=_safe_float(row.get("relative_strength_60d_pctile")),
+            adr_20_pct=_safe_float(row.get("adr_20_pct")),
+            ema9=_safe_float(row.get("ema9")),
+            ema21=_safe_float(row.get("ema21")),
+            ema50=_safe_float(row.get("ema50")),
+            ema_stack_bullish=_safe_bool(row.get("ema_stack_bullish")),
+            ema21_rising=_safe_bool(row.get("ema21_rising")),
+            ema50_rising=_safe_bool(row.get("ema50_rising")),
+            distance_to_120d_high_pct=_safe_float(row.get("distance_to_120d_high_pct")),
+            pullback_depth_10d_pct=_safe_float(row.get("pullback_depth_10d_pct")),
+            range_contraction_ratio=_safe_float(row.get("range_contraction_ratio")),
+            volume_contraction_ratio=_safe_float(row.get("volume_contraction_ratio")),
+            anchored_vwap_60d_high=_safe_float(row.get("anchored_vwap_60d_high")),
+            support_confluence_count=_safe_int(row.get("support_confluence_count")),
+            trigger_distance_pct=_safe_float(row.get("trigger_distance_pct")),
+            one_word_limit_up=_safe_bool(row.get("one_word_limit_up")),
+            avg_amount_20d=_safe_float(row.get("avg_amount_20d")),
+            sector_breadth_count=_safe_int(row.get("sector_breadth_count")),
             signal_score=_safe_float(row.get("signal_score")),
             ma_bullish=_safe_bool(row.get("ma_bullish")),
             price_above_ma20=_safe_bool(row.get("price_above_ma20")),
@@ -634,7 +797,15 @@ def _df_to_picks(df: pd.DataFrame) -> list[Pick]:
 
 def _sort_screened_candidates(df: pd.DataFrame, screening=None) -> pd.DataFrame:
     """Sort scored candidates deterministically with factor-aware tie breakers."""
-    factor_order = ["stability", "activity", "momentum", "value"]
+    factor_order = [
+        "trend_quality",
+        "relative_strength",
+        "sector_resonance",
+        "contraction",
+        "support_confluence",
+        "trigger_quality",
+        "liquidity",
+    ]
     if screening is not None and screening.factor_weights:
         factor_order = [
             factor
@@ -657,6 +828,111 @@ def _sort_screened_candidates(df: pd.DataFrame, screening=None) -> pd.DataFrame:
     return df.sort_values(sort_columns, ascending=ascending, kind="mergesort")
 
 
+def _attach_martin_cross_sectional_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Rank momentum within the enriched pool and measure sector participation."""
+    result = df.copy()
+    for periods in (20, 60):
+        source = f"change_{periods}d"
+        target = f"relative_strength_{periods}d_pctile"
+        raw_values = result[source] if source in result.columns else pd.Series(pd.NA, index=result.index)
+        values = pd.to_numeric(raw_values, errors="coerce")
+        if values.notna().any():
+            result[target] = values.rank(method="average", pct=True) * 100.0
+        else:
+            result[target] = pd.NA
+
+    raw_change_20d = (
+        result["change_20d"]
+        if "change_20d" in result.columns
+        else pd.Series(pd.NA, index=result.index)
+    )
+    change_20d = pd.to_numeric(raw_change_20d, errors="coerce")
+    result["market_median_change_20d_pct"] = (
+        round(float(change_20d.median()), 4) if change_20d.notna().any() else pd.NA
+    )
+
+    industry_col = next(
+        (name for name in ("industry", "行业", "所属行业") if name in result.columns),
+        None,
+    )
+    if industry_col is None:
+        result["sector_breadth_count"] = 0
+        return result
+
+    industries = result[industry_col].fillna("").astype(str).str.strip()
+    ema_ok = result.get("ema_stack_bullish", pd.Series(False, index=result.index)) == True  # noqa: E712
+    rs60 = result.get(
+        "relative_strength_60d_pctile", pd.Series(pd.NA, index=result.index)
+    )
+    strong = ema_ok & pd.to_numeric(rs60, errors="coerce").ge(70)
+    breadth = strong.groupby(industries).transform("sum")
+    result["sector_breadth_count"] = breadth.where(industries.ne(""), 0).astype(int)
+    return result
+
+
+def _attach_martin_cross_sectional_features_from_universe(
+    enriched: pd.DataFrame,
+    *,
+    universe: pd.DataFrame,
+) -> pd.DataFrame:
+    """Map full-universe relative strength back to the enriched seed pool."""
+    if enriched.empty or universe.empty or "code" not in enriched.columns or "code" not in universe.columns:
+        return _attach_martin_cross_sectional_features(enriched)
+
+    full = universe.copy()
+    full["__cross_code"] = full["code"].map(
+        lambda value: normalize_code(value, allow_ticker=True)
+    )
+    selected = enriched.copy()
+    selected["__cross_code"] = selected["code"].map(
+        lambda value: normalize_code(value, allow_ticker=True)
+    )
+    selected = selected.drop_duplicates("__cross_code", keep="last").set_index("__cross_code")
+    for column in ("change_20d", "change_60d", "ema_stack_bullish"):
+        if column not in selected.columns:
+            continue
+        mapped = full["__cross_code"].map(selected[column])
+        if column in full.columns:
+            full[column] = mapped.where(mapped.notna(), full[column])
+        else:
+            full[column] = mapped
+
+    full = _attach_martin_cross_sectional_features(full)
+    full = full.drop_duplicates("__cross_code", keep="last").set_index("__cross_code")
+    result = enriched.copy()
+    result_codes = result["code"].map(lambda value: normalize_code(value, allow_ticker=True))
+    for column in (
+        "relative_strength_20d_pctile",
+        "relative_strength_60d_pctile",
+        "sector_breadth_count",
+        "market_median_change_20d_pct",
+    ):
+        if column in full.columns:
+            result[column] = result_codes.map(full[column])
+    return result
+
+
+def _attach_market_regime_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Attach deterministic one-day breadth gates to every snapshot row."""
+    result = df.copy()
+    change_col = next(
+        (name for name in ("change_pct", "涨跌幅") if name in result.columns),
+        None,
+    )
+    if change_col is None:
+        result["market_positive_ratio"] = pd.NA
+        result["market_median_change_pct"] = pd.NA
+        return result
+    changes = pd.to_numeric(result[change_col], errors="coerce").dropna()
+    if changes.empty:
+        result["market_positive_ratio"] = pd.NA
+        result["market_median_change_pct"] = pd.NA
+        return result
+    result["market_positive_ratio"] = round(float(changes.gt(0).mean() * 100.0), 4)
+    result["market_median_change_pct"] = round(float(changes.median()), 4)
+    return result
+
+
 def _required_snapshot_columns(filters) -> list[str]:
     columns: list[str] = []
     if filters.exclude_st:
@@ -675,7 +951,12 @@ def _required_snapshot_columns(filters) -> list[str]:
         columns.append("volume_ratio")
     if filters.turnover_rate_min is not None:
         columns.append("turnover_rate")
-    if filters.change_pct_min is not None or filters.change_pct_max is not None:
+    if any([
+        filters.change_pct_min is not None,
+        filters.change_pct_max is not None,
+        filters.market_positive_ratio_min is not None,
+        filters.market_median_change_pct_min is not None,
+    ]):
         columns.append("change_pct")
     return list(dict.fromkeys(columns))
 

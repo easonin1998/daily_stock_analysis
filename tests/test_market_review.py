@@ -7,8 +7,11 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import pandas as pd
 
 from tests.litellm_stub import ensure_litellm_stub
 
@@ -136,6 +139,104 @@ class MarketReviewLocalizationTestCase(unittest.TestCase):
         self.assertEqual(result.report, "CN body")
         notifier.save_report_to_file.assert_not_called()
         persist_history.assert_called_once()
+
+    def test_market_review_payload_records_successful_llm_generation(self) -> None:
+        analyzer = market_review_module.MarketAnalyzer(
+            config=SimpleNamespace(
+                report_language="zh",
+                market_review_color_scheme="green_up",
+                litellm_model="deepseek/deepseek-v4-flash",
+            ),
+            analyzer=MagicMock(),
+        )
+        analyzer._review_generation_mode = "llm"
+        overview = SimpleNamespace(
+            date="2026-08-13",
+            indices=[],
+            top_sectors=[],
+            bottom_sectors=[],
+            top_concepts=[],
+            bottom_concepts=[],
+            up_count=0,
+            down_count=0,
+            flat_count=0,
+            limit_up_count=0,
+            limit_down_count=0,
+            total_amount=0.0,
+        )
+
+        payload = analyzer.build_market_review_payload(
+            overview,
+            [],
+            "## 复盘\n\n正文",
+            market_light_snapshot={"dimensions": {}},
+        )
+
+        self.assertEqual(payload["generation"], {
+            "mode": "llm",
+            "model": "deepseek/deepseek-v4-flash",
+        })
+
+    def test_market_review_payload_preserves_evidence_backed_recommendations(self) -> None:
+        analyzer = market_review_module.MarketAnalyzer(
+            config=SimpleNamespace(report_language="zh", market_review_color_scheme="green_up"),
+            analyzer=MagicMock(),
+        )
+        overview = SimpleNamespace(
+            date="2026-08-13", indices=[], top_sectors=[], bottom_sectors=[],
+            top_concepts=[], bottom_concepts=[], up_count=0, down_count=0, flat_count=0,
+            limit_up_count=0, limit_down_count=0, total_amount=0.0,
+        )
+        recommendations = {
+            "etf": [{"code": "515120", "name": "创新药ETF", "score": 80}],
+            "stocks": [],
+        }
+
+        payload = analyzer.build_market_review_payload(
+            overview,
+            [],
+            "## 复盘\n\n正文",
+            market_light_snapshot={"dimensions": {}},
+            recommendations=recommendations,
+        )
+
+        self.assertEqual(payload["recommendations"], recommendations)
+
+    def test_cn_market_review_selects_medicine_candidates_from_leading_theme(self) -> None:
+        analyzer = market_review_module.MarketAnalyzer(
+            config=SimpleNamespace(report_language="zh", market_review_color_scheme="green_up"),
+            analyzer=MagicMock(),
+        )
+        overview = SimpleNamespace(
+            top_sectors=[{"name": "医药制造业", "change_pct": 1.64}],
+            top_concepts=[{"name": "创新药", "change_pct": 3.2}],
+        )
+        daily = pd.DataFrame([{
+            "close": 10.2, "ma5": 10.0, "ma10": 9.9, "ma20": 9.8,
+            "pct_chg": 1.2, "volume_ratio": 1.3, "amount": 2.5e8,
+        }])
+        analyzer.data_manager.get_daily_data = MagicMock(return_value=(daily, "AkshareFetcher"))
+
+        recommendations = analyzer._select_market_review_recommendations(overview)
+
+        self.assertEqual([item["code"] for item in recommendations["etf"]], ["515120", "512170"])
+        self.assertEqual([item["code"] for item in recommendations["stocks"]], ["603259", "600276"])
+        self.assertTrue(all(item["score"] >= 80 for item in recommendations["etf"]))
+
+    def test_market_review_hard_filters_undated_and_stale_news(self) -> None:
+        today = datetime.now().date()
+        fresh = (today - timedelta(days=2)).isoformat()
+        stale = (today - timedelta(days=3)).isoformat()
+
+        results = market_review_module.MarketAnalyzer._filter_market_review_news([
+            {"title": "fresh A-share item", "published_date": fresh, "market_scope": "cn"},
+            {"title": "fresh US stock market item", "published_date": fresh, "market_scope": "us"},
+            {"title": "fresh unrelated US item", "published_date": fresh, "market_scope": "us"},
+            {"title": "stale", "published_date": stale},
+            {"title": "undated", "published_date": ""},
+        ])
+
+        self.assertEqual([item["title"] for item in results], ["fresh A-share item", "fresh US stock market item"])
 
     def test_run_market_review_passes_request_config_to_generation(self) -> None:
         notifier = self._make_notifier()

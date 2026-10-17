@@ -209,21 +209,67 @@ def _collect_candidate_context_row(
         return None, [*errors, f"{code} context: {exc}"]
 
 
-def fetch_stock_news_summary(code: str, *, limit: int = 3) -> str:
+def fetch_stock_news_items(
+    code: str,
+    *,
+    limit: int = 3,
+    max_age_days: int | None = None,
+    now: datetime | None = None,
+) -> list[dict[str, str]]:
+    """Return structured Eastmoney stock news, optionally with a strict age cap."""
     import akshare as ak
 
     df = ak.stock_news_em(symbol=str(code).zfill(6))
     if df is None or df.empty:
-        return ""
-    items = []
-    for _, row in df.head(max(limit, 1)).iterrows():
+        return []
+
+    current = now or datetime.now()
+    cutoff = current - timedelta(days=max_age_days) if max_age_days is not None else None
+    items: list[dict[str, str]] = []
+    for _, row in df.iterrows():
         title = _first_value(row, ["新闻标题", "标题", "title"])
         published_at = _first_value(row, ["发布时间", "时间", "date"])
         source = _first_value(row, ["文章来源", "来源", "source"])
-        text = " ".join(item for item in [published_at, source, title] if item)
-        if text:
-            items.append(text)
-    return _compress_text(" | ".join(_dedupe(items)), max_len=520)
+        snippet = _first_value(row, ["新闻内容", "内容", "snippet"])
+        url = _first_value(row, ["新闻链接", "链接", "url"])
+        if not title:
+            continue
+
+        parsed_at = pd.to_datetime(published_at, errors="coerce")
+        if cutoff is not None:
+            if pd.isna(parsed_at):
+                continue
+            published_datetime = parsed_at.to_pydatetime()
+            if published_datetime < cutoff or published_datetime > current + timedelta(hours=6):
+                continue
+        normalized_date = (
+            parsed_at.strftime("%Y-%m-%d %H:%M:%S")
+            if not pd.isna(parsed_at)
+            else str(published_at or "")
+        )
+        items.append({
+            "title": str(title),
+            "snippet": _compress_text(str(snippet or ""), max_len=280),
+            "url": str(url or ""),
+            "source": str(source or "东方财富资讯"),
+            "published_date": normalized_date,
+        })
+        if len(items) >= max(limit, 1):
+            break
+    return items
+
+
+def fetch_stock_news_summary(code: str, *, limit: int = 3) -> str:
+    items = fetch_stock_news_items(code, limit=limit)
+    texts = [
+        " ".join(
+            value
+            for value in [item.get("published_date", ""), item.get("source", ""), item.get("title", "")]
+            if value
+        )
+        for item in items
+    ]
+    return _compress_text(" | ".join(_dedupe(texts)), max_len=520)
 
 
 def fetch_stock_announcement_summary(code: str, *, limit: int = 3) -> str:

@@ -8,6 +8,7 @@ const {
   getScreeningStatus,
   getHotspotDetail,
   getHotspots,
+  getRun,
   getStrategies,
   getScreenTask,
   navigate,
@@ -24,7 +25,7 @@ const {
       traceId: 'screen-task-1',
       status: 'pending',
       message: 'Screening 选股任务已提交',
-      strategy: 'dual_low',
+      strategy: 'martin_momentum_pullback',
       market: 'cn',
       maxResults: 3,
     };
@@ -45,6 +46,7 @@ const {
     getScreeningStatus: vi.fn(),
     getHotspotDetail: vi.fn(),
     getHotspots: vi.fn(),
+    getRun: vi.fn(),
     getStrategies: vi.fn(),
     getScreenTask,
     navigate: vi.fn(),
@@ -70,6 +72,7 @@ vi.mock('../../api/screening', () => ({
     getStatus: () => getScreeningStatus(),
     getHotspotDetail: (payload: unknown) => getHotspotDetail(payload),
     getHotspots: (payload: unknown) => getHotspots(payload),
+    getRun: (runId: string) => getRun(runId),
     getStrategies: () => getStrategies(),
     getScreenTask: (taskId: string) => getScreenTask(taskId),
     screen: (payload: unknown) => screenStocks(payload),
@@ -81,13 +84,13 @@ const mockStrategiesResponse = {
   enabled: true,
   strategies: [
     {
-      id: 'dual_low',
-      name: 'Dual Low',
-      title: 'Dual Low',
-      description: 'Low valuation strategy',
-      category: 'value',
-      tag: 'value',
-      tags: ['value'],
+      id: 'martin_momentum_pullback',
+      name: 'Martin动量回调',
+      title: 'Martin动量回调',
+      description: 'Momentum pullback strategy',
+      category: 'trend',
+      tag: 'trend',
+      tags: ['momentum', 'pullback'],
       marketScope: ['cn'],
     },
   ],
@@ -110,6 +113,7 @@ describe('StockScreeningPage', () => {
     getScreeningStatus.mockReset();
     getHotspotDetail.mockReset();
     getHotspots.mockReset();
+    getRun.mockReset();
     getStrategies.mockReset();
     getScreenTask.mockClear();
     navigate.mockReset();
@@ -144,6 +148,7 @@ describe('StockScreeningPage', () => {
     });
     getHotspots.mockResolvedValue({ enabled: true, provider: 'akshare', hotspots: [], hotspotCount: 0 });
     window.sessionStorage.clear();
+    window.history.replaceState({}, '', '/screening');
   });
 
   it('keeps implementation attribution and repeated guidance off the operation page', async () => {
@@ -942,15 +947,15 @@ describe('StockScreeningPage', () => {
     await waitFor(() => expect(screen.getByText(/自定义策略 \(custom_strategy_alpha\)/)).toBeInTheDocument());
   });
 
-  it('uses supported Screening strategy ids and cn market', async () => {
+  it('renders strategy ids returned by the API and cn market', async () => {
     getStrategies.mockResolvedValueOnce({
       enabled: true,
       strategies: [
-        { id: 'balanced_alpha', name: '平衡选股', description: 'desc', category: '框架' },
-        { id: 'capital_heat', name: '资金热度', description: 'desc', category: '动量' },
-        { id: 'dual_low', name: '双低', description: 'desc', category: '价值' },
-        { id: 'oversold_reversal', name: '超跌', description: 'desc', category: '反转' },
-        { id: 'shrink_pullback', name: '缩量回踩', description: 'desc', category: '趋势' },
+        { id: 'framework_demo', name: '综合示例', description: 'desc', category: '框架' },
+        { id: 'momentum_demo', name: '动量示例', description: 'desc', category: '动量' },
+        { id: 'value_demo', name: '价值示例', description: 'desc', category: '价值' },
+        { id: 'reversal_demo', name: '反转示例', description: 'desc', category: '反转' },
+        { id: 'trend_demo', name: '趋势示例', description: 'desc', category: '趋势' },
       ],
       strategyCount: 5,
     });
@@ -973,15 +978,15 @@ describe('StockScreeningPage', () => {
 
     const strategySelect = screen.getByLabelText('策略') as HTMLSelectElement;
     expect(Array.from(strategySelect.options).map((option) => option.textContent)).toEqual([
-      '平衡选股',
-      '资金热度',
-      '双低',
-      '超跌',
-      '缩量回踩',
+      '综合示例',
+      '动量示例',
+      '价值示例',
+      '反转示例',
+      '趋势示例',
       '自定义策略…',
     ]);
 
-    ['balanced_alpha', 'capital_heat', 'oversold_reversal', 'shrink_pullback'].forEach((id) => {
+    ['framework_demo', 'momentum_demo', 'reversal_demo', 'trend_demo'].forEach((id) => {
       fireEvent.change(strategySelect, { target: { value: id } });
       expect(strategySelect.value).toBe(id);
     });
@@ -990,17 +995,52 @@ describe('StockScreeningPage', () => {
     await waitFor(() => expect(screenStocks).toHaveBeenCalledTimes(1));
     expect(screenStocks).toHaveBeenCalledWith({
       market: 'cn',
-      strategy: 'shrink_pullback',
+      strategy: 'trend_demo',
       maxResults: 3,
+      notify: true,
+      webBaseUrl: window.location.origin,
     });
+  });
+
+  it('opens a persisted screening run from the Feishu detail link', async () => {
+    window.history.replaceState({}, '', '/screening?runId=run-1');
+    getScreeningStatus.mockResolvedValueOnce({ enabled: true, available: true });
+    getRun.mockResolvedValueOnce({
+      enabled: true,
+      runId: 'run-1',
+      strategy: 'martin_momentum_pullback',
+      market: 'cn',
+      candidateCount: 1,
+      result: {
+        enabled: true,
+        runId: 'run-1',
+        strategy: 'martin_momentum_pullback',
+        market: 'cn',
+        candidates: [{
+          rank: 1,
+          code: '600519',
+          name: '贵州茅台',
+          score: 88.6,
+          reason: '趋势与相对强度共振',
+          raw: {},
+        }],
+        candidateCount: 1,
+      },
+    });
+
+    render(<StockScreeningPage />);
+
+    await waitFor(() => expect(getRun).toHaveBeenCalledWith('run-1'));
+    expect(await screen.findByText('贵州茅台')).toBeInTheDocument();
+    expect(screen.getByText('选股完成')).toBeInTheDocument();
   });
 
   it('clears previous screening candidates when strategy changes', async () => {
     getStrategies.mockResolvedValueOnce({
       enabled: true,
       strategies: [
-        { id: 'dual_low', name: '双低选股', description: 'desc', category: '价值' },
-        { id: 'capital_heat', name: '资金热度', description: 'desc', category: '动量' },
+        { id: 'martin_momentum_pullback', name: 'Martin动量回调', description: 'desc', category: '趋势' },
+        { id: 'momentum_demo', name: '动量示例', description: 'desc', category: '动量' },
       ],
       strategyCount: 2,
     });
@@ -1031,11 +1071,11 @@ describe('StockScreeningPage', () => {
     expect(await screen.findByText('旧策略股票')).toBeInTheDocument();
     expect(screen.getByText('选股完成')).toBeInTheDocument();
 
-    fireEvent.change(screen.getByLabelText('策略'), { target: { value: 'capital_heat' } });
+    fireEvent.change(screen.getByLabelText('策略'), { target: { value: 'momentum_demo' } });
 
     expect(screen.queryByText('旧策略股票')).not.toBeInTheDocument();
     expect(screen.queryByText('选股完成')).not.toBeInTheDocument();
-    expect(screen.getByLabelText('策略')).toHaveValue('capital_heat');
+    expect(screen.getByLabelText('策略')).toHaveValue('momentum_demo');
   });
 
   it('hands a screening candidate to DSA analysis with mapped skills', async () => {
@@ -1043,8 +1083,8 @@ describe('StockScreeningPage', () => {
       enabled: true,
       strategies: [
         {
-          id: 'dual_low',
-          name: '双低选股',
+          id: 'martin_momentum_pullback',
+          name: 'Martin动量回调',
           description: 'desc',
           category: '价值',
           analysisSkills: ['growth_quality'],
@@ -1167,7 +1207,7 @@ describe('StockScreeningPage', () => {
     window.sessionStorage.setItem('dsa.screening.activeScreenTask.v1', JSON.stringify({
       taskId: 'screen-task-1',
       market: 'cn',
-      strategy: 'dual_low',
+      strategy: 'martin_momentum_pullback',
       maxResults: 3,
     }));
     getScreenTask.mockRejectedValueOnce(Object.assign(new Error('timeout of 30000ms exceeded'), {
@@ -1196,10 +1236,10 @@ describe('StockScreeningPage', () => {
           code: '000001',
           name: '平安银行',
           score: 88.5,
-          reason: '本地后置评分: value_quality',
+          reason: 'Martin 七维因子评分',
           amount: 1042000000,
           factorScores: {
-            value: 87.44,
+            trend_quality: 87.44,
             liquidity: 93.33,
           },
           raw: {},
@@ -1225,7 +1265,7 @@ describe('StockScreeningPage', () => {
     expect(screen.queryByText(/Missing gemini_api_key/)).not.toBeInTheDocument();
     expect(screen.getByText(/排序：确定性因子/)).toBeInTheDocument();
     expect(screen.getByText('因子排序')).toBeInTheDocument();
-    expect(screen.getByText(/主要优势：流动性 93、估值 87/)).toBeInTheDocument();
+    expect(screen.getByText(/主要优势：流动性 93、趋势质量 87/)).toBeInTheDocument();
     expect(screen.queryByText(/LLM 已降级/)).not.toBeInTheDocument();
   });
 

@@ -12,6 +12,31 @@ from src.services.screening.models import HardFilterConfig
 
 logger = logging.getLogger(__name__)
 _DAILY_FILTER_DEFAULTS = {
+    "daily_data_points_min": None,
+    "avg_amount_20d_min": None,
+    "adr_20_pct_min": None,
+    "adr_20_pct_max": None,
+    "change_20d_min": None,
+    "change_20d_max": None,
+    "relative_strength_20d_pctile_min": None,
+    "relative_strength_60d_pctile_min": None,
+    "require_ema_stack": False,
+    "require_ema21_rising": False,
+    "require_ema50_rising": False,
+    "distance_to_120d_high_pct_min": None,
+    "pullback_depth_10d_pct_min": None,
+    "pullback_depth_10d_pct_max": None,
+    "range_contraction_ratio_max": None,
+    "volume_contraction_ratio_max": None,
+    "support_confluence_count_min": None,
+    "trigger_distance_pct_min": None,
+    "trigger_distance_pct_max": None,
+    "trigger_close_location_pct_min": None,
+    "trigger_close_location_pct_max": None,
+    "trigger_volume_vs_previous_min": None,
+    "trigger_volume_vs_previous_max": None,
+    "market_median_change_20d_pct_min": None,
+    "exclude_one_word_limit_up": False,
     "change_60d_min": None,
     "change_60d_max": None,
     "require_ma_bullish": False,
@@ -73,6 +98,10 @@ def apply_hard_filters(df: pd.DataFrame, filters: HardFilterConfig) -> pd.DataFr
     mask = _filter_min(result, mask, ["turnover_rate", "换手率"], filters.turnover_rate_min)
     mask = _filter_min(result, mask, ["change_pct", "涨跌幅"], filters.change_pct_min)
     mask = _filter_max(result, mask, ["change_pct", "涨跌幅"], filters.change_pct_max)
+    mask = _filter_min(result, mask, ["market_positive_ratio"], filters.market_positive_ratio_min)
+    mask = _filter_min(
+        result, mask, ["market_median_change_pct"], filters.market_median_change_pct_min
+    )
 
     mask = _filter_min(result, mask, ["change_60d"], filters.change_60d_min)
     mask = _filter_max(result, mask, ["change_60d"], filters.change_60d_max)
@@ -98,6 +127,51 @@ def apply_hard_filters(df: pd.DataFrame, filters: HardFilterConfig) -> pd.DataFr
     mask = _filter_max(result, mask, ["max_drawdown_20d_pct"], filters.max_drawdown_20d_pct_max)
     mask = _filter_min(result, mask, ["atr_20_pct"], filters.atr_20_pct_min)
     mask = _filter_max(result, mask, ["atr_20_pct"], filters.atr_20_pct_max)
+    mask = _filter_min(result, mask, ["daily_data_points"], filters.daily_data_points_min)
+    mask = _filter_min(result, mask, ["avg_amount_20d"], filters.avg_amount_20d_min)
+    mask = _filter_min(result, mask, ["adr_20_pct"], filters.adr_20_pct_min)
+    mask = _filter_max(result, mask, ["adr_20_pct"], filters.adr_20_pct_max)
+    mask = _filter_min(result, mask, ["change_20d"], filters.change_20d_min)
+    mask = _filter_max(result, mask, ["change_20d"], filters.change_20d_max)
+    mask = _filter_min(
+        result, mask, ["relative_strength_20d_pctile"], filters.relative_strength_20d_pctile_min
+    )
+    mask = _filter_min(
+        result, mask, ["relative_strength_60d_pctile"], filters.relative_strength_60d_pctile_min
+    )
+    mask = _filter_bool_true(result, mask, "ema_stack_bullish", filters.require_ema_stack)
+    mask = _filter_bool_true(result, mask, "ema21_rising", filters.require_ema21_rising)
+    mask = _filter_bool_true(result, mask, "ema50_rising", filters.require_ema50_rising)
+    mask = _filter_min(
+        result, mask, ["distance_to_120d_high_pct"], filters.distance_to_120d_high_pct_min
+    )
+    mask = _filter_min(result, mask, ["pullback_depth_10d_pct"], filters.pullback_depth_10d_pct_min)
+    mask = _filter_max(result, mask, ["pullback_depth_10d_pct"], filters.pullback_depth_10d_pct_max)
+    mask = _filter_max(result, mask, ["range_contraction_ratio"], filters.range_contraction_ratio_max)
+    mask = _filter_max(result, mask, ["volume_contraction_ratio"], filters.volume_contraction_ratio_max)
+    mask = _filter_min(
+        result, mask, ["support_confluence_count"], filters.support_confluence_count_min
+    )
+    mask = _filter_min(result, mask, ["trigger_distance_pct"], filters.trigger_distance_pct_min)
+    mask = _filter_max(result, mask, ["trigger_distance_pct"], filters.trigger_distance_pct_max)
+    mask = _filter_min(
+        result, mask, ["trigger_close_location_pct"], filters.trigger_close_location_pct_min
+    )
+    mask = _filter_max(
+        result, mask, ["trigger_close_location_pct"], filters.trigger_close_location_pct_max
+    )
+    mask = _filter_min(
+        result, mask, ["trigger_volume_vs_previous"], filters.trigger_volume_vs_previous_min
+    )
+    mask = _filter_max(
+        result, mask, ["trigger_volume_vs_previous"], filters.trigger_volume_vs_previous_max
+    )
+    mask = _filter_min(
+        result, mask, ["market_median_change_20d_pct"], filters.market_median_change_20d_pct_min
+    )
+    mask = _filter_bool_false(
+        result, mask, "one_word_limit_up", filters.exclude_one_word_limit_up
+    )
 
     return result.loc[mask].copy()
 
@@ -153,6 +227,8 @@ def hard_filter_rejection_summary(
     record_min("turnover_rate_min", ["turnover_rate", "换手率"], filters.turnover_rate_min)
     record_min("change_pct_min", ["change_pct", "涨跌幅"], filters.change_pct_min)
     record_max("change_pct_max", ["change_pct", "涨跌幅"], filters.change_pct_max)
+    record_min("market_positive_ratio_min", ["market_positive_ratio"], filters.market_positive_ratio_min)
+    record_min("market_median_change_pct_min", ["market_median_change_pct"], filters.market_median_change_pct_min)
     record_min("change_60d_min", ["change_60d"], filters.change_60d_min)
     record_max("change_60d_max", ["change_60d"], filters.change_60d_max)
 
@@ -183,6 +259,35 @@ def hard_filter_rejection_summary(
     record_max("max_drawdown_20d_pct_max", ["max_drawdown_20d_pct"], filters.max_drawdown_20d_pct_max)
     record_min("atr_20_pct_min", ["atr_20_pct"], filters.atr_20_pct_min)
     record_max("atr_20_pct_max", ["atr_20_pct"], filters.atr_20_pct_max)
+    record_min("daily_data_points_min", ["daily_data_points"], filters.daily_data_points_min)
+    record_min("avg_amount_20d_min", ["avg_amount_20d"], filters.avg_amount_20d_min)
+    record_min("adr_20_pct_min", ["adr_20_pct"], filters.adr_20_pct_min)
+    record_max("adr_20_pct_max", ["adr_20_pct"], filters.adr_20_pct_max)
+    record_min("change_20d_min", ["change_20d"], filters.change_20d_min)
+    record_max("change_20d_max", ["change_20d"], filters.change_20d_max)
+    record_min("relative_strength_20d_pctile_min", ["relative_strength_20d_pctile"], filters.relative_strength_20d_pctile_min)
+    record_min("relative_strength_60d_pctile_min", ["relative_strength_60d_pctile"], filters.relative_strength_60d_pctile_min)
+    if filters.require_ema_stack:
+        record("require_ema_stack", _filter_bool_true(df, mask, "ema_stack_bullish", True))
+    if filters.require_ema21_rising:
+        record("require_ema21_rising", _filter_bool_true(df, mask, "ema21_rising", True))
+    if filters.require_ema50_rising:
+        record("require_ema50_rising", _filter_bool_true(df, mask, "ema50_rising", True))
+    record_min("distance_to_120d_high_pct_min", ["distance_to_120d_high_pct"], filters.distance_to_120d_high_pct_min)
+    record_min("pullback_depth_10d_pct_min", ["pullback_depth_10d_pct"], filters.pullback_depth_10d_pct_min)
+    record_max("pullback_depth_10d_pct_max", ["pullback_depth_10d_pct"], filters.pullback_depth_10d_pct_max)
+    record_max("range_contraction_ratio_max", ["range_contraction_ratio"], filters.range_contraction_ratio_max)
+    record_max("volume_contraction_ratio_max", ["volume_contraction_ratio"], filters.volume_contraction_ratio_max)
+    record_min("support_confluence_count_min", ["support_confluence_count"], filters.support_confluence_count_min)
+    record_min("trigger_distance_pct_min", ["trigger_distance_pct"], filters.trigger_distance_pct_min)
+    record_max("trigger_distance_pct_max", ["trigger_distance_pct"], filters.trigger_distance_pct_max)
+    record_min("trigger_close_location_pct_min", ["trigger_close_location_pct"], filters.trigger_close_location_pct_min)
+    record_max("trigger_close_location_pct_max", ["trigger_close_location_pct"], filters.trigger_close_location_pct_max)
+    record_min("trigger_volume_vs_previous_min", ["trigger_volume_vs_previous"], filters.trigger_volume_vs_previous_min)
+    record_max("trigger_volume_vs_previous_max", ["trigger_volume_vs_previous"], filters.trigger_volume_vs_previous_max)
+    record_min("market_median_change_20d_pct_min", ["market_median_change_20d_pct"], filters.market_median_change_20d_pct_min)
+    if filters.exclude_one_word_limit_up:
+        record("exclude_one_word_limit_up", _filter_bool_false(df, mask, "one_word_limit_up", True))
 
     return diagnostics
 
@@ -253,6 +358,8 @@ def hard_filter_waterfall(
     record_min("turnover_rate_min", ["turnover_rate", "换手率"], filters.turnover_rate_min)
     record_min("change_pct_min", ["change_pct", "涨跌幅"], filters.change_pct_min)
     record_max("change_pct_max", ["change_pct", "涨跌幅"], filters.change_pct_max)
+    record_min("market_positive_ratio_min", ["market_positive_ratio"], filters.market_positive_ratio_min)
+    record_min("market_median_change_pct_min", ["market_median_change_pct"], filters.market_median_change_pct_min)
     record_min("change_60d_min", ["change_60d"], filters.change_60d_min)
     record_max("change_60d_max", ["change_60d"], filters.change_60d_max)
 
@@ -283,6 +390,35 @@ def hard_filter_waterfall(
     record_max("max_drawdown_20d_pct_max", ["max_drawdown_20d_pct"], filters.max_drawdown_20d_pct_max)
     record_min("atr_20_pct_min", ["atr_20_pct"], filters.atr_20_pct_min)
     record_max("atr_20_pct_max", ["atr_20_pct"], filters.atr_20_pct_max)
+    record_min("daily_data_points_min", ["daily_data_points"], filters.daily_data_points_min)
+    record_min("avg_amount_20d_min", ["avg_amount_20d"], filters.avg_amount_20d_min)
+    record_min("adr_20_pct_min", ["adr_20_pct"], filters.adr_20_pct_min)
+    record_max("adr_20_pct_max", ["adr_20_pct"], filters.adr_20_pct_max)
+    record_min("change_20d_min", ["change_20d"], filters.change_20d_min)
+    record_max("change_20d_max", ["change_20d"], filters.change_20d_max)
+    record_min("relative_strength_20d_pctile_min", ["relative_strength_20d_pctile"], filters.relative_strength_20d_pctile_min)
+    record_min("relative_strength_60d_pctile_min", ["relative_strength_60d_pctile"], filters.relative_strength_60d_pctile_min)
+    if filters.require_ema_stack:
+        record("require_ema_stack", _filter_bool_true(df, mask, "ema_stack_bullish", True), ["ema_stack_bullish"])
+    if filters.require_ema21_rising:
+        record("require_ema21_rising", _filter_bool_true(df, mask, "ema21_rising", True), ["ema21_rising"])
+    if filters.require_ema50_rising:
+        record("require_ema50_rising", _filter_bool_true(df, mask, "ema50_rising", True), ["ema50_rising"])
+    record_min("distance_to_120d_high_pct_min", ["distance_to_120d_high_pct"], filters.distance_to_120d_high_pct_min)
+    record_min("pullback_depth_10d_pct_min", ["pullback_depth_10d_pct"], filters.pullback_depth_10d_pct_min)
+    record_max("pullback_depth_10d_pct_max", ["pullback_depth_10d_pct"], filters.pullback_depth_10d_pct_max)
+    record_max("range_contraction_ratio_max", ["range_contraction_ratio"], filters.range_contraction_ratio_max)
+    record_max("volume_contraction_ratio_max", ["volume_contraction_ratio"], filters.volume_contraction_ratio_max)
+    record_min("support_confluence_count_min", ["support_confluence_count"], filters.support_confluence_count_min)
+    record_min("trigger_distance_pct_min", ["trigger_distance_pct"], filters.trigger_distance_pct_min)
+    record_max("trigger_distance_pct_max", ["trigger_distance_pct"], filters.trigger_distance_pct_max)
+    record_min("trigger_close_location_pct_min", ["trigger_close_location_pct"], filters.trigger_close_location_pct_min)
+    record_max("trigger_close_location_pct_max", ["trigger_close_location_pct"], filters.trigger_close_location_pct_max)
+    record_min("trigger_volume_vs_previous_min", ["trigger_volume_vs_previous"], filters.trigger_volume_vs_previous_min)
+    record_max("trigger_volume_vs_previous_max", ["trigger_volume_vs_previous"], filters.trigger_volume_vs_previous_max)
+    record_min("market_median_change_20d_pct_min", ["market_median_change_20d_pct"], filters.market_median_change_20d_pct_min)
+    if filters.exclude_one_word_limit_up:
+        record("exclude_one_word_limit_up", _filter_bool_false(df, mask, "one_word_limit_up", True), ["one_word_limit_up"])
 
     return steps
 
@@ -290,6 +426,31 @@ def hard_filter_waterfall(
 def requires_daily_features(filters: HardFilterConfig) -> bool:
     """Return whether a hard-filter config needs daily K-line features."""
     return any([
+        filters.daily_data_points_min is not None,
+        filters.avg_amount_20d_min is not None,
+        filters.adr_20_pct_min is not None,
+        filters.adr_20_pct_max is not None,
+        filters.change_20d_min is not None,
+        filters.change_20d_max is not None,
+        filters.relative_strength_20d_pctile_min is not None,
+        filters.relative_strength_60d_pctile_min is not None,
+        filters.require_ema_stack,
+        filters.require_ema21_rising,
+        filters.require_ema50_rising,
+        filters.distance_to_120d_high_pct_min is not None,
+        filters.pullback_depth_10d_pct_min is not None,
+        filters.pullback_depth_10d_pct_max is not None,
+        filters.range_contraction_ratio_max is not None,
+        filters.volume_contraction_ratio_max is not None,
+        filters.support_confluence_count_min is not None,
+        filters.trigger_distance_pct_min is not None,
+        filters.trigger_distance_pct_max is not None,
+        filters.trigger_close_location_pct_min is not None,
+        filters.trigger_close_location_pct_max is not None,
+        filters.trigger_volume_vs_previous_min is not None,
+        filters.trigger_volume_vs_previous_max is not None,
+        filters.market_median_change_20d_pct_min is not None,
+        filters.exclude_one_word_limit_up,
         filters.change_60d_min is not None,
         filters.change_60d_max is not None,
         filters.require_ma_bullish,
@@ -386,6 +547,23 @@ def _filter_bool_true(
     return mask & (df[col_name] == True)  # noqa: E712
 
 
+def _filter_bool_false(
+    df: pd.DataFrame,
+    mask: pd.Series,
+    col_name: str,
+    enabled: bool,
+) -> pd.Series:
+    if not enabled:
+        return mask
+    if not mask.any():
+        return mask
+    if col_name not in df.columns:
+        raise SnapshotFieldMissingError(
+            f"Missing required daily feature column for bool filter: {col_name}"
+        )
+    return mask & (df[col_name] == False)  # noqa: E712
+
+
 def _filter_in(
     df: pd.DataFrame,
     mask: pd.Series,
@@ -402,7 +580,6 @@ def _filter_in(
         )
     allowed_set = {str(item) for item in allowed}
     return mask & df[col_name].astype(str).isin(allowed_set)
-
 
 
 def _rejection_samples(

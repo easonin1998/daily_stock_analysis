@@ -8,21 +8,26 @@ from __future__ import annotations
 from src.services.screening.models import Pick
 
 _DEFAULT_RISK_PROFILE = {
-    "chase_change_pct": 8.0,
+    "chase_change_pct": 5.0,
     "chase_points": 4.0,
-    "breakdown_change_pct": -7.0,
+    "breakdown_change_pct": -4.0,
     "breakdown_points": 3.5,
+    "low_nominal_price": 4.0,
+    "low_nominal_price_points": 0.75,
+    "near_par_price": 2.0,
+    "near_par_price_points": 2.0,
     "abnormal_volume_ratio": 6.0,
     "abnormal_volume_ratio_points": 3.0,
     "high_turnover_rate": 15.0,
     "high_turnover_points": 3.0,
-    "invalid_pe_points": 3.0,
-    "high_pb": 8.0,
-    "high_pb_points": 2.0,
-    "weak_signal_score": 45.0,
-    "weak_signal_points": 2.5,
-    "macd_bearish_points": 2.0,
-    "rsi_overbought_points": 1.5,
+    "high_adr_pct": 7.0,
+    "high_adr_points": 2.0,
+    "extended_ema21_pct": 6.0,
+    "extended_ema21_points": 2.5,
+    "weak_sector_resonance_score": 35.0,
+    "weak_sector_resonance_points": 2.0,
+    "early_trigger_distance_pct": -2.5,
+    "early_trigger_points": 1.5,
     "low_llm_confidence": 0.35,
     "low_llm_confidence_points": 1.5,
     "llm_risk_points": 1.2,
@@ -138,6 +143,128 @@ def apply_portfolio_overlay(
     return ordered, notes
 
 
+def apply_sector_quota(
+    picks: list[Pick],
+    *,
+    max_output: int,
+    max_same_sector: int = 2,
+    max_score_gap: float = 3.0,
+    profile: dict[str, object] | None = None,
+) -> tuple[list[Pick], list[str], int]:
+    """Diversify the final set without replacing materially stronger picks.
+
+    Only candidates below the initial output boundary are used as replacements.
+    If no different-sector candidate is within ``max_score_gap``, the original
+    over-quota pick is kept so diversification never reduces output quality or
+    result count merely to satisfy a cosmetic quota.
+    """
+    output_count = max(int(max_output), 0)
+    if not picks or output_count == 0:
+        return [], [], 0
+
+    portfolio_profile = profile or {}
+    max_same_sector = max(int(portfolio_profile.get("max_same_bucket", max_same_sector)), 1)
+    max_score_gap = max(float(portfolio_profile.get("quota_max_score_gap", max_score_gap)), 0.0)
+    baseline = list(picks[:output_count])
+    reserve = list(picks[output_count:])
+    if not any(_canonical_sector(_pick_sector(pick)) for pick in baseline):
+        return _rerank(baseline), [], 0
+
+    bucket_counts: dict[str, int] = {}
+    kept: list[Pick] = []
+    overflow: list[Pick] = []
+    for pick in baseline:
+        bucket = _pick_bucket(pick, portfolio_profile)
+        if not bucket:
+            kept.append(pick)
+            continue
+        if bucket_counts.get(bucket, 0) < max_same_sector:
+            kept.append(pick)
+            bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+        else:
+            overflow.append(pick)
+
+    if not overflow:
+        return _rerank(baseline), [], 0
+
+    notes: list[str] = []
+    replacements = 0
+    used_codes = {pick.code for pick in kept}
+    for displaced in overflow:
+        replacement = next(
+            (
+                candidate
+                for candidate in reserve
+                if candidate.code not in used_codes
+                and _quota_candidate_allowed(
+                    candidate,
+                    displaced=displaced,
+                    bucket_counts=bucket_counts,
+                    max_same_sector=max_same_sector,
+                    max_score_gap=max_score_gap,
+                    profile=portfolio_profile,
+                )
+            ),
+            None,
+        )
+        if replacement is None:
+            kept.append(displaced)
+            used_codes.add(displaced.code)
+            bucket = _pick_bucket(displaced, portfolio_profile)
+            if bucket:
+                bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+            notes.append(
+                f"Sector quota retained {displaced.code}: no comparable cross-sector reserve "
+                f"within {max_score_gap:.1f} points"
+            )
+            continue
+
+        kept.append(replacement)
+        used_codes.add(replacement.code)
+        bucket = _pick_bucket(replacement, portfolio_profile)
+        if bucket:
+            bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+        replacement.portfolio_flags = _unique(
+            [*replacement.portfolio_flags, "portfolio_sector_quota_backfill"]
+        )
+        replacements += 1
+        notes.append(
+            f"Sector quota replaced {displaced.code} with {replacement.code} "
+            f"(score_gap={float(displaced.final_score) - float(replacement.final_score):.2f})"
+        )
+
+    return _rerank(kept[:output_count]), notes, replacements
+
+
+def _quota_candidate_allowed(
+    candidate: Pick,
+    *,
+    displaced: Pick,
+    bucket_counts: dict[str, int],
+    max_same_sector: int,
+    max_score_gap: float,
+    profile: dict[str, object],
+) -> bool:
+    bucket = _pick_bucket(candidate, profile)
+    if not bucket or bucket_counts.get(bucket, 0) >= max_same_sector:
+        return False
+    return float(candidate.final_score) >= float(displaced.final_score) - max_score_gap
+
+
+def _pick_bucket(pick: Pick, profile: dict[str, object]) -> str:
+    sector = _canonical_sector(_pick_sector(pick))
+    if not sector:
+        return ""
+    return _portfolio_bucket(sector, pick.llm_theme, buckets=profile.get("buckets"))
+
+
+def _rerank(picks: list[Pick]) -> list[Pick]:
+    ordered = sorted(picks, key=lambda item: (-float(item.final_score), item.code))
+    for index, pick in enumerate(ordered, start=1):
+        pick.rank = index
+    return ordered
+
+
 def assess_pick_risk(
     pick: Pick,
     *,
@@ -155,27 +282,37 @@ def assess_pick_risk(
         points += profile["breakdown_points"]
         flags.append("single_day_breakdown_risk")
 
+    if 0 < pick.price < profile["near_par_price"]:
+        points += profile["near_par_price_points"]
+        flags.append("near_par_price_risk")
+    elif 0 < pick.price < profile["low_nominal_price"]:
+        points += profile["low_nominal_price_points"]
+        flags.append("low_nominal_price")
+
     if pick.volume_ratio is not None and pick.volume_ratio >= profile["abnormal_volume_ratio"]:
         points += profile["abnormal_volume_ratio_points"]
         flags.append("abnormal_volume_ratio")
     if pick.turnover_rate is not None and pick.turnover_rate >= profile["high_turnover_rate"]:
         points += profile["high_turnover_points"]
         flags.append("high_turnover")
-    if pick.pe_ratio is not None and pick.pe_ratio <= 0:
-        points += profile["invalid_pe_points"]
-        flags.append("negative_or_invalid_pe")
-    if pick.pb_ratio is not None and pick.pb_ratio >= profile["high_pb"]:
-        points += profile["high_pb_points"]
-        flags.append("high_pb")
-    if pick.signal_score is not None and pick.signal_score < profile["weak_signal_score"]:
-        points += profile["weak_signal_points"]
-        flags.append("weak_daily_signal")
-    if pick.macd_status == "bearish":
-        points += profile["macd_bearish_points"]
-        flags.append("macd_bearish")
-    if pick.rsi_status == "overbought":
-        points += profile["rsi_overbought_points"]
-        flags.append("rsi_overbought")
+    if pick.adr_20_pct is not None and pick.adr_20_pct >= profile["high_adr_pct"]:
+        points += profile["high_adr_points"]
+        flags.append("high_adr_execution_risk")
+    if pick.ema21 is not None and pick.ema21 > 0:
+        distance_to_ema21 = (pick.price / pick.ema21 - 1.0) * 100.0
+        if distance_to_ema21 >= profile["extended_ema21_pct"]:
+            points += profile["extended_ema21_points"]
+            flags.append("extended_from_ema21")
+    sector_score = float((pick.factor_scores or {}).get("sector_resonance", 50.0))
+    if sector_score < profile["weak_sector_resonance_score"]:
+        points += profile["weak_sector_resonance_points"]
+        flags.append("weak_sector_resonance")
+    if (
+        pick.trigger_distance_pct is not None
+        and pick.trigger_distance_pct < profile["early_trigger_distance_pct"]
+    ):
+        points += profile["early_trigger_points"]
+        flags.append("trigger_not_confirmed")
     if pick.llm_confidence is not None and pick.llm_confidence < profile["low_llm_confidence"]:
         points += profile["low_llm_confidence_points"]
         flags.append("low_llm_confidence")

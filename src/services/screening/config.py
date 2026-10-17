@@ -9,7 +9,7 @@ from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _PACKAGE_DIR = Path(__file__).resolve().parent
-DEFAULT_POST_ANALYZERS = ["scorecard"]
+DEFAULT_POST_ANALYZERS: list[str] = []
 DEFAULT_LLM_MODEL = "gemini/gemini-2.5-flash"
 DEFAULT_SNAPSHOT_SOURCE_PRIORITY = ["sina", "efinance", "akshare_em", "em_datacenter"]
 TUSHARE_FIRST_SOURCE_PRIORITY = ["tushare", "sina", "efinance", "akshare_em", "em_datacenter"]
@@ -203,8 +203,8 @@ class Config:
     dsa_force_refresh: bool = False
     dsa_notify: bool = False
 
-    # L3/post-ranking analyzers. scorecard is the default local scorer; DSA is
-    # one optional backend, not the pipeline's default or only final stage.
+    # Optional L3/post-ranking analyzers. The Martin factor score remains the
+    # default final local score; remote overlays must be explicitly enabled.
     post_analyzers: list[str] = field(default_factory=lambda: list(DEFAULT_POST_ANALYZERS))
     post_analysis_max_picks: int = 3
     post_analyzer_url: str = ""
@@ -213,12 +213,19 @@ class Config:
     # Optional daily K-line enrichment after snapshot hard filters.
     daily_enrich_enabled: bool = False
     daily_enrich_max_candidates: int = 100
-    daily_lookback_days: int = 120
+    daily_lookback_days: int = 160
     daily_source: str = "auto"
     daily_fetch_retries: int = 2
     daily_fetch_max_workers: int = 1
     daily_history_cache_dir: Path | None = None
     daily_history_cache_ttl_hours: int = 24
+    daily_feature_library_enabled: bool = True
+    daily_feature_library_path: Path | None = None
+    daily_feature_library_max_age_days: int = 7
+    seed_pool_core_ratio: float = 0.55
+    seed_pool_strength_ratio: float = 0.20
+    seed_pool_activity_ratio: float = 0.15
+    seed_pool_max_sector_ratio: float = 0.20
 
     # Independent risk layer.
     risk_enabled: bool = True
@@ -264,6 +271,10 @@ class Config:
             _parse_optional_path_env("SCREENING_DAILY_HISTORY_CACHE_DIR")
             or _parse_optional_path_env("DAILY_HISTORY_CACHE_DIR")
             or data_dir / "daily_history"
+        )
+        daily_feature_library_path = (
+            _parse_optional_path_env("SCREENING_DAILY_FEATURE_LIBRARY_PATH")
+            or data_dir / "daily_feature_library.json"
         )
         industry_provider_cache_dir = (
             _parse_optional_path_env("SCREENING_INDUSTRY_PROVIDER_CACHE_DIR")
@@ -349,7 +360,7 @@ class Config:
             post_analyzer_timeout_sec=float(os.getenv("POST_ANALYZER_TIMEOUT_SEC", "120")),
             daily_enrich_enabled=_parse_bool_env("DAILY_ENRICH_ENABLED", False),
             daily_enrich_max_candidates=max(1, int(os.getenv("DAILY_ENRICH_MAX_CANDIDATES", "100"))),
-            daily_lookback_days=max(30, int(os.getenv("DAILY_LOOKBACK_DAYS", "120"))),
+            daily_lookback_days=max(120, int(os.getenv("DAILY_LOOKBACK_DAYS", "160"))),
             daily_source=os.getenv("DAILY_SOURCE", "auto"),
             daily_fetch_retries=max(0, int(os.getenv("DAILY_FETCH_RETRIES", "2"))),
             daily_fetch_max_workers=max(1, int(os.getenv("DAILY_FETCH_MAX_WORKERS", "1"))),
@@ -362,6 +373,21 @@ class Config:
                         os.getenv("DAILY_HISTORY_CACHE_TTL_HOURS", "24"),
                     )
                 ),
+            ),
+            daily_feature_library_enabled=_parse_bool_env(
+                "SCREENING_DAILY_FEATURE_LIBRARY_ENABLED",
+                True,
+            ),
+            daily_feature_library_path=daily_feature_library_path,
+            daily_feature_library_max_age_days=max(
+                0,
+                int(os.getenv("SCREENING_DAILY_FEATURE_LIBRARY_MAX_AGE_DAYS", "7")),
+            ),
+            seed_pool_core_ratio=_parse_ratio_env("SCREENING_SEED_POOL_CORE_RATIO", 0.55),
+            seed_pool_strength_ratio=_parse_ratio_env("SCREENING_SEED_POOL_STRENGTH_RATIO", 0.20),
+            seed_pool_activity_ratio=_parse_ratio_env("SCREENING_SEED_POOL_ACTIVITY_RATIO", 0.15),
+            seed_pool_max_sector_ratio=_parse_ratio_env(
+                "SCREENING_SEED_POOL_MAX_SECTOR_RATIO", 0.20
             ),
             risk_enabled=_parse_bool_env("RISK_ENABLED", True),
             risk_max_penalty=_parse_float_env("RISK_MAX_PENALTY", 12.0),
@@ -389,6 +415,10 @@ def _parse_float_env(name: str, default: float) -> float:
     if value is None or value == "":
         return default
     return float(value)
+
+
+def _parse_ratio_env(name: str, default: float) -> float:
+    return max(0.0, min(_parse_float_env(name, default), 1.0))
 
 
 def _parse_optional_float_env(name: str) -> float | None:

@@ -2,6 +2,7 @@
 """Regression contracts for the DSA-owned screening implementation."""
 
 import os
+from datetime import date
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -70,19 +71,17 @@ def test_bundled_engine_keeps_source_and_license_notices() -> None:
 def test_bundled_strategies_are_loaded_from_the_internal_package() -> None:
     strategies = load_all_strategies(SCREENING_ROOT / "strategies")
 
-    assert set(strategies) == {
-        "balanced_alpha",
-        "blue_chip_income",
-        "capital_heat",
-        "dual_low",
-        "low_volatility_quality",
-        "momentum_quality",
-        "oversold_reversal",
-        "quality_value",
-        "shrink_pullback",
-        "volume_breakout",
+    assert set(strategies) == {"martin_momentum_pullback"}
+    strategy = strategies["martin_momentum_pullback"]
+    assert strategy.screening.factor_weights == {
+        "trend_quality": 0.20,
+        "relative_strength": 0.20,
+        "sector_resonance": 0.15,
+        "contraction": 0.15,
+        "support_confluence": 0.15,
+        "trigger_quality": 0.10,
+        "liquidity": 0.05,
     }
-    assert strategies["dual_low"].screening.factor_weights["value"] < 0.40
 
 
 def test_list_strategies_preserves_legacy_strategies_dir_override() -> None:
@@ -95,7 +94,7 @@ screening:
   market_scope: [cn]
   hard_filters: {}
   factor_weights:
-    value: 1.0
+    liquidity: 1.0
   max_output: 3
 """.strip()
 
@@ -147,7 +146,7 @@ def test_pipeline_passes_daily_history_cache_settings_to_enrichment(monkeypatch)
             enabled=True,
             market_scope=["cn"],
             hard_filters=HardFilterConfig(),
-            factor_weights={"value": 1.0},
+            factor_weights={"liquidity": 1.0},
             max_output=3,
         ),
     )
@@ -156,6 +155,7 @@ def test_pipeline_passes_daily_history_cache_settings_to_enrichment(monkeypatch)
         daily_enrich_enabled=True,
         daily_history_cache_dir=Path("/tmp/daily-history-cache"),
         daily_history_cache_ttl_hours=6,
+        daily_feature_library_path=Path("/tmp/daily-feature-library.json"),
         post_analyzers=[],
         risk_enabled=False,
         portfolio_diversity_enabled=False,
@@ -174,6 +174,27 @@ def test_pipeline_passes_daily_history_cache_settings_to_enrichment(monkeypatch)
         enriched.attrs["daily_source_health"] = {}
         return enriched
 
+    def fake_merge_daily_feature_library(df: pd.DataFrame, **kwargs):
+        captured["library_merge"] = kwargs
+        return df.copy(), {
+            "matched_count": 0,
+            "fresh_count": 0,
+            "stale_count": 0,
+        }
+
+    def fake_upsert_daily_feature_library(df: pd.DataFrame, **kwargs):
+        captured["library_upsert"] = kwargs
+        return {"updated_count": len(df), "entry_count": len(df)}
+
+    def fake_refresh_daily_feature_library_from_cache(df: pd.DataFrame, **kwargs):
+        captured["library_maintenance"] = kwargs
+        return {
+            "cache_count": len(df),
+            "updated_count": len(df),
+            "appended_count": len(df),
+            "error_count": 0,
+        }
+
     monkeypatch.setattr(screening_pipeline, "load_all_strategies", lambda _path: {"demo": strategy})
     monkeypatch.setattr(screening_pipeline, "fetch_snapshot_with_fallback", lambda *args, **kwargs: snapshot_df.copy())
     monkeypatch.setattr(screening_pipeline, "apply_hard_filters", lambda df, _filters: df.copy())
@@ -183,12 +204,39 @@ def test_pipeline_passes_daily_history_cache_settings_to_enrichment(monkeypatch)
         lambda df, _screening: df.assign(screen_score=88.0),
     )
     monkeypatch.setattr(screening_pipeline, "enrich_daily_features", fake_enrich_daily_features)
+    monkeypatch.setattr(
+        screening_pipeline,
+        "merge_daily_feature_library",
+        fake_merge_daily_feature_library,
+    )
+    monkeypatch.setattr(
+        screening_pipeline,
+        "upsert_daily_feature_library",
+        fake_upsert_daily_feature_library,
+    )
+    monkeypatch.setattr(
+        screening_pipeline,
+        "completed_snapshot_bar_date",
+        lambda *_args, **_kwargs: date(2026, 10, 16),
+    )
+    monkeypatch.setattr(
+        screening_pipeline,
+        "latest_daily_feature_date",
+        lambda *_args, **_kwargs: date(2026, 10, 15),
+    )
+    monkeypatch.setattr(
+        screening_pipeline,
+        "refresh_daily_feature_library_from_cache",
+        fake_refresh_daily_feature_library_from_cache,
+    )
     monkeypatch.setattr(screening_pipeline, "apply_dsa_provider_context", lambda picks, _context: [])
     monkeypatch.setattr(screening_pipeline, "apply_risk_overlay", lambda picks, **kwargs: (picks, []))
     monkeypatch.setattr(screening_pipeline, "apply_portfolio_overlay", lambda picks, **kwargs: (picks, []))
     monkeypatch.setattr(screening_pipeline, "run_post_analyzers", lambda picks, **kwargs: (picks, []))
 
-    history_fetcher = lambda *_args, **_kwargs: pd.DataFrame()
+    def history_fetcher(*_args, **_kwargs):
+        return pd.DataFrame()
+
     result = screening_pipeline.screen(
         "demo",
         use_llm=False,
@@ -199,6 +247,9 @@ def test_pipeline_passes_daily_history_cache_settings_to_enrichment(monkeypatch)
     assert captured["cache_dir"] == Path("/tmp/daily-history-cache")
     assert captured["cache_ttl_seconds"] == 6 * 60 * 60
     assert captured["history_fetcher"] is history_fetcher
+    assert captured["library_merge"]["library_path"] == Path("/tmp/daily-feature-library.json")
+    assert captured["library_upsert"]["library_path"] == Path("/tmp/daily-feature-library.json")
+    assert captured["library_maintenance"]["snapshot_bar_date"] == date(2026, 10, 16)
     assert result.daily_enriched is True
 
 
@@ -264,13 +315,18 @@ def test_scorecard_reranks_before_capped_dsa_analyzer(monkeypatch) -> None:
             name=f"Stock {index}",
             final_score=91.0 - index,
             screen_score=91.0 - index,
-            factor_scores={"value": 50.0, "stability": 50.0},
+            factor_scores={"trend_quality": 50.0, "relative_strength": 50.0},
         )
         for index in range(1, 5)
     ]
     # The original fourth candidate crosses the remote Top-3 cutoff after the
-    # full-pool scorecard applies its value/quality bonus.
-    picks[3].factor_scores = {"value": 100.0, "stability": 100.0}
+    # full-pool scorecard confirms both leadership and pullback quality.
+    picks[3].factor_scores = {
+        "trend_quality": 100.0,
+        "relative_strength": 100.0,
+        "contraction": 100.0,
+        "support_confluence": 100.0,
+    }
     config = ScreeningRuntimeConfig(
         strategies_dir=SCREENING_ROOT / "strategies",
         dsa_api_url="https://dsa.example",
@@ -295,7 +351,7 @@ def test_scorecard_reranks_before_capped_dsa_analyzer(monkeypatch) -> None:
         max_picks=3,
     )
 
-    assert attempted_codes == ["000001", "000004", "000002"]
+    assert attempted_codes == ["000004", "000001", "000002"]
     assert {
         pick.code: pick.post_analysis_status.get("dsa")
         for pick in analyzed
@@ -384,7 +440,7 @@ def test_pipeline_uses_ranker_success_flag_instead_of_partial_llm_scores(monkeyp
             enabled=True,
             market_scope=["cn"],
             hard_filters=HardFilterConfig(),
-            factor_weights={"value": 1.0},
+            factor_weights={"liquidity": 1.0},
             max_output=3,
         ),
     )
@@ -457,7 +513,7 @@ def test_default_scorecard_scores_full_pool_before_seeded_rotation(monkeypatch) 
             enabled=True,
             market_scope=["cn"],
             hard_filters=HardFilterConfig(),
-            factor_weights={"value": 1.0},
+            factor_weights={"liquidity": 1.0},
             max_output=3,
         ),
     )
@@ -532,7 +588,7 @@ def test_dsa_provider_context_respects_host_max_candidates_setting() -> None:
     assert notes == ["DSA provider context applied 3 of 3 candidates"]
 
 
-def test_hard_filter_and_factor_scoring_keep_core_semantics() -> None:
+def test_hard_filter_and_martin_factor_scoring_keep_core_semantics() -> None:
     frame = pd.DataFrame(
         [
             {
@@ -540,10 +596,7 @@ def test_hard_filter_and_factor_scoring_keep_core_semantics() -> None:
                 "name": "Low Value",
                 "price": 10.0,
                 "amount": 200_000_000,
-                "pe_ratio": 5.0,
-                "pb_ratio": 0.6,
                 "turnover_rate": 2.0,
-                "volume_ratio": 1.2,
                 "change_pct": 0.0,
             },
             {
@@ -551,10 +604,7 @@ def test_hard_filter_and_factor_scoring_keep_core_semantics() -> None:
                 "name": "High Value",
                 "price": 10.0,
                 "amount": 20_000_000,
-                "pe_ratio": 15.0,
-                "pb_ratio": 2.0,
                 "turnover_rate": 2.0,
-                "volume_ratio": 1.2,
                 "change_pct": 0.0,
             },
         ]
@@ -565,7 +615,7 @@ def test_hard_filter_and_factor_scoring_keep_core_semantics() -> None:
 
     scored = compute_screen_scores(
         frame,
-        ScreeningConfig(factor_weights={"value": 1.0}),
+        ScreeningConfig(factor_weights={"liquidity": 1.0}),
     ).set_index("code")
     assert scored.loc["low_value", "screen_score"] > scored.loc["high_value", "screen_score"]
 

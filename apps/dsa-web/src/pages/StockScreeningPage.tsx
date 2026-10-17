@@ -2,6 +2,7 @@ import type React from 'react';
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
+  BellRing,
   Bookmark,
   Building2,
   CheckCircle2,
@@ -44,6 +45,7 @@ const MARKETS = [{ id: 'cn', label: 'A 股' }];
 const SCREEN_TASK_STORAGE_KEY = 'dsa.screening.activeScreenTask.v1';
 const SCREEN_TASK_POLL_INTERVAL_MS = 2000;
 const CUSTOM_STRATEGY_OPTION_VALUE = '__custom_strategy__';
+const DEFAULT_SCREENING_STRATEGY = 'martin_momentum_pullback';
 const STRATEGY_CATEGORY_LABELS: Record<string, string> = {
   framework: '综合',
   income: '收益',
@@ -86,7 +88,7 @@ const readPersistedScreenTask = (): PersistedScreenTask | null => {
     return {
       taskId: parsed.taskId,
       market: typeof parsed.market === 'string' && parsed.market.trim() ? parsed.market : 'cn',
-      strategy: typeof parsed.strategy === 'string' && parsed.strategy.trim() ? parsed.strategy : 'dual_low',
+      strategy: typeof parsed.strategy === 'string' && parsed.strategy.trim() ? parsed.strategy : DEFAULT_SCREENING_STRATEGY,
       maxResults: Number.isFinite(restoredMaxResults) ? Math.min(100, Math.max(1, restoredMaxResults)) : 3,
     };
   } catch {
@@ -159,22 +161,18 @@ const formatPercent = (value: unknown) => {
 };
 
 const FACTOR_LABELS: Record<string, string> = {
-  value: '估值',
+  trend_quality: '趋势质量',
+  relative_strength: '相对强度',
+  sector_resonance: '板块共振',
+  contraction: '缩量收敛',
+  support_confluence: '支撑共振',
+  trigger_quality: '触发质量',
   liquidity: '流动性',
-  momentum: '动量',
-  reversal: '反转',
-  activity: '活跃度',
-  stability: '稳定性',
-  size: '规模',
-  theme_heat: '题材热度',
-  topic_alignment: '题材匹配',
 };
 
 const POST_TAG_LABELS: Record<string, string> = {
-  value_quality: '价值质量',
-  controlled_reversal: '受控反转',
-  momentum: '趋势动量',
-  liquidity: '流动性',
+  momentum_leader: '动量领涨',
+  pullback_ready: '回调就绪',
 };
 
 const HOTSPOT_QUALITY_LABELS: Record<string, string> = {
@@ -278,6 +276,20 @@ const getFactorEntries = (item: ScreeningCandidate) =>
     .filter(([, value]) => typeof value === 'number')
     .sort((a, b) => Number(b[1]) - Number(a[1]))
     .slice(0, 6);
+
+const getMartinEvidence = (item: ScreeningCandidate) => [
+  ['ADR20', item.adr20Pct, '%'],
+  ['20日涨幅', item.change20d, '%'],
+  ['60日涨幅', item.change60d, '%'],
+  ['RS20', item.relativeStrength20dPctile, ''],
+  ['RS60', item.relativeStrength60dPctile, ''],
+  ['10日回调', item.pullbackDepth10dPct, '%'],
+  ['波幅收敛比', item.rangeContractionRatio, ''],
+  ['成交量收敛比', item.volumeContractionRatio, ''],
+  ['支撑共振', item.supportConfluenceCount, ' 项'],
+  ['触发距离', item.triggerDistancePct, '%'],
+  ['板块强势候选', item.sectorBreadthCount, ' 只'],
+] as const;
 
 const toMessageList = (values: string[] | undefined) =>
   Array.isArray(values) ? values.map((value) => String(value).trim()).filter(Boolean) : [];
@@ -807,9 +819,10 @@ const StockScreeningPage: React.FC = () => {
   const [enabled, setEnabled] = useState(false);
   const [available, setAvailable] = useState(false);
   const [market, setMarket] = useState(restoredTask?.market || 'cn');
-  const [strategy, setStrategy] = useState(restoredTask?.strategy || 'dual_low');
+  const [strategy, setStrategy] = useState(restoredTask?.strategy || DEFAULT_SCREENING_STRATEGY);
   const [strategies, setStrategies] = useState<ScreeningStrategy[]>([]);
   const [maxResults, setMaxResults] = useState(restoredTask?.maxResults || 3);
+  const [notifyOnComplete, setNotifyOnComplete] = useState(true);
   const [candidates, setCandidates] = useState<ScreeningCandidate[]>([]);
   const [hotspots, setHotspots] = useState<ScreeningHotspot[]>([]);
   const [hotspotsUpdatedAt, setHotspotsUpdatedAt] = useState<string | null>(null);
@@ -834,6 +847,12 @@ const StockScreeningPage: React.FC = () => {
   const [activeTaskId, setActiveTaskId] = useState<string | null>(restoredTask?.taskId ?? null);
   const [taskProgress, setTaskProgress] = useState(restoredTask?.taskId ? 10 : 0);
   const [taskMessage, setTaskMessage] = useState(restoredTask?.taskId ? '正在恢复选股任务状态...' : '');
+  const [linkedRunId] = useState(() => {
+    if (typeof window === 'undefined') {
+      return '';
+    }
+    return new URLSearchParams(window.location.search).get('runId')?.trim() || '';
+  });
 
   const selectedStrategy = useMemo(() => strategies.find((item) => item.id === strategy), [strategies, strategy]);
   const selectedStrategyTitle = selectedStrategy?.name || selectedStrategy?.title || '自定义策略';
@@ -1097,6 +1116,39 @@ const StockScreeningPage: React.FC = () => {
   }, [loadHotspots, loadStrategies]);
 
   useEffect(() => {
+    if (!linkedRunId || restoredTask?.taskId) {
+      return undefined;
+    }
+    let active = true;
+    setLoading(true);
+    setTaskProgress(100);
+    setTaskMessage('正在读取选股历史结果...');
+    screeningApi.getRun(linkedRunId)
+      .then((run) => {
+        if (!active) {
+          return;
+        }
+        setMarket(run.market || 'cn');
+        setStrategy(run.strategy || DEFAULT_SCREENING_STRATEGY);
+        applyScreenResult(run.result);
+        setError('');
+      })
+      .catch((err) => {
+        if (active) {
+          setError(toApiErrorMessage(err, '选股历史结果加载失败，请在网页中重新运行选股。'));
+        }
+      })
+      .finally(() => {
+        if (active) {
+          setLoading(false);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [applyScreenResult, linkedRunId, restoredTask?.taskId]);
+
+  useEffect(() => {
     if (!activeTaskId) {
       return undefined;
     }
@@ -1234,7 +1286,13 @@ const StockScreeningPage: React.FC = () => {
     setTaskProgress(0);
     setTaskMessage('正在提交选股任务...');
     try {
-      const task = await screeningApi.startScreen({ market, strategy, maxResults });
+      const task = await screeningApi.startScreen({
+        market,
+        strategy,
+        maxResults,
+        notify: notifyOnComplete,
+        webBaseUrl: window.location.origin,
+      });
       persistScreenTask({
         taskId: task.taskId,
         market,
@@ -1632,6 +1690,17 @@ const StockScreeningPage: React.FC = () => {
             ? strategyLoadError
             : selectedStrategy?.description || '策略会先执行硬过滤和因子评分，再进行风险与组合约束。'}
         </div>
+        <label className="mt-3 inline-flex cursor-pointer items-center gap-2 text-xs font-medium text-secondary-text">
+          <input
+            type="checkbox"
+            className="h-4 w-4 accent-cyan"
+            checked={notifyOnComplete}
+            disabled={loading}
+            onChange={(event) => setNotifyOnComplete(event.target.checked)}
+          />
+          <BellRing className="h-4 w-4 text-cyan" />
+          完成后推送飞书
+        </label>
       </section>
 
       {loading || screenMeta ? (
@@ -1676,6 +1745,11 @@ const StockScreeningPage: React.FC = () => {
               <span>
                 深度补充：{screenMeta?.dsaEnrichment?.enrichedCount ?? '-'} / {screenMeta?.dsaEnrichment?.requestedCount ?? '-'}
               </span>
+              {screenMeta?.notification?.requested ? (
+                <span>
+                  飞书：{screenMeta.notification.sent ? '已推送' : '推送失败，请检查机器人配置'}
+                </span>
+              ) : null}
             </div>
           </details>
         </section>
@@ -1724,6 +1798,7 @@ const StockScreeningPage: React.FC = () => {
                 {candidates.map((item) => {
                   const expanded = expandedCode === item.code;
                   const factors = getFactorEntries(item);
+                  const martinEvidence = getMartinEvidence(item).filter(([, value]) => value != null);
                   const llmInsightAvailable = hasLlmInsight(item);
                   const dsaWarnings = item.dsaContext?.warnings || [];
                   const dsaNews = item.dsaNews || [];
@@ -1820,6 +1895,16 @@ const StockScreeningPage: React.FC = () => {
                                   <p className="text-xs font-semibold text-secondary-text">成交额</p>
                                   <p className="mt-1 text-sm text-foreground">{formatAmount(item.amount)}</p>
                                 </div>
+                                {martinEvidence.length > 0 ? (
+                                  <div>
+                                    <p className="text-xs font-semibold text-secondary-text">形态证据</p>
+                                    <p className="mt-1 text-sm leading-6 text-foreground">
+                                      {martinEvidence
+                                        .map(([label, value, suffix]) => `${label} ${formatNumber(value)}${suffix}`)
+                                        .join(' · ')}
+                                    </p>
+                                  </div>
+                                ) : null}
                                 {item.llmWatchItems?.length ? (
                                   <div>
                                     <p className="text-xs font-semibold text-secondary-text">智能关注项</p>

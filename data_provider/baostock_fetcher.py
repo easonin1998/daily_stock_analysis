@@ -374,6 +374,31 @@ class BaostockFetcher(BaseFetcher):
         
         return None
 
+    def get_industry_map(self) -> dict[str, str]:
+        """Return one full-market A-share code-to-industry mapping."""
+        with self._baostock_session() as bs:
+            rs = bs.query_stock_industry()
+            if rs.error_code != '0':
+                raise DataFetchError(f"Baostock 行业查询失败: {rs.error_msg}")
+
+            rows = []
+            while rs.next():
+                rows.append(rs.get_row_data())
+            if not rows:
+                return {}
+
+            frame = pd.DataFrame(rows, columns=rs.fields)
+            if 'code' not in frame.columns or 'industry' not in frame.columns:
+                raise DataFetchError("Baostock 行业查询缺少 code/industry 字段")
+            mapping: dict[str, str] = {}
+            for _, row in frame.iterrows():
+                raw_code = str(row.get('code') or '').strip()
+                code = raw_code.split('.')[-1]
+                industry = str(row.get('industry') or '').strip()
+                if code.isdigit() and len(code) == 6 and industry:
+                    mapping[code] = industry
+            return mapping
+
 
 if __name__ == "__main__":
     # 测试代码

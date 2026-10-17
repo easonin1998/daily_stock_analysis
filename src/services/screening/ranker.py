@@ -25,6 +25,7 @@ def _normalize_code(value: object) -> str:
     # US tickers may pass through (see normalize_code docstring).
     return normalize_code(value, allow_ticker=True)
 
+
 logger = logging.getLogger(__name__)
 _DEFAULT_RANKING_PROMPT_MAX_CHARS = 24_000
 _PROMPT_TRIM_MARKER = "[prompt_trimmed]"
@@ -291,7 +292,7 @@ def _render_ranking_prompt(hints: str, context: str, candidates_text: str) -> st
       "risk": "一句话主要风险",
       "catalysts": ["潜在催化1", "潜在催化2"],
       "risk_flags": ["风险标签1"],
-      "tags": ["价值", "趋势", "防守", "事件", "流动性"],
+      "tags": ["动量", "回调", "板块共振", "触发", "流动性"],
       "style_fit": "与策略风格的匹配度说明",
       "watch_items": ["后续应跟踪的数据或事件"],
       "invalidators": ["会推翻该候选逻辑的观察点"]
@@ -376,12 +377,13 @@ def _format_candidate_for_prompt(p: Pick, *, detail: str = "full") -> str:
             f"change_pct={p.change_pct}%, amount={p.amount:.0f}, "
             f"screen_score={p.screen_score:.1f}, industry={p.industry or 'unknown'}, "
             f"concepts={p.concepts or 'unknown'}, board_heat_score={p.board_heat_score}, "
-            f"signal_score={p.signal_score}, dsa_context={_format_dsa_context_for_prompt(p)}"
+            f"adr20={p.adr_20_pct}%, rs60={p.relative_strength_60d_pctile}, "
+            f"trigger_distance={p.trigger_distance_pct}%, dsa_context={_format_dsa_context_for_prompt(p)}"
         )
     return (
         f"- {p.code} {p.name}: price={p.price}, change_pct={p.change_pct}%, "
         f"amount={p.amount:.0f}, turnover={p.turnover_rate}, volume_ratio={p.volume_ratio}, "
-        f"total_mv={p.total_mv}, PE={p.pe_ratio}, PB={p.pb_ratio}, "
+        f"total_mv={p.total_mv}, ADR20={p.adr_20_pct}%, "
         f"industry={p.industry or 'unknown'}, concepts={p.concepts or 'unknown'}, "
         f"industry_rank={p.industry_rank}, industry_change_pct={p.industry_change_pct}, "
         f"board_heat_score={p.board_heat_score}, board_heat_summary={p.board_heat_summary or 'unknown'}, "
@@ -391,12 +393,15 @@ def _format_candidate_for_prompt(p: Pick, *, detail: str = "full") -> str:
         f"board_heat_cooling_score={p.board_heat_cooling_score}, "
         f"board_heat_observations={p.board_heat_observations}, "
         f"board_heat_state={p.board_heat_state or 'unknown'}, "
-        f"change_60d={p.change_60d}, signal_score={p.signal_score}, "
-        f"macd={p.macd_status}, rsi={p.rsi_status}, "
-        f"breakout_20d_pct={p.breakout_20d_pct}, range_20d_pct={p.range_20d_pct}, "
-        f"volume_ratio_20d={p.volume_ratio_20d}, body_pct={p.body_pct}, "
-        f"pullback_to_ma20_pct={p.pullback_to_ma20_pct}, "
-        f"consolidation_days_20d={p.consolidation_days_20d}, "
+        f"change_20d={p.change_20d}, change_60d={p.change_60d}, "
+        f"rs20={p.relative_strength_20d_pctile}, rs60={p.relative_strength_60d_pctile}, "
+        f"ema9={p.ema9}, ema21={p.ema21}, ema50={p.ema50}, "
+        f"ema_stack={p.ema_stack_bullish}, ema21_rising={p.ema21_rising}, "
+        f"ema50_rising={p.ema50_rising}, distance_to_120d_high={p.distance_to_120d_high_pct}%, "
+        f"pullback_depth_10d={p.pullback_depth_10d_pct}%, "
+        f"range_contraction={p.range_contraction_ratio}, volume_contraction={p.volume_contraction_ratio}, "
+        f"support_confluence={p.support_confluence_count}, trigger_distance={p.trigger_distance_pct}%, "
+        f"sector_breadth={p.sector_breadth_count}, "
         f"screen_score={p.screen_score:.1f}, factor_scores={p.factor_scores}, "
         f"dsa_context={_format_dsa_context_for_prompt(p)}"
     )

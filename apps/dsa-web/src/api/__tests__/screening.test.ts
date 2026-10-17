@@ -108,10 +108,10 @@ describe('screeningApi', () => {
         enabled: true,
         strategies: [
           {
-            id: 'dual_low',
-            name: 'Dual Low',
-            description: 'value',
-            category: 'value',
+            id: 'martin_momentum_pullback',
+            name: 'Martin动量回调',
+            description: 'momentum pullback',
+            category: 'trend',
             market_scope: ['cn'],
           },
         ],
@@ -124,7 +124,7 @@ describe('screeningApi', () => {
     expect(get).toHaveBeenCalledWith('/api/v1/screening/strategies', { timeout: 300000 });
     expect(result.enabled).toBe(true);
     expect(result.strategyCount).toBe(1);
-    expect(result.strategies[0].id).toBe('dual_low');
+    expect(result.strategies[0].id).toBe('martin_momentum_pullback');
     expect(result.strategies[0].marketScope).toEqual(['cn']);
   });
 
@@ -264,11 +264,11 @@ describe('screeningApi', () => {
       },
     });
 
-    await screeningApi.screen({ market: 'cn', strategy: 'dual_low', maxResults: 3 });
+    await screeningApi.screen({ market: 'cn', strategy: 'martin_momentum_pullback', maxResults: 3 });
 
     expect(post).toHaveBeenCalledWith(
       '/api/v1/screening/screen',
-      { market: 'cn', strategy: 'dual_low', max_results: 3, variant_seed: 'browser-seed' },
+      { market: 'cn', strategy: 'martin_momentum_pullback', max_results: 3, variant_seed: 'browser-seed' },
       { timeout: 180000 }
     );
   });
@@ -280,17 +280,30 @@ describe('screeningApi', () => {
         trace_id: 'screen-task-1',
         status: 'pending',
         message: 'Screening 选股任务已提交',
-        strategy: 'dual_low',
+        strategy: 'martin_momentum_pullback',
         market: 'cn',
         max_results: 3,
       },
     });
 
-    const result = await screeningApi.startScreen({ market: 'cn', strategy: 'dual_low', maxResults: 3 });
+    const result = await screeningApi.startScreen({
+      market: 'cn',
+      strategy: 'martin_momentum_pullback',
+      maxResults: 3,
+      notify: true,
+      webBaseUrl: 'http://192.168.1.8:8000',
+    });
 
     expect(post).toHaveBeenCalledWith(
       '/api/v1/screening/screen/tasks',
-      { market: 'cn', strategy: 'dual_low', max_results: 3, variant_seed: 'browser-seed' }
+      {
+        market: 'cn',
+        strategy: 'martin_momentum_pullback',
+        max_results: 3,
+        variant_seed: 'browser-seed',
+        notify: true,
+        web_base_url: 'http://192.168.1.8:8000',
+      }
     );
     expect(result.taskId).toBe('screen-task-1');
     expect(result.maxResults).toBe(3);
@@ -327,7 +340,7 @@ describe('screeningApi', () => {
           trace_id: 'screen-task-storage-disabled',
           status: 'pending',
           message: '选股任务已提交',
-          strategy: 'dual_low',
+          strategy: 'martin_momentum_pullback',
           market: 'cn',
           max_results: 3,
         },
@@ -339,8 +352,8 @@ describe('screeningApi', () => {
       expect(first).not.toBe('');
       expect(second).toBe(first);
 
-      await isolatedScreening.screeningApi.screen({ market: 'cn', strategy: 'dual_low', maxResults: 3 });
-      await isolatedScreening.screeningApi.startScreen({ market: 'cn', strategy: 'dual_low', maxResults: 3 });
+      await isolatedScreening.screeningApi.screen({ market: 'cn', strategy: 'martin_momentum_pullback', maxResults: 3 });
+      await isolatedScreening.screeningApi.startScreen({ market: 'cn', strategy: 'martin_momentum_pullback', maxResults: 3 });
 
       expect(post.mock.calls[0]?.[1]).toMatchObject({ variant_seed: first });
       expect(post.mock.calls[1]?.[1]).toMatchObject({ variant_seed: first });

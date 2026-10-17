@@ -407,6 +407,290 @@ class TestFeishuSender(unittest.TestCase):
         self.assertNotIn("| --- |", rendered)
 
     @mock.patch("src.notification_sender.feishu_sender.requests.post")
+    def test_send_cn_market_review_uses_full_structured_card(self, mock_post):
+        mock_post.return_value = _response(200, {"code": 0})
+        cfg = _config(feishu_webhook_url="https://feishu.example/hook")
+        sender = FeishuSender(cfg)
+        payload = {
+            "kind": "market_review",
+            "region": "cn",
+            "date": "2026-08-13",
+            "generation": {"mode": "llm", "model": "deepseek/deepseek-v4-flash"},
+            "indices": [
+                {"name": "上证指数", "current": 3926.96, "change_pct": -0.50},
+                {"name": "创业板指", "current": 3586.04, "change_pct": 0.45},
+            ],
+            "sectors": {
+                "top": [{"name": "医疗服务", "change_pct": 3.99}],
+                "bottom": [{"name": "贵金属", "change_pct": -5.20}],
+            },
+            "overseas": {
+                "us_indices": [{"name": "标普500", "current": 6450.12, "change_pct": 0.31}],
+            },
+            "recommendations": {
+                "etf": [{
+                    "name": "创新药ETF", "code": "515120", "theme": "创新药",
+                    "change_pct": 1.25, "technical": "站上MA5/10/20", "strength": "积极关注",
+                }],
+                "stocks": [{
+                    "name": "药明康德", "code": "603259", "theme": "CXO",
+                    "change_pct": 2.35, "technical": "站上MA5/10/20", "strength": "重点观察",
+                }],
+            },
+            "sections": [
+                {"key": "overview", "markdown": "指数调整，医药主线强化。"},
+                {"key": "一_盘面总览", "title": "一、盘面总览", "markdown": "市场广度承压。"},
+                {"key": "二_指数结构", "title": "二、指数结构", "markdown": "指数呈弱势震荡。"},
+                {"key": "六_etf_个股关注", "title": "六、ETF/个股关注", "markdown": "候选标的需等待确认。"},
+                {"key": "明日交易计划", "title": "六、明日交易计划", "markdown": "关注创新药持续性，避免追高。"},
+                {"key": "七_风险提示", "title": "七、风险提示", "markdown": "控制仓位。"},
+            ],
+            "news": [{"title": "创新药产业线索"}],
+        }
+
+        result = sender.send_to_feishu("legacy markdown body", structured_payload=payload)
+
+        self.assertTrue(result)
+        card = mock_post.call_args.kwargs["json"]["card"]
+        self.assertEqual(card["schema"], "2.0")
+        self.assertEqual(card["header"]["title"]["content"], "A股盘后智能复盘")
+        rendered = "\n".join(
+            item.get("content", "")
+            for item in card["body"]["elements"]
+            if isinstance(item, dict)
+        )
+        self.assertIn("DeepSeek / deepseek-v4-flash", rendered)
+        self.assertIn("核心结论", rendered)
+        self.assertIn("一、盘面总览", rendered)
+        self.assertIn("二、指数结构", rendered)
+        self.assertIn("六、明日交易计划", rendered)
+        self.assertIn("七、风险提示", rendered)
+        self.assertIn("控制仓位", rendered)
+        tables = [item for item in card["body"]["elements"] if item.get("tag") == "table"]
+        self.assertEqual(len(tables), 5)
+        self.assertEqual(tables[0]["rows"][0]["name"], "上证指数")
+        self.assertEqual(tables[2]["rows"][0]["name"], "标普500")
+        self.assertEqual(tables[3]["rows"][0]["name"], "创新药ETF\n515120")
+
+    def test_market_review_card_removes_markdown_table_headings_after_native_conversion(self):
+        content = "#### 行业板块领涨 Top 5\n| 排名 | 板块 |\n| --- | --- |\n| 1 | 医药 |\n\n正文保留。"
+
+        rendered = FeishuSender._strip_markdown_tables(content)
+
+        self.assertEqual(rendered, "正文保留。")
+
+    def test_cn_market_review_card_falls_back_to_data_formatting_source(self):
+        card = FeishuSender._build_market_review_card_body(
+            {"kind": "market_review", "region": "cn", "generation": {"mode": "template"}},
+            "fallback content",
+        )
+        rendered = "\n".join(
+            item.get("content", "")
+            for item in card["body"]["elements"]
+            if isinstance(item, dict)
+        )
+        self.assertIn("行情数据规则整理", rendered)
+
+    @mock.patch("src.notification_sender.feishu_sender.requests.post")
+    def test_send_strategy_backtest_uses_mobile_summary_card(self, mock_post):
+        mock_post.return_value = _response(200, {"code": 0})
+        cfg = _config(feishu_webhook_url="https://feishu.example/hook")
+        sender = FeishuSender(cfg)
+        payload = {
+            "kind": "strategy_backtest",
+            "period": {"start": "2026-08-01", "end": "2026-10-16"},
+            "benchmark": {"metrics": {"total_return_pct": 1.28}},
+            "results": {
+                "strategy": {
+                    "metrics": {
+                        "total_return_pct": 0.50,
+                        "excess_return_pct": -0.78,
+                        "max_drawdown_pct": -13.51,
+                        "trade_count": 17,
+                        "win_rate_pct": 29.41,
+                        "estimated_total_cost": 7010,
+                    },
+                    "trades": [
+                        {"code": "688203", "name": "海正生材", "return_pct": 35.40, "pnl": 63189}
+                    ],
+                },
+            },
+            "data_diagnostics": {"library_codes": 2639, "panel_dates": 49},
+            "signal_diagnostics": {
+                "setup_count": 128,
+                "entry_signal_count": 25,
+                "unconfirmed_setup_count": 103,
+                "first_signal_date": "2026-08-14",
+            },
+            "source_validation": {"summary": {"requested": 5, "ok": 5}},
+        }
+
+        result = sender.send_to_feishu("Martin A股策略回测", structured_payload=payload)
+
+        self.assertTrue(result)
+        card = mock_post.call_args.kwargs["json"]["card"]
+        self.assertEqual(card["schema"], "2.0")
+        self.assertEqual(card["header"]["title"]["content"], "Martin A股策略回测")
+        tables = [item for item in card["body"]["elements"] if item.get("tag") == "table"]
+        self.assertEqual(len(tables), 2)
+        self.assertEqual(tables[0]["rows"][0]["return"], "+0.50%")
+        self.assertEqual(tables[1]["rows"][0]["name"], "海正生材\n688203")
+        rendered = "\n".join(
+            item.get("content", "")
+            for item in card["body"]["elements"]
+            if isinstance(item, dict)
+        )
+        self.assertIn("仍跑输同池等权基准", rendered)
+        self.assertNotIn("左侧", rendered)
+        self.assertIn("5/5 通过", rendered)
+
+    def test_strategy_backtest_detail_cards_render_months_and_trade_ledger(self):
+        result = {
+            "config": {"initial_cash": 50000},
+            "metrics": {
+                "final_equity": 52365.45,
+                "total_return_pct": 4.73,
+                "max_drawdown_pct": -14.94,
+                "sharpe_ratio": 0.55,
+                "profit_factor": 1.17,
+                "average_trade_pct": 1.19,
+                "average_exposure_pct": 28.37,
+                "average_entry_position_weight_pct": 18.42,
+                "median_entry_position_weight_pct": 19.08,
+                "one_lot_trade_count": 0,
+                "max_adr_stress_heat_pct": 7.12,
+                "average_win_pct": 32.47,
+                "average_loss_pct": -4.02,
+                "win_rate_pct": 14.29,
+            },
+            "diagnostics": {"skipped_gap_down": 25},
+            "equity_curve": [
+                {"date": "2026-04-30", "equity": 50935.48},
+                {"date": "2026-05-29", "equity": 58432.92},
+            ],
+            "trades": [{
+                "code": "300201",
+                "name": "海伦哲",
+                "entry_date": "2026-04-30",
+                "exit_date": "2026-06-02",
+                "holding_days": 20,
+                "shares": 1_000,
+                "entry_price": 9.432,
+                "exit_price": 15.691,
+                "entry_fee": 2.83,
+                "exit_fee": 12.55,
+                "return_pct": 66.37,
+                "pnl": 6260.04,
+                "exit_reason": "max_holding_days",
+            }],
+        }
+        analysis = FeishuSender._build_structured_card_body(
+            {
+                "kind": "strategy_backtest_analysis",
+                "period": {"start": "2026-04-01", "end": "2026-10-17"},
+                "results": {"strategy": result},
+            },
+            "",
+        )
+        analysis_tables = [
+            item for item in analysis["body"]["elements"] if item.get("tag") == "table"
+        ]
+        self.assertEqual(analysis["header"]["title"]["content"], "Martin回测详细诊断")
+        sizing_table = next(table for table in analysis_tables if "one_lot" in table["rows"][0])
+        month_table = next(table for table in analysis_tables if "month" in table["rows"][0])
+        exit_table = next(table for table in analysis_tables if "reason" in table["rows"][0])
+        self.assertEqual(sizing_table["rows"][0]["median"], "+19.08%")
+        self.assertEqual(month_table["rows"][0]["month"], "2026-04")
+        self.assertEqual(exit_table["rows"][0]["reason"], "20日上限")
+
+        ledger = FeishuSender._build_structured_card_body(
+            {
+                "kind": "strategy_backtest_trades",
+                "period": {"start": "2026-04-01", "end": "2026-10-17"},
+                "page": 1,
+                "pages": 1,
+                "total_trades": 1,
+                "trades": result["trades"],
+            },
+            "",
+        )
+        ledger_table = next(
+            item for item in ledger["body"]["elements"] if item.get("tag") == "table"
+        )
+        self.assertEqual(ledger_table["rows"][0]["stock"], "海伦哲\n300201")
+        self.assertEqual(ledger_table["rows"][0]["shares"], "1,000")
+        self.assertEqual(ledger_table["rows"][0]["prices"], "买 9.432\n卖 15.691")
+        self.assertEqual(ledger_table["rows"][0]["cashflow"], "支 9,434.83\n收 15,678.45")
+        self.assertIn("+66.37%", ledger_table["rows"][0]["return"])
+
+    @mock.patch("src.notification_sender.feishu_sender.requests.post")
+    def test_send_screening_result_uses_completion_card_with_detail_link(self, mock_post):
+        mock_post.return_value = _response(200, {"code": 0})
+        cfg = _config(feishu_webhook_url="https://feishu.example/hook")
+        sender = FeishuSender(cfg)
+        payload = {
+            "kind": "screening_result",
+            "strategy": "martin_momentum_pullback",
+            "market": "cn",
+            "run_id": "run-1",
+            "candidate_count": 1,
+            "snapshot_count": 5570,
+            "after_filter_count": 28,
+            "ranking_mode": "llm",
+            "candidates": [{
+                "code": "600519",
+                "name": "贵州茅台",
+                "score": 88.6,
+                "reason": "趋势与相对强度共振",
+                "trade_plan": {
+                    "signal_status": "buy_signal",
+                    "entry": {"trigger_price": 1500.0, "min_price": 1490.0, "max_price": 1520.0},
+                    "exit": {
+                        "initial_stop_price": 1450.0,
+                        "initial_risk_pct": 3.3333,
+                        "sizing_risk_pct": 3.3333,
+                        "effective_risk_pct": 3.3333,
+                        "adr_stress_pct": 4.0,
+                        "breakeven_activation_price": 1570.0,
+                        "first_profit_price": 1640.0,
+                        "follow_through_days": 10,
+                        "follow_through_min_return_pct": 3.0,
+                        "max_holding_days": 20,
+                    },
+                    "position_sizing": {
+                        "max_position_weight_pct": 15.0,
+                        "min_position_weight_pct": 12.0,
+                        "max_portfolio_risk_per_trade_pct": 0.5,
+                        "max_portfolio_heat_pct": 2.5,
+                    },
+                },
+            }],
+            "detail_url": "http://192.168.1.8:8000/screening?runId=run-1",
+        }
+
+        result = sender.send_to_feishu("fallback", structured_payload=payload)
+
+        self.assertTrue(result)
+        card = mock_post.call_args.kwargs["json"]["card"]
+        self.assertEqual(card["schema"], "2.0")
+        self.assertEqual(card["header"]["title"]["content"], "选股任务完成")
+        tables = [item for item in card["body"]["elements"] if item.get("tag") == "table"]
+        self.assertEqual(tables[0]["rows"][0]["name"], "1. 贵州茅台\n600519")
+        rendered = "\n".join(
+            item.get("content", "")
+            for item in card["body"]["elements"]
+            if isinstance(item, dict)
+        )
+        self.assertIn("候选 **1** 只", rendered)
+        self.assertIn("条件单计划", rendered)
+        self.assertIn("初始防守：**1450.0**", rendered)
+        self.assertIn("仓位区间：**12.0% - 15.0%**", rendered)
+        self.assertIn("单笔风险预算 0.5%", rendered)
+        self.assertIn("技术止损/计仓风险 **3.3333%**", rendered)
+        self.assertIn("1 ADR 压力 4.0%（不参与计仓）", rendered)
+        self.assertIn("http://192.168.1.8:8000/screening?runId=run-1", rendered)
+
+    @mock.patch("src.notification_sender.feishu_sender.requests.post")
     def test_send_error_response_returns_false(self, mock_post):
         mock_post.return_value = _response(200, {"code": 19024, "msg": "keyword not found"})
         cfg = _config(feishu_webhook_url="https://feishu.example/hook")

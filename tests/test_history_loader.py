@@ -56,6 +56,41 @@ class HistoryLoaderTestCase(unittest.TestCase):
         self.assertEqual(len(df), 40)
         mock_db.get_data_range.assert_called_once()
 
+    @patch("src.services.history_loader._get_fetcher_manager")
+    @patch("src.storage.get_db")
+    def test_weekend_target_accepts_previous_friday_cache(self, mock_get_db, mock_get_fm):
+        from src.services.history_loader import load_history_df
+
+        fake_bar = MagicMock()
+        fake_bar.to_dict.return_value = {"date": "2026-04-17", "close": 10}
+        mock_db = MagicMock()
+        mock_db.get_data_range.return_value = [fake_bar] * 40
+        mock_get_db.return_value = mock_db
+
+        df, source = load_history_df("600519", days=60, target_date=date(2026, 4, 19))
+
+        self.assertIsNotNone(df)
+        self.assertEqual(source, "db_cache")
+        mock_get_fm.assert_not_called()
+
+    @patch("src.services.history_loader._get_fetcher_manager")
+    @patch("src.storage.get_db")
+    def test_weekend_target_rejects_cache_older_than_previous_friday(self, mock_get_db, mock_get_fm):
+        from src.services.history_loader import load_history_df
+
+        fake_bar = MagicMock()
+        fake_bar.to_dict.return_value = {"date": "2026-04-16", "close": 10}
+        mock_db = MagicMock()
+        mock_db.get_data_range.return_value = [fake_bar] * 40
+        mock_get_db.return_value = mock_db
+        fallback_df = pd.DataFrame({"close": [10, 11]})
+        mock_get_fm.return_value.get_daily_data.return_value = (fallback_df, "eastmoney")
+
+        df, source = load_history_df("600519", days=60, target_date=date(2026, 4, 19))
+
+        self.assertIs(df, fallback_df)
+        self.assertEqual(source, "eastmoney")
+
     # ------------------------------------------------------------------
     # DB miss → DFM fallback
     # ------------------------------------------------------------------

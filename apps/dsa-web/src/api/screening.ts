@@ -45,8 +45,64 @@ export type ScreeningCandidate = {
   price?: number | null;
   changePct?: number | null;
   amount?: number | null;
+  seedPoolScore?: number | null;
+  seedPoolReason?: string;
   industry?: string;
+  adr20Pct?: number | null;
+  change20d?: number | null;
+  change60d?: number | null;
+  relativeStrength20dPctile?: number | null;
+  relativeStrength60dPctile?: number | null;
+  pullbackDepth10dPct?: number | null;
+  rangeContractionRatio?: number | null;
+  volumeContractionRatio?: number | null;
+  supportConfluenceCount?: number | null;
+  triggerDistancePct?: number | null;
+  sectorBreadthCount?: number | null;
   factorScores?: Record<string, number>;
+  tradePlan?: {
+    schemaVersion?: number;
+    signalStatus?: 'buy_signal' | 'watch_wait_trigger' | 'data_insufficient' | string;
+    action?: string;
+    executionModel?: string;
+    referenceClose?: number | null;
+    entry?: {
+      session?: string;
+      triggerPrice?: number | null;
+      minPrice?: number | null;
+      maxPrice?: number | null;
+      cancelIf?: string[];
+    };
+    exit?: {
+      decisionTime?: string;
+      executionSession?: string;
+      pricingStatus?: string;
+      referenceEntryPrice?: number | null;
+      initialStopPrice?: number | null;
+      initialRiskPerShare?: number | null;
+      initialRiskPct?: number | null;
+      structuralSupportPrice?: number | null;
+      breakevenActivationPrice?: number | null;
+      firstProfitPrice?: number | null;
+      twoRReferencePrice?: number | null;
+      fixedTakeProfit?: boolean;
+      trailingDrawdownPct?: number | null;
+      followThroughDays?: number | null;
+      followThroughMinReturnPct?: number | null;
+      maxHoldingDays?: number | null;
+    };
+    positionSizing?: {
+      pricingStatus?: string;
+      referencePrice?: number | null;
+      maxPositionWeightPct?: number | null;
+      maxPortfolioRiskPerTradePct?: number | null;
+      lotSize?: number | null;
+      quantityFormula?: string;
+    };
+    conditionOrders?: Record<string, unknown>;
+    holdingPremises?: string[];
+    conditionOrderNote?: string;
+  };
   postAnalysisSummaries?: Record<string, string>;
   postAnalysisTags?: string[];
   dsaContext?: {
@@ -66,6 +122,16 @@ export type ScreeningCandidate = {
       provider?: string;
       results?: Array<Record<string, unknown>>;
       error?: string | null;
+    };
+    dailyValidation?: {
+      enabled?: boolean;
+      mode?: string;
+      status?: string;
+      primarySource?: string;
+      rows?: number;
+      latestDate?: string;
+      validation?: Record<string, unknown>;
+      error?: string;
     };
     warnings?: string[];
   };
@@ -210,6 +276,10 @@ export type ScreeningScreenResponse = {
   strategy?: string;
   market?: string;
   snapshotCount?: number;
+  snapshotFilteredCount?: number;
+  seedPoolCount?: number;
+  seedPoolLimit?: number;
+  seedPoolDiagnostics?: Record<string, unknown>;
   afterFilterCount?: number;
   llmRanked?: boolean;
   llmMarketView?: string;
@@ -237,9 +307,18 @@ export type ScreeningScreenResponse = {
   riskEnabled?: boolean | null;
   portfolioDiversityEnabled?: boolean | null;
   portfolioConcentrationNotes?: string[];
+  sectorQuotaApplied?: boolean;
+  sectorQuotaReplacements?: number;
+  sectorQuotaMaxPerBucket?: number;
   resultVariantApplied?: boolean;
   resultVariantPoolSize?: number;
   resultVariantRotatedSlots?: number;
+  notification?: {
+    requested: boolean;
+    channel: 'feishu' | string;
+    sent: boolean;
+    detailUrl?: string | null;
+  };
 };
 
 export type ScreeningScreenAccepted = {
@@ -356,22 +435,26 @@ export const screeningApi = {
     return toCamelCase<ScreeningStatus>(response.data);
   },
 
-  async screen(payload: { market: string; strategy: string; maxResults: number }): Promise<ScreeningScreenResponse> {
+  async screen(payload: { market: string; strategy: string; maxResults: number; notify?: boolean; webBaseUrl?: string }): Promise<ScreeningScreenResponse> {
     const response = await apiClient.post<Record<string, unknown>>('/api/v1/screening/screen', {
       market: payload.market,
       strategy: payload.strategy,
       max_results: payload.maxResults,
       variant_seed: getScreeningVariantSeed(),
+      ...(payload.notify !== undefined ? { notify: payload.notify } : {}),
+      ...(payload.webBaseUrl ? { web_base_url: payload.webBaseUrl } : {}),
     }, { timeout: SCREENING_SCREEN_TIMEOUT_MS });
     return toCamelCase<ScreeningScreenResponse>(response.data);
   },
 
-  async startScreen(payload: { market: string; strategy: string; maxResults: number }): Promise<ScreeningScreenAccepted> {
+  async startScreen(payload: { market: string; strategy: string; maxResults: number; notify?: boolean; webBaseUrl?: string }): Promise<ScreeningScreenAccepted> {
     const response = await apiClient.post<Record<string, unknown>>('/api/v1/screening/screen/tasks', {
       market: payload.market,
       strategy: payload.strategy,
       max_results: payload.maxResults,
       variant_seed: getScreeningVariantSeed(),
+      ...(payload.notify !== undefined ? { notify: payload.notify } : {}),
+      ...(payload.webBaseUrl ? { web_base_url: payload.webBaseUrl } : {}),
     });
     return toCamelCase<ScreeningScreenAccepted>(response.data);
   },

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import contextvars
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from threading import Lock
 from typing import Any, List, Optional, Tuple
 
@@ -123,6 +123,20 @@ def _select_best_bars(db, stock_code: str, start: date, end: date) -> Tuple[Opti
     return best_code, best_bars
 
 
+def _expected_latest_bar_date(end: date, *, now: Optional[datetime] = None) -> date:
+    """Return the latest weekday whose close should already be available."""
+    expected = end
+    while expected.weekday() >= 5:
+        expected -= timedelta(days=1)
+
+    current = now or datetime.now()
+    if expected == current.date() and current.time() < time(15, 10):
+        expected -= timedelta(days=1)
+        while expected.weekday() >= 5:
+            expected -= timedelta(days=1)
+    return expected
+
+
 def load_history_df(
     stock_code: str,
     days: int = 60,
@@ -152,7 +166,8 @@ def load_history_df(
         _code, bars = _select_best_bars(db, stock_code, start, end)
         required_records = max(min(days, _CACHE_MIN_RECORDS), 1)
         latest_date = max((_bar_date(bar) for bar in bars), default=date.min)
-        if bars and latest_date >= end and len(bars) >= required_records:
+        expected_latest = _expected_latest_bar_date(end)
+        if bars and latest_date >= expected_latest and len(bars) >= required_records:
             df = pd.DataFrame([b.to_dict() for b in bars])
             logger.debug(
                 "load_history_df(%s): %d bars from DB (requested %d)",

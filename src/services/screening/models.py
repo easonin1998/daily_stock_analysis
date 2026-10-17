@@ -24,6 +24,9 @@ class HardFilterConfig:
     turnover_rate_min: float | None = None
     change_pct_min: float | None = None
     change_pct_max: float | None = None
+    market_positive_ratio_min: float | None = None
+    market_median_change_pct_min: float | None = None
+    market_median_change_20d_pct_min: float | None = None
     change_60d_min: float | None = None
     change_60d_max: float | None = None
     require_ma_bullish: bool = False
@@ -48,6 +51,30 @@ class HardFilterConfig:
     max_drawdown_20d_pct_max: float | None = None
     atr_20_pct_min: float | None = None
     atr_20_pct_max: float | None = None
+    daily_data_points_min: int | None = None
+    avg_amount_20d_min: float | None = None
+    adr_20_pct_min: float | None = None
+    adr_20_pct_max: float | None = None
+    change_20d_min: float | None = None
+    change_20d_max: float | None = None
+    relative_strength_20d_pctile_min: float | None = None
+    relative_strength_60d_pctile_min: float | None = None
+    require_ema_stack: bool = False
+    require_ema21_rising: bool = False
+    require_ema50_rising: bool = False
+    distance_to_120d_high_pct_min: float | None = None
+    pullback_depth_10d_pct_min: float | None = None
+    pullback_depth_10d_pct_max: float | None = None
+    range_contraction_ratio_max: float | None = None
+    volume_contraction_ratio_max: float | None = None
+    support_confluence_count_min: int | None = None
+    trigger_distance_pct_min: float | None = None
+    trigger_distance_pct_max: float | None = None
+    trigger_close_location_pct_min: float | None = None
+    trigger_close_location_pct_max: float | None = None
+    trigger_volume_vs_previous_min: float | None = None
+    trigger_volume_vs_previous_max: float | None = None
+    exclude_one_word_limit_up: bool = False
 
 
 @dataclass
@@ -55,9 +82,7 @@ class ScreeningConfig:
     enabled: bool = False
     market_scope: list[str] = field(default_factory=lambda: ["cn"])
     hard_filters: HardFilterConfig = field(default_factory=HardFilterConfig)
-    tech_weight: float = 0.35
     factor_weights: dict[str, float] = field(default_factory=dict)
-    scoring_profile: dict[str, Any] = field(default_factory=dict)
     risk_profile: dict[str, Any] = field(default_factory=dict)
     portfolio_profile: dict[str, Any] = field(default_factory=dict)
     scorecard_profile: dict[str, Any] = field(default_factory=dict)
@@ -130,6 +155,8 @@ class Pick:
     volume_ratio: float | None = None
     pe_ratio: float | None = None
     pb_ratio: float | None = None
+    seed_pool_score: float | None = None
+    seed_pool_reason: str = ""
     industry: str = ""
     concepts: str = ""
     industry_rank: int | None = None
@@ -145,6 +172,26 @@ class Pick:
     board_heat_state: str = ""
     board_heat_summary: str = ""
     change_60d: float | None = None
+    change_20d: float | None = None
+    relative_strength_20d_pctile: float | None = None
+    relative_strength_60d_pctile: float | None = None
+    adr_20_pct: float | None = None
+    ema9: float | None = None
+    ema21: float | None = None
+    ema50: float | None = None
+    ema_stack_bullish: bool | None = None
+    ema21_rising: bool | None = None
+    ema50_rising: bool | None = None
+    distance_to_120d_high_pct: float | None = None
+    pullback_depth_10d_pct: float | None = None
+    range_contraction_ratio: float | None = None
+    volume_contraction_ratio: float | None = None
+    anchored_vwap_60d_high: float | None = None
+    support_confluence_count: int | None = None
+    trigger_distance_pct: float | None = None
+    one_word_limit_up: bool | None = None
+    avg_amount_20d: float | None = None
+    sector_breadth_count: int | None = None
     signal_score: float | None = None
     ma_bullish: bool | None = None
     price_above_ma20: bool | None = None
@@ -180,6 +227,7 @@ class Pick:
     excluded_by_risk: bool = False
     portfolio_penalty: float = 0.0
     portfolio_flags: list[str] = field(default_factory=list)
+    trade_plan: dict[str, Any] = field(default_factory=dict)
     post_analysis_status: dict[str, str] = field(default_factory=dict)
     post_analysis_summaries: dict[str, str] = field(default_factory=dict)
     post_analysis_score_deltas: dict[str, float] = field(default_factory=dict)
@@ -207,6 +255,10 @@ class ScreenResult:
     strategy_version: str = ""
     strategy_category: str = ""
     snapshot_count: int = 0
+    snapshot_filtered_count: int = 0
+    seed_pool_count: int = 0
+    seed_pool_limit: int = 0
+    seed_pool_diagnostics: dict[str, Any] = field(default_factory=dict)
     after_filter_count: int = 0
     picks: list[Pick] = field(default_factory=list)
     run_id: str = ""
@@ -230,6 +282,9 @@ class ScreenResult:
     risk_enabled: bool = True
     portfolio_diversity_enabled: bool = True
     portfolio_concentration_notes: list[str] = field(default_factory=list)
+    sector_quota_applied: bool = False
+    sector_quota_replacements: int = 0
+    sector_quota_max_per_bucket: int = 0
     result_variant_applied: bool = False
     result_variant_pool_size: int = 0
     result_variant_rotated_slots: int = 0

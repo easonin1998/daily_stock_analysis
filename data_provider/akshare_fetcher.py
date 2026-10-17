@@ -1782,8 +1782,10 @@ class AkshareFetcher(BaseFetcher):
 
     def get_main_indices(self, region: str = "cn") -> Optional[List[Dict[str, Any]]]:
         """
-        获取主要指数实时行情 (新浪接口)，仅支持 A 股
+        获取主要指数行情（A 股实时/美股日线，均来自新浪接口）。
         """
+        if region == "us":
+            return self._get_us_main_indices_sina()
         if region != "cn":
             return None
         import akshare as ak
@@ -1845,6 +1847,52 @@ class AkshareFetcher(BaseFetcher):
         except Exception as e:
             logger.error(f"[Akshare] 获取指数行情失败: {e}")
             return None
+
+    def _get_us_main_indices_sina(self) -> Optional[List[Dict[str, Any]]]:
+        """Fetch dated US benchmark closes when Yahoo Finance is rate limited."""
+        import akshare as ak
+
+        indices_map = {
+            ".INX": ("SPX", "标普500指数"),
+            ".IXIC": ("IXIC", "纳斯达克综合指数"),
+            ".DJI": ("DJI", "道琼斯工业指数"),
+            ".NDX": ("NDX", "纳斯达克100指数"),
+        }
+        results: List[Dict[str, Any]] = []
+        for symbol, (code, name) in indices_map.items():
+            try:
+                self._set_random_user_agent()
+                self._enforce_rate_limit()
+                daily = ak.index_us_stock_sina(symbol=symbol)
+                if daily is None or len(daily) < 2:
+                    continue
+                latest = daily.iloc[-1]
+                previous = daily.iloc[-2]
+                close = safe_float(latest.get("close"), 0.0)
+                prev_close = safe_float(previous.get("close"), 0.0)
+                high = safe_float(latest.get("high"), close)
+                low = safe_float(latest.get("low"), close)
+                change = close - prev_close
+                change_pct = change / prev_close * 100 if prev_close else 0.0
+                amplitude = (high - low) / prev_close * 100 if prev_close else 0.0
+                results.append({
+                    "code": code,
+                    "name": name,
+                    "current": close,
+                    "change": change,
+                    "change_pct": change_pct,
+                    "open": safe_float(latest.get("open"), close),
+                    "high": high,
+                    "low": low,
+                    "prev_close": prev_close,
+                    "volume": safe_float(latest.get("volume"), 0.0),
+                    "amount": safe_float(latest.get("amount"), 0.0),
+                    "amplitude": amplitude,
+                    "as_of_date": str(latest.get("date") or ""),
+                })
+            except Exception as exc:
+                logger.warning("[Akshare] 获取美股指数 %s 失败: %s", name, exc)
+        return results or None
 
     def get_market_stats(self) -> Optional[Dict[str, Any]]:
         """

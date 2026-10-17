@@ -28,21 +28,19 @@ def _normalize_code(value: object) -> str:
     # US tickers may pass through (see normalize_code docstring).
     return normalize_code(value, allow_ticker=True)
 
+
 SUPPORTED_POST_ANALYZERS = {"dsa", "scorecard", "external_http"}
 _DEFAULT_SCORECARD_PROFILE = {
-    "value_quality_value_min": 75.0,
-    "value_quality_stability_min": 65.0,
-    "value_quality_bonus": 2.4,
-    "capital_confirmed_momentum_min": 72.0,
-    "capital_confirmed_activity_min": 65.0,
-    "capital_confirmed_bonus": 1.8,
-    "controlled_reversal_min": 75.0,
-    "controlled_reversal_bonus": 1.2,
-    "hot_money_activity_min": 90.0,
-    "hot_money_stability_max": 45.0,
-    "hot_money_penalty": 2.5,
-    "volume_spike_ratio": 5.0,
-    "volume_spike_penalty": 1.2,
+    "leader_trend_min": 75.0,
+    "leader_relative_strength_min": 80.0,
+    "leader_bonus": 1.5,
+    "pullback_contraction_min": 70.0,
+    "pullback_support_min": 65.0,
+    "pullback_bonus": 2.0,
+    "weak_sector_max": 35.0,
+    "weak_sector_penalty": 1.5,
+    "chase_change_pct": 5.0,
+    "chase_penalty": 1.2,
     "high_llm_confidence": 0.75,
     "high_llm_confidence_bonus": 0.8,
     "low_llm_confidence": 0.40,
@@ -293,31 +291,28 @@ def _scorecard_delta(
 ) -> tuple[float, list[str], list[str], str]:
     profile = _scorecard_profile(profile)
     factors = pick.factor_scores or {}
-    value = float(factors.get("value", 50))
-    stability = float(factors.get("stability", 50))
-    momentum = float(factors.get("momentum", 50))
-    activity = float(factors.get("activity", 50))
-    reversal = float(factors.get("reversal", 50))
+    trend = float(factors.get("trend_quality", 50))
+    relative_strength = float(factors.get("relative_strength", 50))
+    sector = float(factors.get("sector_resonance", 50))
+    contraction = float(factors.get("contraction", 50))
+    support = float(factors.get("support_confluence", 50))
 
     delta = 0.0
     flags: list[str] = []
     tags: list[str] = []
 
-    if value >= profile["value_quality_value_min"] and stability >= profile["value_quality_stability_min"]:
-        delta += profile["value_quality_bonus"]
-        tags.append("value_quality")
-    if momentum >= profile["capital_confirmed_momentum_min"] and activity >= profile["capital_confirmed_activity_min"]:
-        delta += profile["capital_confirmed_bonus"]
-        tags.append("capital_confirmed")
-    if reversal >= profile["controlled_reversal_min"] and pick.change_pct < 0:
-        delta += profile["controlled_reversal_bonus"]
-        tags.append("controlled_reversal")
-    if activity >= profile["hot_money_activity_min"] and stability < profile["hot_money_stability_max"]:
-        delta -= profile["hot_money_penalty"]
-        flags.append("hot_money_instability")
-    if pick.volume_ratio is not None and pick.volume_ratio >= profile["volume_spike_ratio"]:
-        delta -= profile["volume_spike_penalty"]
-        flags.append("volume_spike")
+    if trend >= profile["leader_trend_min"] and relative_strength >= profile["leader_relative_strength_min"]:
+        delta += profile["leader_bonus"]
+        tags.append("momentum_leader")
+    if contraction >= profile["pullback_contraction_min"] and support >= profile["pullback_support_min"]:
+        delta += profile["pullback_bonus"]
+        tags.append("pullback_ready")
+    if sector < profile["weak_sector_max"]:
+        delta -= profile["weak_sector_penalty"]
+        flags.append("weak_sector_resonance")
+    if pick.change_pct >= profile["chase_change_pct"]:
+        delta -= profile["chase_penalty"]
+        flags.append("chase_risk")
     if pick.llm_confidence is not None:
         if pick.llm_confidence >= profile["high_llm_confidence"]:
             delta += profile["high_llm_confidence_bonus"]

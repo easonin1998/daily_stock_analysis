@@ -447,6 +447,7 @@ daily_stock_analysis/
 > - 台股：在美股/港股 offshore 基础路径之外，`institution` 区块额外展示三大法人原始买卖超净额（TWSE T86 / TPEx，默认开启、fail-open，取不到数据时维持 `not_supported`）；`capital_flow`、`dragon_tiger`、`boards` 仍为 `not_supported`；
 > - 任何异常走 fail-open，仅记录错误，不影响技术面/新闻/筹码主链路。
 > - 配置 `TICKFLOW_API_KEY` 后，TickFlow 会作为可选 A 股日 K 数据源和大盘复盘增强源实例化；`TICKFLOW_PRIORITY` 只影响日 K/通用数据源回退链。实时行情优先级由 `REALTIME_SOURCE_PRIORITY` 单独控制，只有显式包含 `tickflow` 时才会使用 TickFlow 实时行情。`REALTIME_SOURCE_PRIORITY` 中排在 `tickflow` 前面的数据源会先被尝试。
+> - 配置飞书 Webhook 或 App Bot 时，单市场 A 股大盘复盘会优先使用专用完整交互卡片：保留核心结论、盘面总览、指数结构、板块主线、资金与情绪、消息催化、ETF/个股关注、明日交易计划和风险提示等全部固定章节正文。卡片采用飞书 JSON 2.0 原生宽表格展示 A 股指数、行业强弱、最新美股指数和候选标的，不会残留已转表格的 Markdown 排名标题；候选仅在当日领涨方向明确且日线均线/量价数据完整时生成，内容包含技术、量价代理、情绪和失效条件，不构成投资建议。A 股复盘会轮转合并本地的美股、A 股和全球情报池，并在合并后再次严格过滤：只接纳近两天内、有发布日期且与美股传导或 A 股交易相关的资讯；无有效资讯时报告会明确说明，不能以旧闻或无关事件补充。卡片会标注本次为 `DeepSeek / <模型名>` 分析还是行情数据规则整理；其他报告类型与多市场复盘保持原有 Markdown 推送兼容路径。
 > - `CN_QUANT_DATA_MODE=akshare_baostock` 仅改变 A 股日线取数链：AkShare 作为主取数源，Baostock 作为前复权日线校验源；实时行情仍由 `REALTIME_SOURCE_PRIORITY` 控制。Baostock 不可用、返回空或校验不一致时会记录 `daily_source_validation` 状态并继续分析。
 > - TickFlow 日 K 默认 `TICKFLOW_KLINE_ADJUST=none`；日线 `volume` 从手统一转为股，`amount` 保持元口径。
 > - TickFlow 日 K 区间请求会显式传入 `start_time` / `end_time` / `count`；官方 quickstart 明确说明时间范围查询仍受 `count` 限制。若返回非空但行数打满 `count` 且首个返回交易日晚于请求起始交易日，系统会判定为疑似截断，不写入缓存并让 manager 继续回退。
@@ -1572,7 +1573,7 @@ FastAPI 提供 RESTful API 服务，支持配置管理和触发分析。
 - 🧪 **今日状态/任务刷新防抖** - 首页「今日」与「自选」通过带有时区感知的历史区间判断并发起分页历史查询；任务完成后由最新一次 stock bar 刷新成功才清除失败态，避免旧请求乱序覆盖新状态导致重复提交
 - 🧭 **首次配置提示** - 首页会读取只读配置状态，缺少 LLM 主渠道、自选股等基础项时提示缺口并引导进入系统设置
 - 📊 **实时进度** - 分析任务状态实时更新，支持多任务并行；普通分析链路在进入 LLM 阶段后会优先尝试 LiteLLM 流式生成，并通过任务 SSE 回灌更细粒度的 `message/progress`
-- 🧪 **选股任务可恢复** - 选股实现参考 AlphaSift；页面提交后台任务后轮询快照、候选上下文、LLM 重排和最终增强等阶段，切换页面再返回会恢复当前任务进度或最终结果；热点榜单刷新可与选股同时进行，详情在选中题材后按需加载，成分股会并行尝试东方财富与同花顺，也可主动复用 DSA 搜索服务补充近期消息；5 分钟内重复选股默认复用最近成功快照；每次运行可在分差有界的近分池中生成不同组合，明显领先候选仍受保护，硬过滤、风险约束和评分不受影响
+- 🧪 **Martin 动量回调选股** - 内置策略仅保留 `martin_momentum_pullback`，以 60 日相对强度前 5% 为领涨股硬门槛，并结合 ADR20、EMA9/21/50、板块共振、缩量收敛、支撑和触发质量筛选 A 股；触发日收盘位置与量能用于排序而非刚性删股。交易计划按技术止损与单笔 0.5% 风险预算计仓，单只上限 20%、组合技术风险热度上限 2.5%；ADR 只作跳空压力观察，技术止损超过 3% 或整数手后仓位不足 12% 时放弃交易。页面提交后台任务后会恢复进度或最终结果，热点详情与近期消息仍按需加载，5 分钟内重复运行默认复用成功快照
 - 🗂️ **大盘复盘任务可见性** - 首页触发大盘复盘后会返回 `task_id` 并轮询 `GET /api/v1/analysis/status/{task_id}`，在进行中/完成/失败场景给出可见反馈，失败时直接透出报错内容
 - 🗂️ **市场复盘历史独立入口** - 大盘复盘历史通过专用入口与普通个股历史隔离；建议通过 `stock_code=MARKET` + `report_type=market_review` 直接查询与回放大盘复盘记录
 - 🧾 **市场复盘历史可复用** - 大盘复盘任务会持久化到分析历史，`report_type` 为 `market_review`，可直接通过历史列表/详情打开对应 Markdown 或详情页，不会重新触发分析重算
@@ -1640,7 +1641,7 @@ FastAPI 提供 RESTful API 服务，支持配置管理和触发分析。
 > 审计依据：优先级与回退语义以 `src/config.py` 的 `Config._load_from_env()` 为准（`LITELLM_CONFIG` > `LLM_CHANNELS` > legacy）。配套回归见 `tests/test_llm_channel_config.py`（配置源解析）与 `tests/test_market_review_runtime.py`（共享装配路径）。该接口当前仅提供单进程/单机级防重复能力，若为多实例部署需通过外部任务队列或分布式锁补齐全局幂等。
 > 说明：`POST /api/v1/analysis/market-review` 触发后，报告会以 `report_type=market_review` 写入历史库；你可直接查询 `/api/v1/history` 或 `/api/v1/history/{record_id}` 获取历史 Markdown，避免再次触发分析重算。
 > 说明：历史列表新增 `report_type` 查询参数；通过 `stock_code=MARKET&report_type=market_review` 可单独读取大盘复盘历史集合，与普通个股历史逻辑完全隔离。
-> 说明：`POST /api/v1/analysis/market-review` 的任务状态与历史持久化都会包含 `market_review_payload`：其中 `region` 是本次实际执行的 canonical 市场字符串，另含 `market_scope`、`color_scheme`、`sections`、`sectors`、`concepts`、`news`、`market_light`、`indices` 等结构化字段；多市场结果按区域保存在 `markets`。Web 端 Markdown 渲染、历史详情和分享图片会复用该结构化字段；若结构化字段为空或仅有部分字段则按字段回退到原始 Markdown。
+> 说明：`POST /api/v1/analysis/market-review` 的任务状态与历史持久化都会包含 `market_review_payload`：其中 `region` 是本次实际执行的 canonical 市场字符串，另含 `market_scope`、`color_scheme`、`sections`、`sectors`、`concepts`、`news`、`market_light`、`indices`、`overseas.us_indices`、`recommendations` 等结构化字段；A 股复盘的 `news` 只包含近两天内有发布日期的内容。多市场结果按区域保存在 `markets`。Web 端 Markdown 渲染、历史详情和分享图片会复用该结构化字段；若结构化字段为空或仅有部分字段则按字段回退到原始 Markdown。
 > 说明：运行流快照接口返回 `lanes/nodes/edges/events/summary` 统一契约。active task 缺少 diagnostics 时返回 skeleton flow；若任务 SSE 已收到真实 `flow_event`，快照会包含最近增量事件。completed history 优先使用 `context_snapshot.diagnostics` 与 `analysis_context_pack_overview` 构建完整拓扑。`cancel_requested/cancelled` 是合法状态，不会映射为 failed。
 > 说明：`market_review_payload` 中的 `breadth` 仅在行情宽度数据真实可用时下发；当美股/港股或接口暂不可用时不下发该字段。前端显示层需按“字段缺失”降级为“暂无数据”而不是展示 0。
 > 说明：该端点若返回 `task_id`，WebUI 会轮询 `GET /api/v1/analysis/status/{task_id}` 展示状态。状态为 `completed` 时给出完成提示（报告已生成并按配置推送），状态为 `failed` 时在前端错误区域显示 `error` 原因。
