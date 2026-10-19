@@ -32,6 +32,27 @@ from src.services.screening.filter import (
     without_daily_filters,
 )
 from src.services.screening.industry import enrich_industry_concepts
+from src.services.screening.martin_setups import (
+    MULTI_SETUP_MODE,
+    attach_martin_entry_setups,
+    common_martin_hard_filters,
+)
+from src.services.screening.sector_strength import (
+    attach_sector_strength_features,
+    compute_sector_strength_snapshot,
+    load_sector_strength_history,
+    select_sector_strength_snapshot,
+    summarize_sector_strength_snapshot,
+    upsert_sector_strength_history,
+)
+from src.services.screening.market_regime import (
+    MarketRegimePolicy,
+    REGIME_RISK_OFF,
+    load_market_regime_history,
+    resolve_market_regime_limits,
+    unavailable_market_regime,
+    update_market_regime_history,
+)
 from src.services.screening.models import Pick, ScreenResult
 from src.services.screening.normalize import (
     normalize_code,
@@ -44,7 +65,7 @@ from src.services.screening.post_analysis import normalize_post_analyzers, run_p
 from src.services.screening.ranker import rank_candidates_with_metadata
 from src.services.screening.risk import apply_portfolio_overlay, apply_risk_overlay, apply_sector_quota
 from src.services.screening.scorer import compute_screen_scores, factor_score_columns
-from src.services.screening.trade_plan import build_martin_trade_plan
+from src.services.screening.trade_plan import MartinTradePlanConfig, build_martin_trade_plan
 from src.services.screening.selection_variant import apply_seeded_selection_variant
 from src.services.screening.snapshot import fetch_snapshot_with_fallback
 from src.services.screening.strategy import load_all_strategies
@@ -131,6 +152,7 @@ def screen(
 
     strat = strategies[strategy]
     screening = strat.screening
+    execution_profile = screening.execution_profile or {}
     if market not in screening.market_scope:
         raise ValueError(
             f"Strategy '{strategy}' does not support market '{market}'. "
@@ -180,6 +202,7 @@ def screen(
             max_boards=config.industry_provider_max_boards,
             provider_cache_dir=config.industry_provider_cache_dir,
             provider_cache_ttl_hours=config.industry_provider_cache_ttl_hours,
+            include_fund_flow=config.sector_fund_flow_enabled,
         )
         degradation.extend(f"Industry/concepts enrichment: {item}" for item in industry_notes)
     snapshot_df = _attach_market_regime_features(snapshot_df)
@@ -196,11 +219,12 @@ def screen(
                 f"Snapshot source fallback: last_good_cache stale_age_hours={stale_age}"
             )
 
+    completed_bar_date = None
+    library_latest_date = None
     if (
         market == "cn"
         and config.daily_feature_library_enabled
         and config.daily_feature_library_path is not None
-        and config.daily_history_cache_dir is not None
     ):
         completed_bar_date = completed_snapshot_bar_date(snapshot_df, market=market)
         library_latest_date = latest_daily_feature_date(config.daily_feature_library_path)
@@ -208,7 +232,7 @@ def screen(
             completed_bar_date is not None
             and library_latest_date < completed_bar_date
         )
-        if needs_library_refresh:
+        if needs_library_refresh and config.daily_history_cache_dir is not None:
             library_refresh = refresh_daily_feature_library_from_cache(
                 snapshot_df,
                 cache_dir=config.daily_history_cache_dir,
@@ -226,6 +250,146 @@ def screen(
                 f"appended={library_refresh.get('appended_count', 0)}, "
                 f"errors={library_refresh.get('error_count', 0)}"
             )
+            library_latest_date = latest_daily_feature_date(
+                config.daily_feature_library_path
+            )
+
+    effective_bar_date = completed_bar_date or library_latest_date
+    if completed_bar_date is None and library_latest_date is not None:
+        degradation.append(
+            "Premarket analysis date: using latest completed local daily bar "
+            f"{library_latest_date.isoformat()}"
+        )
+
+    full_market_feature_universe = pd.DataFrame()
+    full_market_library_diagnostics: dict[str, object] = {}
+    if (
+        market == "cn"
+        and effective_bar_date is not None
+        and config.daily_feature_library_enabled
+        and config.daily_feature_library_path is not None
+    ):
+        try:
+            full_market_feature_universe, full_market_library_diagnostics = (
+                merge_daily_feature_library(
+                    snapshot_df,
+                    library_path=config.daily_feature_library_path,
+                    max_age_days=config.daily_feature_library_max_age_days,
+                )
+            )
+            full_market_feature_universe = _attach_martin_cross_sectional_features(
+                full_market_feature_universe
+            )
+        except Exception as exc:  # Local overlays must not break stock selection.
+            degradation.append(f"Full-market local feature overlay failed: {exc}")
+            full_market_feature_universe = pd.DataFrame()
+
+    market_regime = unavailable_market_regime(
+        "市场状态调节未启用"
+        if not config.market_regime_enabled
+        else "尚未建立可用的全市场状态"
+    )
+    if market == "cn" and config.market_regime_enabled:
+        if (
+            config.daily_feature_library_enabled
+            and config.daily_feature_library_path is not None
+        ):
+            regime_policy = MarketRegimePolicy(
+                min_universe_size=config.market_regime_min_universe_size,
+                upgrade_confirmation_days=(
+                    config.market_regime_upgrade_confirmation_days
+                ),
+            )
+            regime_history_path = config.data_dir / "market_regime_history.json"
+            try:
+                if effective_bar_date is not None and not full_market_feature_universe.empty:
+                    market_regime = update_market_regime_history(
+                        full_market_feature_universe,
+                        history_path=regime_history_path,
+                        as_of=effective_bar_date,
+                        policy=regime_policy,
+                    )
+                    degradation.append(
+                        "Market regime technical coverage: "
+                        f"matched={full_market_library_diagnostics.get('matched_count', 0)} of "
+                        f"{len(full_market_feature_universe)}"
+                    )
+                else:
+                    market_regime = load_market_regime_history(
+                        regime_history_path,
+                        policy=regime_policy,
+                    )
+                degradation.append(
+                    "Market regime: "
+                    f"state={market_regime.get('state')}, "
+                    f"score={market_regime.get('score')}, "
+                    f"date={market_regime.get('date') or '--'}"
+                )
+            except Exception as exc:  # The overlay must not break stock selection.
+                market_regime = unavailable_market_regime(
+                    f"市场状态计算失败：{exc}"
+                )
+                degradation.append(str(market_regime["reason"]))
+        else:
+            market_regime = unavailable_market_regime(
+                "未启用本地日线指标库，无法计算多日市场状态"
+            )
+            degradation.append(str(market_regime["reason"]))
+
+    sector_snapshot = pd.DataFrame()
+    sector_overview = summarize_sector_strength_snapshot(sector_snapshot)
+    if market == "cn" and bool(execution_profile.get("sector_leadership_enabled", False)):
+        persisted_snapshot = pd.DataFrame()
+        if config.sector_strength_history_path is not None:
+            persisted_snapshot = select_sector_strength_snapshot(
+                load_sector_strength_history(config.sector_strength_history_path),
+                as_of=effective_bar_date,
+            )
+        effective_date_text = (
+            effective_bar_date.isoformat() if effective_bar_date is not None else ""
+        )
+        persisted_date = str(
+            persisted_snapshot.attrs.get("selected_as_of") or ""
+        )
+        if not persisted_snapshot.empty and persisted_date == effective_date_text:
+            sector_snapshot = persisted_snapshot
+            degradation.append(
+                "Sector strength contract: reused full-market point-in-time snapshot "
+                f"as_of={persisted_date}, sectors={len(sector_snapshot)}"
+            )
+        elif not full_market_feature_universe.empty:
+            sector_snapshot = compute_sector_strength_snapshot(
+                full_market_feature_universe,
+                as_of=effective_bar_date,
+                source="local_daily_feature_library",
+            )
+            degradation.append(
+                "Sector strength contract: computed from full-market local features "
+                f"as_of={effective_date_text or '--'}, sectors={len(sector_snapshot)}"
+            )
+            if (
+                effective_bar_date is not None
+                and config.sector_strength_history_path is not None
+                and not sector_snapshot.empty
+            ):
+                sector_update = upsert_sector_strength_history(
+                    sector_snapshot,
+                    full_market_feature_universe,
+                    path=config.sector_strength_history_path,
+                    as_of=effective_bar_date,
+                )
+                degradation.append(
+                    "Sector strength history updated: "
+                    f"rows={sector_update.get('updated_count', 0)}, "
+                    f"total={sector_update.get('record_count', 0)}"
+                )
+        elif not persisted_snapshot.empty:
+            sector_snapshot = persisted_snapshot
+            degradation.append(
+                "Sector strength contract: using latest prior point-in-time snapshot "
+                f"as_of={persisted_date or '--'}"
+            )
+        sector_overview = summarize_sector_strength_snapshot(sector_snapshot)
 
     # 3. L1 hard filter. If a strategy needs daily features, first apply only
     # snapshot-safe filters, then enrich a narrowed candidate pool.
@@ -280,6 +444,11 @@ def screen(
             daily_enriched=False,
             risk_enabled=config.risk_enabled,
             portfolio_diversity_enabled=config.portfolio_diversity_enabled,
+            market_regime=market_regime,
+            sector_overview=sector_overview,
+            analysis_date=(
+                effective_bar_date.isoformat() if effective_bar_date is not None else ""
+            ),
         )
 
     daily_enriched = False
@@ -339,6 +508,38 @@ def screen(
                 enriched,
                 universe=df,
             )
+            setup_mode = str(
+                execution_profile.get("entry_setup_mode") or "legacy_pullback"
+            )
+            if setup_mode == MULTI_SETUP_MODE:
+                enriched = attach_martin_entry_setups(
+                    enriched,
+                    mode=setup_mode,
+                    tradable_setup_types=execution_profile.get(
+                        "tradable_setup_types"
+                    ),
+                )
+            if bool(execution_profile.get("sector_leadership_enabled", False)):
+                if sector_snapshot.empty:
+                    sector_universe = _attach_martin_cross_sectional_features(df)
+                    sector_snapshot = compute_sector_strength_snapshot(
+                        sector_universe,
+                        as_of=effective_bar_date,
+                        source="screening_candidate_subset",
+                    )
+                    sector_overview = summarize_sector_strength_snapshot(
+                        sector_snapshot
+                    )
+                enriched = attach_sector_strength_features(
+                    enriched,
+                    sector_snapshot,
+                    unavailable_source="live_sector_unavailable",
+                )
+                degradation.append(
+                    "Sector strength contract: "
+                    f"available={len(sector_snapshot)} sectors, "
+                    f"as_of={effective_bar_date or '--'}"
+                )
             daily_enriched = True
             daily_errors = [str(item) for item in enriched.attrs.get("daily_errors", [])]
             daily_enrich_count = int(enriched.attrs.get("daily_success_count", len(enriched)))
@@ -371,8 +572,13 @@ def screen(
                 suffix = f" | +{len(daily_errors) - 5} more" if len(daily_errors) > 5 else ""
                 degradation.append(f"Daily K-line enrichment row errors: {sample}{suffix}")
             if daily_needed:
+                effective_filters = (
+                    common_martin_hard_filters(screening.hard_filters)
+                    if setup_mode == MULTI_SETUP_MODE
+                    else screening.hard_filters
+                )
                 if explain_filters:
-                    daily_waterfall = hard_filter_waterfall(enriched, screening.hard_filters)
+                    daily_waterfall = hard_filter_waterfall(enriched, effective_filters)
                     if daily_waterfall:
                         degradation.append(
                             "Daily hard-filter waterfall: "
@@ -380,10 +586,12 @@ def screen(
                         )
                 daily_filter_rejections = hard_filter_rejection_summary(
                     enriched,
-                    screening.hard_filters,
+                    effective_filters,
                     limit=6,
                 )
-                df = apply_hard_filters(enriched, screening.hard_filters)
+                df = apply_hard_filters(enriched, effective_filters)
+                if setup_mode == MULTI_SETUP_MODE and "setup_confirmed" in df.columns:
+                    df = df[df["setup_confirmed"] == True].copy()  # noqa: E712
                 after_filter_count = len(df)
                 if daily_filter_rejections:
                     degradation.append(
@@ -421,6 +629,11 @@ def screen(
             daily_enrich_count=daily_enrich_count,
             risk_enabled=config.risk_enabled,
             portfolio_diversity_enabled=config.portfolio_diversity_enabled,
+            market_regime=market_regime,
+            sector_overview=sector_overview,
+            analysis_date=(
+                effective_bar_date.isoformat() if effective_bar_date is not None else ""
+            ),
         )
 
     # 4. Compute screen_score
@@ -647,13 +860,11 @@ def screen(
     else:
         picks = selection_variant.picks
     for pick in picks:
-        pick.trade_plan = build_martin_trade_plan(
-            price=pick.price,
-            trigger_distance_pct=pick.trigger_distance_pct,
-            adr_20_pct=pick.adr_20_pct,
-            ema21=pick.ema21,
-            atr_20_pct=pick.atr_20_pct,
-            anchored_vwap=pick.anchored_vwap_60d_high,
+        pick.trade_plan = _build_market_aware_trade_plan(
+            pick,
+            market_regime=market_regime,
+            enabled=config.market_regime_enabled,
+            execution_profile=screening.execution_profile,
         )
     _emit_progress(progress_callback, 88, "选股核心流程完成")
 
@@ -696,6 +907,11 @@ def screen(
         result_variant_applied=selection_variant.applied,
         result_variant_pool_size=selection_variant.pool_size,
         result_variant_rotated_slots=selection_variant.rotated_slots,
+        market_regime=market_regime,
+        sector_overview=sector_overview,
+        analysis_date=(
+            effective_bar_date.isoformat() if effective_bar_date is not None else ""
+        ),
     )
 
 
@@ -773,6 +989,22 @@ def _df_to_picks(df: pd.DataFrame) -> list[Pick]:
             one_word_limit_up=_safe_bool(row.get("one_word_limit_up")),
             avg_amount_20d=_safe_float(row.get("avg_amount_20d")),
             sector_breadth_count=_safe_int(row.get("sector_breadth_count")),
+            sector_strength_score=_safe_float(row.get("sector_strength_score")),
+            sector_strength_rank=_safe_int(row.get("sector_strength_rank")),
+            sector_member_count=_safe_int(row.get("sector_member_count")),
+            sector_breadth_ratio=_safe_float(row.get("sector_breadth_ratio")),
+            sector_leader_count=_safe_int(row.get("sector_leader_count")),
+            sector_high_adr_leader_count=_safe_int(row.get("sector_high_adr_leader_count")),
+            sector_trend_state=_safe_text(row.get("sector_trend_state")),
+            sector_leadership_priority=_safe_bool(row.get("sector_leadership_priority")),
+            sector_data_status=_safe_text(row.get("sector_data_status")),
+            sector_data_source=_safe_text(row.get("sector_data_source")),
+            sector_data_as_of=_safe_text(row.get("sector_data_as_of")),
+            setup_type=_safe_text(row.get("setup_type")),
+            setup_trigger_price=_safe_float(row.get("setup_trigger_price")),
+            setup_confirmed=_safe_bool(row.get("setup_confirmed")),
+            setup_trade_eligible=_safe_bool(row.get("setup_trade_eligible")),
+            setup_execution_status=_safe_text(row.get("setup_execution_status")),
             signal_score=_safe_float(row.get("signal_score")),
             ma_bullish=_safe_bool(row.get("ma_bullish")),
             price_above_ma20=_safe_bool(row.get("price_above_ma20")),
@@ -793,6 +1025,200 @@ def _df_to_picks(df: pd.DataFrame) -> list[Pick]:
             factor_scores=factor_scores,
         ))
     return picks
+
+
+def _build_market_aware_trade_plan(
+    pick: Pick,
+    *,
+    market_regime: dict[str, object],
+    enabled: bool,
+    execution_profile: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Build one trade plan with market-state limits applied to new entries."""
+    profile = execution_profile or {}
+    base = MartinTradePlanConfig(
+        pyramiding_enabled=bool(profile.get("pyramiding_enabled", False)),
+        adaptive_exit_enabled=bool(profile.get("adaptive_exit_enabled", False)),
+        initial_position_weight_pct=float(
+            profile.get("initial_position_weight_pct", 20.0)
+        ),
+        add_on_position_weight_pct=float(
+            profile.get("add_on_position_weight_pct", 5.0)
+        ),
+        max_add_ons=int(profile.get("max_add_ons", 0)),
+        first_add_on_r_multiple=float(profile.get("first_add_on_r_multiple", 1.0)),
+        second_add_on_r_multiple=float(profile.get("second_add_on_r_multiple", 2.0)),
+        first_partial_r_multiple=float(
+            profile.get("first_partial_r_multiple", 3.0)
+        ),
+        second_partial_r_multiple=float(
+            profile.get("second_partial_r_multiple", 5.0)
+        ),
+        partial_exit_fraction=float(profile.get("partial_exit_fraction", 0.20)),
+        adaptive_trailing_drawdown_pct=float(
+            profile.get("adaptive_trailing_drawdown_pct", 6.0)
+        ),
+        mature_trailing_drawdown_pct=float(
+            profile.get("mature_trailing_drawdown_pct", 5.0)
+        ),
+        adaptive_exit_model=str(
+            profile.get("adaptive_exit_model", "legacy_tightening")
+        ),
+        developing_exit_activation_r=float(
+            profile.get("developing_exit_activation_r", 1.0)
+        ),
+        developing_trailing_adr_multiple=float(
+            profile.get("developing_trailing_adr_multiple", 1.0)
+        ),
+        developing_trailing_min_pct=float(
+            profile.get("developing_trailing_min_pct", 5.0)
+        ),
+        developing_trailing_max_pct=float(
+            profile.get("developing_trailing_max_pct", 8.0)
+        ),
+        established_trailing_adr_multiple=float(
+            profile.get("established_trailing_adr_multiple", 1.5)
+        ),
+        established_trailing_min_pct=float(
+            profile.get("established_trailing_min_pct", 7.0)
+        ),
+        established_trailing_max_pct=float(
+            profile.get("established_trailing_max_pct", 12.0)
+        ),
+        mature_trailing_adr_multiple=float(
+            profile.get("mature_trailing_adr_multiple", 1.75)
+        ),
+        mature_trailing_min_pct=float(
+            profile.get("mature_trailing_min_pct", 9.0)
+        ),
+        mature_trailing_max_pct=float(
+            profile.get("mature_trailing_max_pct", 15.0)
+        ),
+        established_profit_floor_r=float(
+            profile.get("established_profit_floor_r", 1.0)
+        ),
+        mature_profit_floor_r=float(profile.get("mature_profit_floor_r", 2.5)),
+        first_partial_exit_fraction=float(
+            profile.get("first_partial_exit_fraction", 0.0)
+        ),
+        second_partial_exit_fraction=float(
+            profile.get("second_partial_exit_fraction", 0.15)
+        ),
+        partial_exit_requires_exhaustion=bool(
+            profile.get("partial_exit_requires_exhaustion", True)
+        ),
+        ema9_confirmation_days=int(profile.get("ema9_confirmation_days", 2)),
+        risk_off_ema9_confirmation_days=int(
+            profile.get("risk_off_ema9_confirmation_days", 1)
+        ),
+        min_position_weight_pct=(
+            8.0 if bool(profile.get("pyramiding_enabled", False)) else 12.0
+        ),
+    )
+    limits = resolve_market_regime_limits(
+        market_regime if enabled else unavailable_market_regime("市场状态调节已关闭"),
+        base_max_positions=5,
+        base_risk_per_trade_pct=base.max_portfolio_risk_per_trade_pct,
+        base_max_portfolio_heat_pct=base.max_portfolio_heat_pct,
+        base_max_position_weight_pct=base.max_position_weight_pct,
+        base_min_position_weight_pct=base.min_position_weight_pct,
+    )
+    plan_rules = base
+    if limits["new_entries_allowed"]:
+        plan_rules = MartinTradePlanConfig(
+            max_portfolio_risk_per_trade_pct=float(limits["risk_per_trade_pct"]),
+            max_portfolio_heat_pct=float(limits["max_portfolio_heat_pct"]),
+            max_position_weight_pct=float(limits["max_position_weight_pct"]),
+            min_position_weight_pct=float(limits["min_position_weight_pct"]),
+            pyramiding_enabled=base.pyramiding_enabled,
+            adaptive_exit_enabled=base.adaptive_exit_enabled,
+            initial_position_weight_pct=base.initial_position_weight_pct,
+            add_on_position_weight_pct=base.add_on_position_weight_pct,
+            max_add_ons=base.max_add_ons,
+            first_add_on_r_multiple=base.first_add_on_r_multiple,
+            second_add_on_r_multiple=base.second_add_on_r_multiple,
+            first_partial_r_multiple=base.first_partial_r_multiple,
+            second_partial_r_multiple=base.second_partial_r_multiple,
+            partial_exit_fraction=base.partial_exit_fraction,
+            adaptive_trailing_drawdown_pct=base.adaptive_trailing_drawdown_pct,
+            mature_trailing_drawdown_pct=base.mature_trailing_drawdown_pct,
+            adaptive_exit_model=base.adaptive_exit_model,
+            developing_exit_activation_r=base.developing_exit_activation_r,
+            developing_trailing_adr_multiple=base.developing_trailing_adr_multiple,
+            developing_trailing_min_pct=base.developing_trailing_min_pct,
+            developing_trailing_max_pct=base.developing_trailing_max_pct,
+            established_trailing_adr_multiple=base.established_trailing_adr_multiple,
+            established_trailing_min_pct=base.established_trailing_min_pct,
+            established_trailing_max_pct=base.established_trailing_max_pct,
+            mature_trailing_adr_multiple=base.mature_trailing_adr_multiple,
+            mature_trailing_min_pct=base.mature_trailing_min_pct,
+            mature_trailing_max_pct=base.mature_trailing_max_pct,
+            established_profit_floor_r=base.established_profit_floor_r,
+            mature_profit_floor_r=base.mature_profit_floor_r,
+            first_partial_exit_fraction=base.first_partial_exit_fraction,
+            second_partial_exit_fraction=base.second_partial_exit_fraction,
+            partial_exit_requires_exhaustion=(
+                base.partial_exit_requires_exhaustion
+            ),
+            ema9_confirmation_days=base.ema9_confirmation_days,
+            risk_off_ema9_confirmation_days=(
+                base.risk_off_ema9_confirmation_days
+            ),
+        )
+    plan = build_martin_trade_plan(
+        price=pick.price,
+        trigger_distance_pct=pick.trigger_distance_pct,
+        adr_20_pct=pick.adr_20_pct,
+        ema21=pick.ema21,
+        atr_20_pct=pick.atr_20_pct,
+        anchored_vwap=pick.anchored_vwap_60d_high,
+        config=plan_rules,
+    )
+    plan["market_regime"] = {
+        "enabled": enabled,
+        "date": market_regime.get("date"),
+        "state": market_regime.get("state"),
+        "score": market_regime.get("score"),
+        "reason": market_regime.get("reason"),
+    }
+    plan["portfolio_limits"] = {
+        key: value for key, value in limits.items() if key != "profile"
+    }
+    plan["setup_permission"] = {
+        "setup_type": pick.setup_type,
+        "confirmed": pick.setup_confirmed,
+        "trade_eligible": pick.setup_trade_eligible,
+        "status": pick.setup_execution_status,
+    }
+    if pick.setup_confirmed is True and pick.setup_trade_eligible is False:
+        plan["signal_status"] = "watch_only_setup"
+        plan["action"] = "no_order"
+        plan["setup_watch_reason"] = (
+            f"{pick.setup_type or '当前形态'} 已完成识别，但当前策略版本仅允许"
+            "首次回踩形态进入交易；本候选保留观察，不设置买入条件单。"
+        )
+        condition_orders = plan.get("condition_orders")
+        if isinstance(condition_orders, dict):
+            entry_order = condition_orders.get("entry")
+            if isinstance(entry_order, dict):
+                entry_order["status"] = "not_armed"
+    if (
+        enabled
+        and str(market_regime.get("state") or "") == REGIME_RISK_OFF
+        and plan.get("signal_status") == "buy_signal"
+    ):
+        plan["signal_status"] = "market_blocked"
+        plan["action"] = "no_order"
+        plan["market_block_reason"] = (
+            str(market_regime.get("reason") or "")
+            or "多日市场状态处于风险关闭，暂停新开仓。"
+        )
+        condition_orders = plan.get("condition_orders")
+        if isinstance(condition_orders, dict):
+            entry_order = condition_orders.get("entry")
+            if isinstance(entry_order, dict):
+                entry_order["status"] = "not_armed"
+    return plan
 
 
 def _sort_screened_candidates(df: pd.DataFrame, screening=None) -> pd.DataFrame:
@@ -816,7 +1242,12 @@ def _sort_screened_candidates(df: pd.DataFrame, screening=None) -> pd.DataFrame:
         ]
     sort_columns = [
         column
-        for column in ["screen_score"] + [f"factor_{factor}_score" for factor in factor_order]
+        for column in [
+            "setup_trade_eligible",
+            "sector_leadership_priority",
+            "sector_strength_score",
+            "screen_score",
+        ] + [f"factor_{factor}_score" for factor in factor_order]
         if column in df.columns
     ]
     ascending = [False] * len(sort_columns)

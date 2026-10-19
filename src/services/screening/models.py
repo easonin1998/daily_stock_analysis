@@ -87,6 +87,7 @@ class ScreeningConfig:
     portfolio_profile: dict[str, Any] = field(default_factory=dict)
     scorecard_profile: dict[str, Any] = field(default_factory=dict)
     event_profile: dict[str, Any] = field(default_factory=dict)
+    execution_profile: dict[str, Any] = field(default_factory=dict)
     ranking_hints: str = ""
     max_output: int = 5
 
@@ -192,6 +193,22 @@ class Pick:
     one_word_limit_up: bool | None = None
     avg_amount_20d: float | None = None
     sector_breadth_count: int | None = None
+    sector_strength_score: float | None = None
+    sector_strength_rank: int | None = None
+    sector_member_count: int | None = None
+    sector_breadth_ratio: float | None = None
+    sector_leader_count: int | None = None
+    sector_high_adr_leader_count: int | None = None
+    sector_trend_state: str = ""
+    sector_leadership_priority: bool | None = None
+    sector_data_status: str = ""
+    sector_data_source: str = ""
+    sector_data_as_of: str = ""
+    setup_type: str = ""
+    setup_trigger_price: float | None = None
+    setup_confirmed: bool | None = None
+    setup_trade_eligible: bool | None = None
+    setup_execution_status: str = ""
     signal_score: float | None = None
     ma_bullish: bool | None = None
     price_above_ma20: bool | None = None
@@ -288,6 +305,9 @@ class ScreenResult:
     result_variant_applied: bool = False
     result_variant_pool_size: int = 0
     result_variant_rotated_slots: int = 0
+    market_regime: dict[str, Any] = field(default_factory=dict)
+    sector_overview: dict[str, Any] = field(default_factory=dict)
+    analysis_date: str = ""
     saved_path: str = ""
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
 

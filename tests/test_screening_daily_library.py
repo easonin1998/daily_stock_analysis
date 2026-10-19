@@ -12,6 +12,7 @@ from src.services.screening import daily as daily_module
 from src.services.screening.daily import (
     fetch_daily_history,
     load_cached_daily_history,
+    load_cached_daily_history_for_period,
     save_cached_daily_history,
 )
 from src.services.screening.daily_library import (
@@ -167,6 +168,79 @@ def test_cache_loader_reuses_a_longer_compatible_window(tmp_path) -> None:
     assert cached is not None
     assert len(cached) == len(history)
     assert cached.attrs["daily_cache_compatible_fallback"] is True
+
+
+def test_period_cache_loader_accepts_shorter_key_when_dates_prove_coverage(
+    tmp_path,
+) -> None:
+    cache_dir = tmp_path / "daily"
+    history = _history(periods=180)
+    history["date"] = pd.date_range("2025-07-01", periods=180, freq="D")
+    history.attrs["daily_source"] = "tencent"
+    save_cached_daily_history(
+        "000001",
+        history,
+        source="auto",
+        lookback_days=180,
+        cache_dir=cache_dir,
+    )
+
+    cached = load_cached_daily_history_for_period(
+        "000001",
+        source="auto",
+        requested_lookback_days=220,
+        cache_dir=cache_dir,
+        start_date=date(2025, 11, 15),
+        required_end_date=date(2025, 12, 20),
+        minimum_pre_start_rows=120,
+        price_adjustment="qfq",
+    )
+
+    assert cached is not None
+    assert cached.attrs["daily_cache_period_coverage_fallback"] is True
+    assert cached.attrs["daily_cache_stored_lookback_days"] == 180
+    assert cached.attrs["daily_cache_pre_start_rows"] == 137
+
+
+def test_period_cache_loader_prefers_real_pre_start_coverage_over_window_key(
+    tmp_path,
+) -> None:
+    cache_dir = tmp_path / "daily"
+    truncated = _history(periods=140)
+    truncated["date"] = pd.date_range("2025-09-01", periods=140, freq="D")
+    truncated.attrs["daily_source"] = "tencent"
+    save_cached_daily_history(
+        "000001",
+        truncated,
+        source="auto",
+        lookback_days=220,
+        cache_dir=cache_dir,
+    )
+    covered = _history(periods=180)
+    covered["date"] = pd.date_range("2025-07-01", periods=180, freq="D")
+    covered.attrs["daily_source"] = "tencent"
+    save_cached_daily_history(
+        "000001",
+        covered,
+        source="auto",
+        lookback_days=180,
+        cache_dir=cache_dir,
+    )
+
+    cached = load_cached_daily_history_for_period(
+        "000001",
+        source="auto",
+        requested_lookback_days=220,
+        cache_dir=cache_dir,
+        start_date=date(2025, 11, 15),
+        required_end_date=date(2025, 12, 20),
+        minimum_pre_start_rows=120,
+        price_adjustment="qfq",
+    )
+
+    assert cached is not None
+    assert cached.attrs["daily_cache_stored_lookback_days"] == 180
+    assert cached.attrs["daily_cache_pre_start_rows"] == 137
 
 
 def test_cache_loader_rejects_unadjusted_history_for_qfq_research(tmp_path) -> None:

@@ -88,11 +88,15 @@ def _relative_strength_score(df: pd.DataFrame) -> pd.Series:
 
 
 def _sector_resonance_score(df: pd.DataFrame) -> pd.Series:
+    normalized = _numeric(df, "sector_strength_score")
     heat = _numeric(df, "board_heat_score")
     breadth = _rank_score(_numeric(df, "sector_breadth_count"), neutral=50.0)
-    if heat.notna().any():
-        return (heat.fillna(50.0).clip(0, 100) * 0.65 + breadth * 0.35).clip(0, 100)
-    return breadth
+    legacy = (
+        (heat.fillna(50.0).clip(0, 100) * 0.65 + breadth * 0.35).clip(0, 100)
+        if heat.notna().any()
+        else breadth
+    )
+    return normalized.where(normalized.notna(), legacy).fillna(50.0).clip(0, 100)
 
 
 def _contraction_score(df: pd.DataFrame) -> pd.Series:

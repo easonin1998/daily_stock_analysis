@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import hashlib
 import json
 import os
@@ -16,6 +16,7 @@ import time
 from typing import Callable
 
 import pandas as pd
+from pandas.api.types import is_bool_dtype
 import requests
 
 from src.services.screening.source_guard import call_with_timeout, parse_source_timeout_seconds
@@ -41,6 +42,10 @@ _DAILY_FEATURE_DEFAULTS = {
     "trigger_distance_pct": pd.NA,
     "trigger_close_location_pct": pd.NA,
     "trigger_volume_vs_previous": pd.NA,
+    "previous_5d_high": pd.NA,
+    "previous_20d_high": pd.NA,
+    "previous_5d_range_pct": pd.NA,
+    "previous_10d_range_pct": pd.NA,
     "one_word_limit_up": pd.NA,
     "avg_amount_20d": pd.NA,
     "ma5": pd.NA,
@@ -68,6 +73,14 @@ _DAILY_FEATURE_DEFAULTS = {
     "daily_price_adjustment": "",
 }
 DAILY_FEATURE_COLUMNS = tuple(_DAILY_FEATURE_DEFAULTS)
+_DAILY_BOOLEAN_FEATURE_COLUMNS = (
+    "ema_stack_bullish",
+    "ema21_rising",
+    "ema50_rising",
+    "one_word_limit_up",
+    "ma_bullish",
+    "price_above_ma20",
+)
 _DAILY_ENRICH_MAX_WORKERS = 1
 _DAILY_HISTORY_CACHE_VERSION = 1
 _DAILY_HISTORY_CACHE_TTL_SECONDS = 24 * 60 * 60
@@ -105,6 +118,12 @@ def enrich_daily_features(
         return df.copy()
 
     result = df.copy()
+    # A live refresh can fail for one row and legitimately return pd.NA. Keep
+    # precomputed boolean library columns nullable so that a partial source
+    # failure is recorded instead of aborting the entire screening run.
+    for column in _DAILY_BOOLEAN_FEATURE_COLUMNS:
+        if column in result.columns and is_bool_dtype(result[column].dtype):
+            result[column] = result[column].astype("boolean")
     daily_errors: list[str] = []
     daily_source_counts: dict[str, int] = {}
     daily_quality_flag_counts: dict[str, int] = {}
@@ -388,6 +407,63 @@ def load_cached_daily_history(
     return None
 
 
+def load_cached_daily_history_for_period(
+    code: str,
+    *,
+    source: str,
+    requested_lookback_days: int,
+    cache_dir: str | Path,
+    start_date: date,
+    required_end_date: date,
+    minimum_pre_start_rows: int = 120,
+    price_adjustment: str | None = None,
+) -> pd.DataFrame | None:
+    """Select the cache with the strongest actual coverage for a period."""
+    normalized_code = _normalize_daily_code(code)
+    normalized_source = _normalize_daily_source(source)
+    required_adjustment = _normalize_price_adjustment(price_adjustment)
+    candidates = _list_daily_history_cache_candidates(
+        cache_dir,
+        code=normalized_code,
+        source=normalized_source,
+    )
+    covered: list[tuple[tuple[int, int, int, int], pd.DataFrame]] = []
+    for stored_lookback_days, path in sorted(
+        candidates,
+        key=lambda item: item[0],
+        reverse=True,
+    ):
+        cached = _read_daily_history_cache(
+            path,
+            ttl_seconds=None,
+            allow_stale=True,
+        )
+        if cached is None or cached.empty:
+            continue
+        if not _matches_price_adjustment(cached, required_adjustment):
+            continue
+        dates = pd.to_datetime(cached.get("date"), errors="coerce").dropna()
+        if dates.empty or dates.max().date() < required_end_date:
+            continue
+        pre_start_rows = int((dates.dt.date < start_date).sum())
+        cached.attrs["daily_cache_period_coverage_fallback"] = True
+        cached.attrs["daily_cache_requested_lookback_days"] = int(
+            requested_lookback_days
+        )
+        cached.attrs["daily_cache_stored_lookback_days"] = stored_lookback_days
+        cached.attrs["daily_cache_pre_start_rows"] = pre_start_rows
+        score = (
+            int(pre_start_rows >= int(minimum_pre_start_rows)),
+            pre_start_rows,
+            len(dates),
+            stored_lookback_days,
+        )
+        covered.append((score, cached))
+    if not covered:
+        return None
+    return max(covered, key=lambda item: item[0])[1]
+
+
 def save_cached_daily_history(
     code: str,
     history: pd.DataFrame,
@@ -606,25 +682,37 @@ def _find_compatible_daily_history_cache(
     minimum_lookback_days: int,
 ) -> Path | None:
     """Return the smallest cache whose requested window covers this request."""
-    safe_source = "".join(ch if ch.isalnum() else "-" for ch in source).strip("-") or "source"
-    safe_code = "".join(ch if ch.isalnum() else "-" for ch in code).strip("-") or "code"
-    candidates: list[tuple[int, Path]] = []
-    for path in Path(cache_dir).glob(f"{safe_code}_{safe_source}_*.json"):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            key = payload.get("key") if isinstance(payload, dict) else None
-            if not isinstance(key, dict):
-                continue
-            if str(key.get("code")) != code or str(key.get("source")) != source:
-                continue
-            candidate_lookback = int(key.get("lookback_days"))
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
-            continue
-        if candidate_lookback >= minimum_lookback_days:
-            candidates.append((candidate_lookback, path))
+    candidates = [
+        (candidate_lookback, path)
+        for candidate_lookback, path in _list_daily_history_cache_candidates(
+            cache_dir,
+            code=code,
+            source=source,
+        )
+        if candidate_lookback >= minimum_lookback_days
+    ]
     if not candidates:
         return None
     return min(candidates, key=lambda item: item[0])[1]
+
+
+def _list_daily_history_cache_candidates(
+    cache_dir: str | Path,
+    *,
+    code: str,
+    source: str,
+) -> list[tuple[int, Path]]:
+    safe_source = "".join(ch if ch.isalnum() else "-" for ch in source).strip("-") or "source"
+    safe_code = "".join(ch if ch.isalnum() else "-" for ch in code).strip("-") or "code"
+    prefix = f"{safe_code}_{safe_source}_"
+    candidates: list[tuple[int, Path]] = []
+    for path in Path(cache_dir).glob(f"{safe_code}_{safe_source}_*.json"):
+        try:
+            candidate_lookback = int(path.stem.removeprefix(prefix).split("_", 1)[0])
+        except (IndexError, TypeError, ValueError):
+            continue
+        candidates.append((candidate_lookback, path))
+    return candidates
 
 
 def _read_daily_history_cache(
@@ -1245,6 +1333,15 @@ def _compute_martin_features(
     )
 
     previous_high = float(high.iloc[-2]) if len(high) >= 2 and pd.notna(high.iloc[-2]) else None
+    prior_high = high.iloc[:-1]
+    prior_low = low.iloc[:-1]
+    previous_5d_high = _series_max(prior_high.tail(5))
+    previous_20d_high = _series_max(prior_high.tail(20))
+    previous_5d_low = _series_minimum(prior_low.tail(5))
+    previous_10d_high = _series_max(prior_high.tail(10))
+    previous_10d_low = _series_minimum(prior_low.tail(10))
+    previous_5d_range_pct = _level_range_pct(previous_5d_high, previous_5d_low)
+    previous_10d_range_pct = _level_range_pct(previous_10d_high, previous_10d_low)
     trigger_distance_pct = (
         (last_close / previous_high - 1.0) * 100
         if previous_high is not None and previous_high > 0
@@ -1298,6 +1395,10 @@ def _compute_martin_features(
         "trigger_distance_pct": _round_or_none(trigger_distance_pct),
         "trigger_close_location_pct": _round_or_none(trigger_close_location_pct),
         "trigger_volume_vs_previous": _round_or_none(trigger_volume_vs_previous),
+        "previous_5d_high": _round_or_none(previous_5d_high),
+        "previous_20d_high": _round_or_none(previous_20d_high),
+        "previous_5d_range_pct": _round_or_none(previous_5d_range_pct),
+        "previous_10d_range_pct": _round_or_none(previous_10d_range_pct),
         "one_word_limit_up": one_word_limit_up,
         "avg_amount_20d": _round_or_none(avg_amount_20d),
     }
@@ -1319,6 +1420,17 @@ def _safe_ratio(numerator: float | None, denominator: float | None) -> float | N
     if numerator is None or denominator is None or denominator <= 0:
         return None
     return numerator / denominator
+
+
+def _series_minimum(series: pd.Series) -> float | None:
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    return float(values.min()) if not values.empty else None
+
+
+def _level_range_pct(high: float | None, low: float | None) -> float | None:
+    if high is None or low is None or low <= 0:
+        return None
+    return (high / low - 1.0) * 100.0
 
 
 def _anchored_vwap_from_60d_high(df: pd.DataFrame) -> float | None:

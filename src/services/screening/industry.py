@@ -20,7 +20,7 @@ from src.services.screening.normalize import (
 )
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_AKSHARE_BOARD_CACHE_SCHEMA = "v1"
+_AKSHARE_BOARD_CACHE_SCHEMA = "v2"
 _BAOSTOCK_INDUSTRY_CACHE_SCHEMA = "v1"
 _CACHE_DIR_UNSET = object()
 _NUMERIC_FIELDS = (
@@ -34,6 +34,8 @@ _NUMERIC_FIELDS = (
     "board_heat_persistence_score",
     "board_heat_cooling_score",
     "board_heat_observations",
+    "board_fund_flow_score",
+    "board_fund_flow_net_amount",
 )
 _TEXT_FIELDS = ("board_heat_summary", "board_heat_state")
 _HEAT_FIELDS = (*_NUMERIC_FIELDS, *_TEXT_FIELDS)
@@ -61,6 +63,7 @@ def enrich_industry_concepts(
     max_boards: int = 80,
     provider_cache_dir: str | Path | None | object = _CACHE_DIR_UNSET,
     provider_cache_ttl_hours: float | None = None,
+    include_fund_flow: bool = False,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Attach industry/concepts columns from stable files and optional providers."""
     result = df.copy()
@@ -91,21 +94,52 @@ def enrich_industry_concepts(
             notes.append(trend_note)
 
     if provider and provider.lower() not in {"", "none", "off", "false"}:
-        if provider.lower() == "akshare":
+        provider_name = provider.lower()
+        if provider_name == "akshare":
             provider_mapping, provider_notes = fetch_akshare_board_map(
                 max_boards=max_boards,
                 cache_dir=provider_cache_dir,
                 cache_ttl_hours=provider_cache_ttl_hours,
+                include_fund_flow=include_fund_flow,
             )
             _merge_mapping(mapping, provider_mapping)
             notes.extend(provider_notes)
-        elif provider.lower() == "baostock":
+        elif provider_name == "baostock":
             provider_mapping, provider_notes = fetch_baostock_industry_map(
                 cache_dir=provider_cache_dir,
                 cache_ttl_hours=provider_cache_ttl_hours,
             )
             _merge_mapping(mapping, provider_mapping)
             notes.extend(provider_notes)
+        elif provider_name in {"free", "auto", "akshare_baostock"}:
+            stable_mapping, stable_notes = fetch_baostock_industry_map(
+                cache_dir=provider_cache_dir,
+                cache_ttl_hours=provider_cache_ttl_hours,
+            )
+            _merge_mapping(mapping, stable_mapping)
+            notes.extend(stable_notes)
+            heat_mapping, heat_notes = fetch_akshare_board_map(
+                max_boards=max_boards,
+                cache_dir=provider_cache_dir,
+                cache_ttl_hours=provider_cache_ttl_hours,
+                include_fund_flow=include_fund_flow,
+            )
+            _merge_mapping(mapping, heat_mapping)
+            notes.extend(heat_notes)
+        elif provider_name in {"free_cached", "cached_free"}:
+            stable_mapping, stable_notes = load_cached_baostock_industry_map(
+                cache_dir=provider_cache_dir,
+            )
+            _merge_mapping(mapping, stable_mapping)
+            notes.extend(stable_notes)
+            heat_mapping, heat_notes = load_cached_akshare_board_map(
+                max_boards=max_boards,
+                cache_dir=provider_cache_dir,
+                cache_ttl_hours=provider_cache_ttl_hours,
+                include_fund_flow=include_fund_flow,
+            )
+            _merge_mapping(mapping, heat_mapping)
+            notes.extend(heat_notes)
         else:
             notes.append(f"industry provider skipped: unsupported provider={provider}")
 
@@ -188,6 +222,7 @@ def fetch_akshare_board_map(
     cache_dir: str | Path | None | object = _CACHE_DIR_UNSET,
     cache_ttl_seconds: float | None = None,
     cache_ttl_hours: float | None = None,
+    include_fund_flow: bool = False,
 ) -> tuple[dict[str, dict[str, object]], list[str]]:
     """Build a code mapping from AkShare industry/concept board constituents.
 
@@ -198,7 +233,11 @@ def fetch_akshare_board_map(
     notes: list[str] = []
     resolved_cache_dir = _resolve_akshare_board_cache_dir(cache_dir)
     cache_path = (
-        _akshare_board_cache_path(resolved_cache_dir, max_boards=board_limit)
+        _akshare_board_cache_path(
+            resolved_cache_dir,
+            max_boards=board_limit,
+            include_fund_flow=include_fund_flow,
+        )
         if resolved_cache_dir is not None
         else None
     )
@@ -206,6 +245,7 @@ def fetch_akshare_board_map(
         cached_mapping, cache_note = _read_akshare_board_cache(
             cache_path,
             max_boards=board_limit,
+            include_fund_flow=include_fund_flow,
             ttl_seconds=_resolve_cache_ttl_seconds(
                 cache_ttl_seconds=cache_ttl_seconds,
                 cache_ttl_hours=cache_ttl_hours,
@@ -219,6 +259,7 @@ def fetch_akshare_board_map(
     import akshare as ak
 
     mapping: dict[str, dict[str, object]] = {}
+    flow_maps = _fetch_akshare_board_fund_flow(ak, notes) if include_fund_flow else {}
     board_specs = [
         ("industry", ak.stock_board_industry_name_em, ak.stock_board_industry_cons_em),
         ("concepts", ak.stock_board_concept_name_em, ak.stock_board_concept_cons_em),
@@ -247,6 +288,7 @@ def fetch_akshare_board_map(
                 change_pct=_safe_float(board_item.get("change_pct")),
                 rank=_safe_float(board_item.get("rank")),
             )
+            flow_item = flow_maps.get(field, {}).get(board, {})
             for _, row in members.iterrows():
                 code = _normalize_code(row.get("代码") or row.get("code"))
                 if not code or code == "000000":
@@ -263,14 +305,40 @@ def fetch_akshare_board_map(
                     item["concepts"] = _merge_label_text(item.get("concepts", ""), board)
                     item["concept_heat_score"] = _max_numeric(item.get("concept_heat_score"), heat_score)
                 item["board_heat_score"] = _max_numeric(item.get("board_heat_score"), heat_score)
+                flow_score = _safe_float(flow_item.get("score"))
+                flow_amount = _safe_float(flow_item.get("net_amount"))
+                if flow_score is not None:
+                    item["board_fund_flow_score"] = _max_numeric(
+                        item.get("board_fund_flow_score"),
+                        flow_score,
+                    )
+                if flow_amount is not None:
+                    current_amount = _safe_float(item.get("board_fund_flow_net_amount"))
+                    if current_amount is None or abs(flow_amount) > abs(current_amount):
+                        item["board_fund_flow_net_amount"] = flow_amount
                 item["board_heat_summary"] = _merge_summary_text(
                     _safe_text(item.get("board_heat_summary")),
                     heat_summary,
                 )
             loaded += 1
         notes.append(f"akshare {field} boards loaded: {loaded}/{len(board_items)}")
+    if not mapping and cache_path is not None:
+        stale_mapping, stale_note = _read_akshare_board_cache(
+            cache_path,
+            max_boards=board_limit,
+            include_fund_flow=include_fund_flow,
+            ttl_seconds=float("inf"),
+        )
+        if stale_mapping is not None:
+            notes.append(stale_note.replace("cache hit", "stale cache fallback"))
+            return stale_mapping, notes
     if cache_path is not None and mapping:
-        cache_note = _write_akshare_board_cache(cache_path, mapping, max_boards=board_limit)
+        cache_note = _write_akshare_board_cache(
+            cache_path,
+            mapping,
+            max_boards=board_limit,
+            include_fund_flow=include_fund_flow,
+        )
         if cache_note:
             notes.append(cache_note)
     return mapping, notes
@@ -318,6 +386,16 @@ def fetch_baostock_industry_map(
         notes.append(f"baostock industry rows loaded: {len(mapping)}")
     except Exception as exc:
         notes.append(f"baostock industry provider failed: {exc}")
+        if cache_path is not None:
+            stale, stale_note = _read_simple_provider_cache(
+                cache_path,
+                provider="baostock",
+                schema=_BAOSTOCK_INDUSTRY_CACHE_SCHEMA,
+                ttl_seconds=float("inf"),
+            )
+            if stale is not None:
+                notes.append(stale_note.replace("cache hit", "stale cache fallback"))
+                return stale, notes
         return {}, notes
 
     if cache_path is not None and mapping:
@@ -330,6 +408,58 @@ def fetch_baostock_industry_map(
             )
         )
     return mapping, notes
+
+
+def load_cached_akshare_board_map(
+    *,
+    max_boards: int = 80,
+    cache_dir: str | Path | None | object = _CACHE_DIR_UNSET,
+    cache_ttl_hours: float | None = None,
+    include_fund_flow: bool = False,
+) -> tuple[dict[str, dict[str, object]], list[str]]:
+    """Read the optional AkShare overlay without issuing network requests."""
+    resolved_cache_dir = _resolve_akshare_board_cache_dir(cache_dir)
+    if resolved_cache_dir is None:
+        return {}, ["akshare cached overlay skipped: cache disabled"]
+    path = _akshare_board_cache_path(
+        resolved_cache_dir,
+        max_boards=max(int(max_boards), 1),
+        include_fund_flow=include_fund_flow,
+    )
+    mapping, note = _read_akshare_board_cache(
+        path,
+        max_boards=max(int(max_boards), 1),
+        include_fund_flow=include_fund_flow,
+        ttl_seconds=_resolve_cache_ttl_seconds(
+            cache_ttl_seconds=None,
+            cache_ttl_hours=cache_ttl_hours,
+        ),
+    )
+    if mapping is None:
+        return {}, [note or f"akshare cached overlay missing: {path}"]
+    return mapping, [note]
+
+
+def load_cached_baostock_industry_map(
+    *,
+    cache_dir: str | Path | None | object = _CACHE_DIR_UNSET,
+) -> tuple[dict[str, dict[str, object]], list[str]]:
+    """Read the stable Baostock industry map without issuing a network request."""
+    resolved_cache_dir = _resolve_akshare_board_cache_dir(cache_dir)
+    if resolved_cache_dir is None:
+        return {}, ["baostock cached industry skipped: cache disabled"]
+    path = resolved_cache_dir / (
+        f"baostock_industry_map_{_BAOSTOCK_INDUSTRY_CACHE_SCHEMA}.json"
+    )
+    mapping, note = _read_simple_provider_cache(
+        path,
+        provider="baostock",
+        schema=_BAOSTOCK_INDUSTRY_CACHE_SCHEMA,
+        ttl_seconds=float("inf"),
+    )
+    if mapping is None:
+        return {}, [note or f"baostock cached industry missing: {path}"]
+    return mapping, [note.replace("cache hit", "cached industry loaded")]
 
 
 def save_industry_map(mapping: dict[str, dict[str, object]], path_like: str | Path) -> Path:
@@ -351,6 +481,8 @@ def save_industry_map(mapping: dict[str, dict[str, object]], path_like: str | Pa
             "board_heat_persistence_score": item.get("board_heat_persistence_score", ""),
             "board_heat_cooling_score": item.get("board_heat_cooling_score", ""),
             "board_heat_observations": item.get("board_heat_observations", ""),
+            "board_fund_flow_score": item.get("board_fund_flow_score", ""),
+            "board_fund_flow_net_amount": item.get("board_fund_flow_net_amount", ""),
             "board_heat_summary": item.get("board_heat_summary", ""),
             "board_heat_state": item.get("board_heat_state", ""),
         }
@@ -529,14 +661,24 @@ def _resolve_cache_ttl_seconds(
     return max(0.0, float(raw_hours)) * 3600
 
 
-def _akshare_board_cache_path(cache_dir: Path, *, max_boards: int) -> Path:
-    return cache_dir / f"akshare_board_map_{_AKSHARE_BOARD_CACHE_SCHEMA}_max_boards_{int(max_boards)}.json"
+def _akshare_board_cache_path(
+    cache_dir: Path,
+    *,
+    max_boards: int,
+    include_fund_flow: bool,
+) -> Path:
+    flow = "with_flow" if include_fund_flow else "no_flow"
+    return cache_dir / (
+        f"akshare_board_map_{_AKSHARE_BOARD_CACHE_SCHEMA}_"
+        f"max_boards_{int(max_boards)}_{flow}.json"
+    )
 
 
 def _read_akshare_board_cache(
     path: Path,
     *,
     max_boards: int,
+    include_fund_flow: bool,
     ttl_seconds: float,
 ) -> tuple[dict[str, dict[str, object]] | None, str]:
     try:
@@ -558,6 +700,7 @@ def _read_akshare_board_cache(
         payload.get("schema") != _AKSHARE_BOARD_CACHE_SCHEMA
         or payload.get("provider") != "akshare"
         or int(payload.get("max_boards", 0) or 0) != int(max_boards)
+        or bool(payload.get("include_fund_flow", False)) != bool(include_fund_flow)
     ):
         return None, f"industry provider cache skipped: {path} schema mismatch"
     mapping = _normalize_cached_mapping(payload.get("mapping"))
@@ -571,6 +714,7 @@ def _write_akshare_board_cache(
     mapping: dict[str, dict[str, object]],
     *,
     max_boards: int,
+    include_fund_flow: bool,
 ) -> str:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -578,6 +722,7 @@ def _write_akshare_board_cache(
             "schema": _AKSHARE_BOARD_CACHE_SCHEMA,
             "provider": "akshare",
             "max_boards": int(max_boards),
+            "include_fund_flow": bool(include_fund_flow),
             "created_at": datetime.now().isoformat(),
             "mapping": _json_safe_mapping(mapping),
         }
@@ -710,6 +855,81 @@ def _board_items(df: pd.DataFrame) -> list[dict[str, object]]:
             "change_pct": change_pct,
         })
     return items
+
+
+def _fetch_akshare_board_fund_flow(
+    ak: object,
+    notes: list[str],
+) -> dict[str, dict[str, dict[str, float]]]:
+    """Fetch optional current board-flow overlays without making them mandatory."""
+    output: dict[str, dict[str, dict[str, float]]] = {}
+    specs = (
+        ("industry", "行业资金流", "stock_fund_flow_industry"),
+        ("concepts", "概念资金流", "stock_fund_flow_concept"),
+    )
+    for field, sector_type, fallback_name in specs:
+        frame = pd.DataFrame()
+        try:
+            rank_func = getattr(ak, "stock_sector_fund_flow_rank")
+            frame = rank_func(indicator="今日", sector_type=sector_type)
+        except Exception as primary_exc:
+            try:
+                fallback = getattr(ak, fallback_name)
+                frame = fallback()
+            except Exception as fallback_exc:
+                notes.append(
+                    f"akshare {field} fund flow skipped: "
+                    f"rank={primary_exc}; fallback={fallback_exc}"
+                )
+                continue
+        parsed = _parse_board_fund_flow(frame)
+        if parsed:
+            output[field] = parsed
+            notes.append(f"akshare {field} fund flow loaded: {len(parsed)}")
+        else:
+            notes.append(f"akshare {field} fund flow skipped: unsupported columns")
+    return output
+
+
+def _parse_board_fund_flow(df: pd.DataFrame) -> dict[str, dict[str, float]]:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return {}
+    name_column = next(
+        (
+            column
+            for column in df.columns
+            if any(token in str(column) for token in ("板块名称", "行业名称", "概念名称", "名称"))
+        ),
+        None,
+    )
+    amount_column = next(
+        (
+            column
+            for column in df.columns
+            if any(token in str(column) for token in ("主力净流入-净额", "主力净流入", "净流入", "净额"))
+            and not any(token in str(column) for token in ("占比", "比例", "%"))
+        ),
+        None,
+    )
+    if name_column is None or amount_column is None:
+        return {}
+    work = df[[name_column, amount_column]].copy()
+    work["__name"] = work[name_column].map(_safe_text)
+    work["__amount"] = work[amount_column].map(_safe_float)
+    work = work[work["__name"].ne("") & work["__amount"].notna()].copy()
+    if work.empty:
+        return {}
+    work["__score"] = work["__amount"].rank(method="average", pct=True).mul(100.0)
+    return {
+        name: {
+            "net_amount": round(float(amount), 4),
+            "score": round(float(score), 4),
+        }
+        for name, amount, score in work[["__name", "__amount", "__score"]].itertuples(
+            index=False,
+            name=None,
+        )
+    }
 
 
 def _merge_mapping(target: dict[str, dict[str, object]], source: dict[str, dict[str, object]]) -> None:

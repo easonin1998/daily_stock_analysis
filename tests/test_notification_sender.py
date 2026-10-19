@@ -601,7 +601,7 @@ class TestFeishuSender(unittest.TestCase):
         exit_table = next(table for table in analysis_tables if "reason" in table["rows"][0])
         self.assertEqual(sizing_table["rows"][0]["median"], "+19.08%")
         self.assertEqual(month_table["rows"][0]["month"], "2026-04")
-        self.assertEqual(exit_table["rows"][0]["reason"], "20日上限")
+        self.assertEqual(exit_table["rows"][0]["reason"], "研究持仓上限")
 
         ledger = FeishuSender._build_structured_card_body(
             {
@@ -637,6 +637,47 @@ class TestFeishuSender(unittest.TestCase):
             "snapshot_count": 5570,
             "after_filter_count": 28,
             "ranking_mode": "llm",
+            "market_regime": {
+                "state": "neutral",
+                "score": 48.0,
+                "reason": "市场分歧，降低新开仓风险",
+                "profile": {"target_exposure_pct": 40.0},
+            },
+            "analysis_date": "2026-10-16",
+            "strategy_version": "3.3",
+            "sector_overview": {
+                "status": "available",
+                "as_of": "2026-10-16",
+                "sector_count": 83,
+                "local_heat_status": "available",
+                "external_heat_status": "unavailable",
+                "fund_flow_status": "unavailable",
+                "top_sectors": [{
+                    "industry": "通信设备",
+                    "local_heat_score": 88.4,
+                    "breadth_ratio": 75.7,
+                    "high_adr_leader_count": 15,
+                    "change_20d_pct": 12.6,
+                }],
+            },
+            "theme_overview": {
+                "status": "available",
+                "provider": "dsa_eastmoney_board_change",
+                "themes": [{
+                    "name": "光通信",
+                    "heat_score": 91.2,
+                    "change_pct": 3.5,
+                    "stage": "加速主升",
+                    "leaders": ["长飞光纤"],
+                }],
+            },
+            "data_diagnostics": {
+                "snapshot_source": "sina",
+                "snapshot_count": 5570,
+                "seed_pool_count": 120,
+                "daily_enrich_count": 120,
+                "warning_count": 1,
+            },
             "candidates": [{
                 "code": "600519",
                 "name": "贵州茅台",
@@ -655,7 +696,7 @@ class TestFeishuSender(unittest.TestCase):
                         "first_profit_price": 1640.0,
                         "follow_through_days": 10,
                         "follow_through_min_return_pct": 3.0,
-                        "max_holding_days": 20,
+                        "max_holding_days": None,
                     },
                     "position_sizing": {
                         "max_position_weight_pct": 15.0,
@@ -675,20 +716,89 @@ class TestFeishuSender(unittest.TestCase):
         self.assertEqual(card["schema"], "2.0")
         self.assertEqual(card["header"]["title"]["content"], "选股任务完成")
         tables = [item for item in card["body"]["elements"] if item.get("tag") == "table"]
-        self.assertEqual(tables[0]["rows"][0]["name"], "1. 贵州茅台\n600519")
+        candidate_table = next(
+            item for item in tables if item.get("element_id") == "screening_candidates"
+        )
+        self.assertEqual(candidate_table["rows"][0]["name"], "1. 贵州茅台\n600519")
         rendered = "\n".join(
             item.get("content", "")
             for item in card["body"]["elements"]
             if isinstance(item, dict)
         )
+        self.assertIn("不设固定期限，趋势未破坏则持有", rendered)
         self.assertIn("候选 **1** 只", rendered)
         self.assertIn("条件单计划", rendered)
+        self.assertIn("中性防守", rendered)
+        self.assertIn("行业板块热度", rendered)
+        self.assertIn("本地量价 **可用**", rendered)
+        self.assertIn("题材异动热度", rendered)
+        self.assertIn("数据质量", rendered)
+        self.assertIn("目标总仓位 **40.0%**", rendered)
         self.assertIn("初始防守：**1450.0**", rendered)
         self.assertIn("仓位区间：**12.0% - 15.0%**", rendered)
         self.assertIn("单笔风险预算 0.5%", rendered)
         self.assertIn("技术止损/计仓风险 **3.3333%**", rendered)
         self.assertIn("1 ADR 压力 4.0%（不参与计仓）", rendered)
         self.assertIn("http://192.168.1.8:8000/screening?runId=run-1", rendered)
+
+    def test_screening_card_marks_market_blocked_plan_as_no_order(self):
+        card = FeishuSender._build_screening_card_body(
+            {
+                "strategy": "martin_momentum_pullback",
+                "market": "cn",
+                "candidates": [{
+                    "code": "000001",
+                    "name": "示例股份",
+                    "score": 80.0,
+                    "trade_plan": {
+                        "signal_status": "market_blocked",
+                        "market_block_reason": "多日市场状态不足以支持新开仓",
+                    },
+                }],
+            },
+            "",
+        )
+
+        rendered = "\n".join(
+            item.get("content", "")
+            for item in card["body"]["elements"]
+            if isinstance(item, dict)
+        )
+        self.assertIn("市场状态暂停", rendered)
+        self.assertIn("多日市场状态不足以支持新开仓", rendered)
+        self.assertNotIn("买入信号", rendered)
+
+    def test_screening_card_marks_disabled_setup_as_watch_only(self):
+        card = FeishuSender._build_screening_card_body(
+            {
+                "strategy": "martin_momentum_pullback",
+                "market": "cn",
+                "candidates": [{
+                    "code": "000002",
+                    "name": "平台样例",
+                    "score": 82.0,
+                    "trade_plan": {
+                        "signal_status": "watch_only_setup",
+                        "setup_permission": {
+                            "setup_type": "platform_breakout",
+                            "confirmed": True,
+                            "trade_eligible": False,
+                        },
+                    },
+                }],
+            },
+            "",
+        )
+
+        rendered = "\n".join(
+            item.get("content", "")
+            for item in card["body"]["elements"]
+            if isinstance(item, dict)
+        )
+        self.assertIn("形态观察", rendered)
+        self.assertIn("platform_breakout 已确认", rendered)
+        self.assertIn("不设置买入条件单", rendered)
+        self.assertNotIn("买入信号", rendered)
 
     @mock.patch("src.notification_sender.feishu_sender.requests.post")
     def test_send_error_response_returns_false(self, mock_post):

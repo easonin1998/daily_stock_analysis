@@ -157,13 +157,85 @@ def _screening_notification_content(result: Dict[str, Any]) -> str:
         "## 选股任务已完成",
         f"策略：{result.get('strategy') or 'martin_momentum_pullback'}",
         f"市场：{'A股' if str(result.get('market') or 'cn').lower() == 'cn' else result.get('market')}",
+        f"数据日期：{result.get('analysis_date') or '--'}",
         f"候选：{result.get('candidate_count', len(candidates))} 只",
     ]
     if candidate_names:
         lines.append(f"前列候选：{'、'.join(candidate_names)}")
     else:
         lines.append("本次没有股票通过全部硬条件，请保持观察。")
+    market_regime = result.get("market_regime")
+    if isinstance(market_regime, dict):
+        lines.append(
+            "市场状态："
+            f"{market_regime.get('state') or 'unavailable'}"
+            f"（评分 {market_regime.get('score') if market_regime.get('score') is not None else '--'}）"
+        )
     return "\n\n".join(lines)
+
+
+def _screening_theme_overview(config: Config, *, top: int = 5) -> Dict[str, Any]:
+    """Fetch a concise theme snapshot without making notification delivery fragile."""
+    try:
+        payload = ScreeningService(config=config).hotspots(
+            top=max(1, min(int(top), 10)),
+            refresh=True,
+            include_details=False,
+            lightweight=True,
+        )
+    except Exception as exc:  # Topic heat is optional enrichment.
+        logger.warning("选股飞书题材热度刷新失败: %s", exc)
+        return {
+            "status": "unavailable",
+            "provider": "",
+            "stale": False,
+            "themes": [],
+            "source_errors": [str(exc)],
+        }
+
+    raw_rows = payload.get("hotspots") if isinstance(payload, dict) else []
+    rows = raw_rows if isinstance(raw_rows, list) else []
+    themes: List[Dict[str, Any]] = []
+    for row in rows[:top]:
+        if not isinstance(row, dict):
+            continue
+        raw_leaders = row.get("leaders")
+        leaders: List[str] = []
+        if isinstance(raw_leaders, list):
+            for item in raw_leaders[:3]:
+                if isinstance(item, dict):
+                    label = str(item.get("name") or item.get("code") or "").strip()
+                else:
+                    label = str(item or "").strip()
+                if label:
+                    leaders.append(label)
+        themes.append({
+            "name": str(row.get("name") or row.get("topic") or "").strip(),
+            "topic": str(row.get("topic") or "").strip(),
+            "rank": row.get("rank"),
+            "heat_score": row.get("heat_score"),
+            "change_pct": row.get("change_pct"),
+            "state": str(row.get("state") or "").strip(),
+            "stage": str(row.get("stage") or "").strip(),
+            "leaders": leaders,
+            "quality_status": str(row.get("quality_status") or "").strip(),
+        })
+    stale = bool(payload.get("stale")) if isinstance(payload, dict) else False
+    return {
+        "status": "stale" if themes and stale else ("available" if themes else "unavailable"),
+        "provider": str(payload.get("provider_used") or payload.get("provider") or "").strip(),
+        "cached_at": payload.get("cached_at"),
+        "stale": stale,
+        "stale_age_hours": payload.get("stale_age_hours"),
+        "cache_used": bool(payload.get("cache_used")),
+        "fallback_used": bool(payload.get("fallback_used")),
+        "themes": themes,
+        "source_errors": [
+            str(item)
+            for item in (payload.get("source_errors") or [])[:3]
+            if str(item).strip()
+        ],
+    }
 
 
 def _notify_screening_result(
@@ -173,16 +245,41 @@ def _notify_screening_result(
     web_base_url: str,
 ) -> Dict[str, Any]:
     detail_url = _screening_detail_url(web_base_url, result.get("run_id"))
+    theme_overview = (
+        _screening_theme_overview(config)
+        if str(result.get("market") or "cn").strip().lower() == "cn"
+        else {"status": "unavailable", "themes": []}
+    )
+    warnings = result.get("warnings") if isinstance(result.get("warnings"), list) else []
     payload = {
         "kind": "screening_result",
         "strategy": result.get("strategy"),
+        "strategy_version": result.get("strategy_version"),
         "market": result.get("market"),
         "run_id": result.get("run_id"),
+        "analysis_date": result.get("analysis_date"),
         "candidate_count": result.get("candidate_count"),
         "snapshot_count": result.get("snapshot_count"),
+        "snapshot_source": result.get("snapshot_source"),
+        "snapshot_filtered_count": result.get("snapshot_filtered_count"),
+        "seed_pool_count": result.get("seed_pool_count"),
+        "daily_enrich_count": result.get("daily_enrich_count"),
         "after_filter_count": result.get("after_filter_count"),
         "ranking_mode": result.get("ranking_mode"),
         "candidates": result.get("candidates") or [],
+        "market_regime": result.get("market_regime") or {},
+        "sector_overview": result.get("sector_overview") or {},
+        "theme_overview": theme_overview,
+        "data_diagnostics": {
+            "analysis_date": result.get("analysis_date"),
+            "snapshot_source": result.get("snapshot_source"),
+            "snapshot_count": result.get("snapshot_count"),
+            "snapshot_filtered_count": result.get("snapshot_filtered_count"),
+            "seed_pool_count": result.get("seed_pool_count"),
+            "daily_enrich_count": result.get("daily_enrich_count"),
+            "warning_count": len(warnings),
+            "warnings": [str(item) for item in warnings[:3]],
+        },
         "detail_url": detail_url,
     }
     try:

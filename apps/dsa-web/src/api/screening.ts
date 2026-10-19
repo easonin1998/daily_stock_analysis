@@ -22,6 +22,26 @@ export type ScreeningStatus = {
   diagnostics?: Record<string, string>;
 };
 
+export type ScreeningMarketRegime = {
+  status?: 'available' | 'unavailable' | string;
+  date?: string;
+  state?: 'strong_risk_on' | 'risk_on' | 'neutral' | 'risk_off' | 'unavailable' | string;
+  rawState?: string;
+  score?: number | null;
+  reason?: string;
+  components?: Record<string, number | null>;
+  measurements?: Record<string, number | null>;
+  profile?: {
+    targetExposurePct?: number;
+    maxPositionsFraction?: number;
+    riskMultiplier?: number;
+    heatMultiplier?: number;
+    positionWeightMultiplier?: number;
+    minPositionWeightMultiplier?: number;
+  };
+  historyDays?: number;
+};
+
 export type ScreeningCandidate = {
   rank: number;
   code: string;
@@ -58,11 +78,15 @@ export type ScreeningCandidate = {
   volumeContractionRatio?: number | null;
   supportConfluenceCount?: number | null;
   triggerDistancePct?: number | null;
+  setupType?: string;
+  setupConfirmed?: boolean | null;
+  setupTradeEligible?: boolean | null;
+  setupExecutionStatus?: 'tradable' | 'watch_only' | 'unconfirmed' | string;
   sectorBreadthCount?: number | null;
   factorScores?: Record<string, number>;
   tradePlan?: {
     schemaVersion?: number;
-    signalStatus?: 'buy_signal' | 'watch_wait_trigger' | 'data_insufficient' | string;
+    signalStatus?: 'buy_signal' | 'watch_wait_trigger' | 'watch_only_setup' | 'data_insufficient' | string;
     action?: string;
     executionModel?: string;
     referenceClose?: number | null;
@@ -102,6 +126,16 @@ export type ScreeningCandidate = {
     conditionOrders?: Record<string, unknown>;
     holdingPremises?: string[];
     conditionOrderNote?: string;
+    marketRegime?: ScreeningMarketRegime;
+    portfolioLimits?: Record<string, unknown>;
+    marketBlockReason?: string;
+    setupWatchReason?: string;
+    setupPermission?: {
+      setupType?: string;
+      confirmed?: boolean | null;
+      tradeEligible?: boolean | null;
+      status?: string;
+    };
   };
   postAnalysisSummaries?: Record<string, string>;
   postAnalysisTags?: string[];
@@ -313,6 +347,7 @@ export type ScreeningScreenResponse = {
   resultVariantApplied?: boolean;
   resultVariantPoolSize?: number;
   resultVariantRotatedSlots?: number;
+  marketRegime?: ScreeningMarketRegime;
   notification?: {
     requested: boolean;
     channel: 'feishu' | string;

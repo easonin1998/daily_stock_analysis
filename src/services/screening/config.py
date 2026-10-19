@@ -194,6 +194,7 @@ class Config:
         _PROJECT_ROOT / "data" / "industry_provider_cache"
     )
     industry_provider_cache_ttl_hours: int = 24
+    sector_fund_flow_enabled: bool = False
 
     # Optional: DSA API for L3 deep analysis
     dsa_api_url: str = ""
@@ -222,10 +223,16 @@ class Config:
     daily_feature_library_enabled: bool = True
     daily_feature_library_path: Path | None = None
     daily_feature_library_max_age_days: int = 7
+    sector_strength_history_path: Path | None = None
     seed_pool_core_ratio: float = 0.55
     seed_pool_strength_ratio: float = 0.20
     seed_pool_activity_ratio: float = 0.15
     seed_pool_max_sector_ratio: float = 0.20
+
+    # Multi-day market-state overlay for new entries.
+    market_regime_enabled: bool = True
+    market_regime_min_universe_size: int = 100
+    market_regime_upgrade_confirmation_days: int = 2
 
     # Independent risk layer.
     risk_enabled: bool = True
@@ -275,6 +282,10 @@ class Config:
         daily_feature_library_path = (
             _parse_optional_path_env("SCREENING_DAILY_FEATURE_LIBRARY_PATH")
             or data_dir / "daily_feature_library.json"
+        )
+        sector_strength_history_path = (
+            _parse_optional_path_env("SCREENING_SECTOR_STRENGTH_HISTORY_PATH")
+            or data_dir / "sector_strength_history.sqlite3"
         )
         industry_provider_cache_dir = (
             _parse_optional_path_env("SCREENING_INDUSTRY_PROVIDER_CACHE_DIR")
@@ -345,6 +356,10 @@ class Config:
                     )
                 ),
             ),
+            sector_fund_flow_enabled=_parse_bool_env(
+                "SCREENING_SECTOR_FUND_FLOW_ENABLED",
+                False,
+            ),
             dsa_api_url=os.getenv("DSA_API_URL", ""),
             dsa_report_type=os.getenv("DSA_REPORT_TYPE", "detailed"),
             dsa_max_picks=max(1, int(os.getenv("DSA_MAX_PICKS", "3"))),
@@ -383,11 +398,29 @@ class Config:
                 0,
                 int(os.getenv("SCREENING_DAILY_FEATURE_LIBRARY_MAX_AGE_DAYS", "7")),
             ),
+            sector_strength_history_path=sector_strength_history_path,
             seed_pool_core_ratio=_parse_ratio_env("SCREENING_SEED_POOL_CORE_RATIO", 0.55),
             seed_pool_strength_ratio=_parse_ratio_env("SCREENING_SEED_POOL_STRENGTH_RATIO", 0.20),
             seed_pool_activity_ratio=_parse_ratio_env("SCREENING_SEED_POOL_ACTIVITY_RATIO", 0.15),
             seed_pool_max_sector_ratio=_parse_ratio_env(
                 "SCREENING_SEED_POOL_MAX_SECTOR_RATIO", 0.20
+            ),
+            market_regime_enabled=_parse_bool_env(
+                "SCREENING_MARKET_REGIME_ENABLED",
+                True,
+            ),
+            market_regime_min_universe_size=max(
+                1,
+                int(os.getenv("SCREENING_MARKET_REGIME_MIN_UNIVERSE_SIZE", "100")),
+            ),
+            market_regime_upgrade_confirmation_days=max(
+                1,
+                int(
+                    os.getenv(
+                        "SCREENING_MARKET_REGIME_UPGRADE_CONFIRMATION_DAYS",
+                        "2",
+                    )
+                ),
             ),
             risk_enabled=_parse_bool_env("RISK_ENABLED", True),
             risk_max_penalty=_parse_float_env("RISK_MAX_PENALTY", 12.0),

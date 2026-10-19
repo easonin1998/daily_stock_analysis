@@ -39,6 +39,7 @@ _SCREENING_KEYS = {
     "portfolio_profile",
     "scorecard_profile",
     "event_profile",
+    "execution_profile",
     "ranking_hints",
     "max_output",
 }
@@ -108,6 +109,48 @@ _EVENT_PROFILE_KEYS = {
     "source_weights",
     "notes",
 }
+_EXECUTION_PROFILE_KEYS = {
+    "profile_version",
+    "entry_setup_mode",
+    "tradable_setup_types",
+    "reentry_cooldown_days",
+    "sector_leadership_enabled",
+    "progressive_exposure_enabled",
+    "pyramiding_enabled",
+    "adaptive_exit_enabled",
+    "initial_position_weight_pct",
+    "add_on_position_weight_pct",
+    "max_add_ons",
+    "first_add_on_r_multiple",
+    "second_add_on_r_multiple",
+    "first_partial_r_multiple",
+    "second_partial_r_multiple",
+    "partial_exit_fraction",
+    "adaptive_trailing_drawdown_pct",
+    "mature_trailing_drawdown_pct",
+    "adaptive_exit_model",
+    "developing_exit_activation_r",
+    "developing_trailing_adr_multiple",
+    "developing_trailing_min_pct",
+    "developing_trailing_max_pct",
+    "established_trailing_adr_multiple",
+    "established_trailing_min_pct",
+    "established_trailing_max_pct",
+    "mature_trailing_adr_multiple",
+    "mature_trailing_min_pct",
+    "mature_trailing_max_pct",
+    "established_profit_floor_r",
+    "mature_profit_floor_r",
+    "first_partial_exit_fraction",
+    "second_partial_exit_fraction",
+    "partial_exit_requires_exhaustion",
+    "exhaustion_volume_ratio_min",
+    "exhaustion_close_location_max_pct",
+    "exhaustion_range_adr_multiple_min",
+    "weak_sector_score_max",
+    "ema9_confirmation_days",
+    "risk_off_ema9_confirmation_days",
+}
 _STYLE_KEYS = {
     "risk_profile",
     "holding_period",
@@ -160,6 +203,12 @@ def load_strategy(filepath: Path) -> Strategy:
         ),
         event_profile=_optional_mapping(
             screening_data, "event_profile", filepath, allowed_keys=_EVENT_PROFILE_KEYS
+        ),
+        execution_profile=_optional_mapping(
+            screening_data,
+            "execution_profile",
+            filepath,
+            allowed_keys=_EXECUTION_PROFILE_KEYS,
         ),
         ranking_hints=screening_data.get("ranking_hints", ""),
         max_output=screening_data.get("max_output", 5),
@@ -843,6 +892,7 @@ def _strategy_profile_keys(screening: ScreeningConfig) -> dict[str, list[str]]:
         "portfolio": screening.portfolio_profile,
         "scorecard": screening.scorecard_profile,
         "event": screening.event_profile,
+        "execution": screening.execution_profile,
     }
     return {
         name: sorted(value)

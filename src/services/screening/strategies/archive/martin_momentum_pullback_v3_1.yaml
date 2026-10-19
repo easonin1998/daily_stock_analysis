@@ -1,0 +1,112 @@
+# Frozen before v3.2 made the fixed trailing exit the production default.
+name: martin_momentum_pullback
+display_name: Martin动量回调
+description: 聚焦高波动、高相对强度的主升趋势股票，在板块共振与缩量回调后等待支撑附近触发
+version: "3.1"
+category: trend
+tags: [momentum, pullback, relative_strength, adr, daily_k]
+analysis_skills: [bull_trend, shrink_pullback]
+style:
+  risk_profile: aggressive
+  holding_period: swing
+  execution_style: momentum_pullback
+  market_regime: [risk_on, trend, rotation]
+  capital_profile: high_liquidity
+  ui_badge: 动量回调
+
+screening:
+  enabled: true
+  market_scope: [cn]
+  hard_filters:
+    exclude_st: true
+    amount_min: 100000000
+    market_cap_min: 3000000000
+    price_min: 1.5
+    change_pct_min: -4.0
+    change_pct_max: 6.0
+    market_positive_ratio_min: 35.0
+    market_median_change_pct_min: -1.5
+    daily_data_points_min: 120
+    avg_amount_20d_min: 100000000
+    adr_20_pct_min: 3.5
+    adr_20_pct_max: 8.0
+    change_20d_min: 3.0
+    change_60d_min: 20.0
+    relative_strength_20d_pctile_min: 70.0
+    relative_strength_60d_pctile_min: 95.0
+    require_ema_stack: true
+    require_ema21_rising: true
+    require_ema50_rising: true
+    distance_to_120d_high_pct_min: -15.0
+    pullback_depth_10d_pct_min: -12.0
+    pullback_depth_10d_pct_max: -1.0
+    range_contraction_ratio_max: 0.95
+    volume_contraction_ratio_max: 0.95
+    support_confluence_count_min: 2
+    trigger_distance_pct_min: -4.0
+    exclude_one_word_limit_up: true
+  factor_weights:
+    trend_quality: 0.20
+    relative_strength: 0.20
+    sector_resonance: 0.15
+    contraction: 0.15
+    support_confluence: 0.15
+    trigger_quality: 0.10
+    liquidity: 0.05
+  portfolio_profile:
+    max_same_bucket: 2
+    concentration_penalty: 4.0
+    quota_max_score_gap: 3.0
+  execution_profile:
+    profile_version: "3.1"
+    entry_setup_mode: multi
+    tradable_setup_types: [first_pullback]
+    reentry_cooldown_days: 0
+    sector_leadership_enabled: true
+    progressive_exposure_enabled: true
+    pyramiding_enabled: true
+    adaptive_exit_enabled: true
+    initial_position_weight_pct: 10.0
+    add_on_position_weight_pct: 5.0
+    max_add_ons: 2
+    first_add_on_r_multiple: 1.0
+    second_add_on_r_multiple: 2.0
+    first_partial_r_multiple: 3.0
+    second_partial_r_multiple: 5.0
+    partial_exit_fraction: 0.20
+    adaptive_trailing_drawdown_pct: 6.0
+    mature_trailing_drawdown_pct: 5.0
+    adaptive_exit_model: profit_floor_volatility
+    developing_exit_activation_r: 1.0
+    developing_trailing_adr_multiple: 1.0
+    developing_trailing_min_pct: 5.0
+    developing_trailing_max_pct: 8.0
+    established_trailing_adr_multiple: 1.5
+    established_trailing_min_pct: 7.0
+    established_trailing_max_pct: 12.0
+    mature_trailing_adr_multiple: 1.75
+    mature_trailing_min_pct: 9.0
+    mature_trailing_max_pct: 15.0
+    established_profit_floor_r: 1.0
+    mature_profit_floor_r: 2.5
+    first_partial_exit_fraction: 0.0
+    second_partial_exit_fraction: 0.15
+    partial_exit_requires_exhaustion: true
+    exhaustion_volume_ratio_min: 1.5
+    exhaustion_close_location_max_pct: 60.0
+    exhaustion_range_adr_multiple_min: 1.0
+    weak_sector_score_max: 40.0
+    ema9_confirmation_days: 2
+    risk_off_ema9_confirmation_days: 1
+  ranking_hints: |
+    仅在已通过硬过滤的候选中排序，不得用估值、超跌反转或主观消息替代趋势条件。
+    优先顺序：
+    1. EMA9 > EMA21 > EMA50 且中期均线持续上行，20/60日相对强度领先
+    2. 同行业有多个强势候选或板块热度得到确认，不孤立追逐单只股票
+    3. 继续识别平台突破、首次回踩、紧缩延续三类收盘形态；仅首次回踩具有交易许可
+    4. 优先热门板块中的高 ADR 领涨股；板块数据缺失时明确标记 unavailable，不把中性值伪装成已确认共振
+    5. 先试仓，仅在持仓盈利且市场状态允许时确认加仓，严禁向亏损仓位摊低成本
+    6. 主要失效条件是跌破支撑、放量转弱、板块共振消失或多日市场状态进入 risk-off；市场状态既约束新开仓，也参与利润保护
+    7. 1R 前不使用峰值回撤；盈利后按 ADR20、R 利润底线、EMA9/EMA21 与衰竭信号自适应管理退出
+    8. 仓位按技术止损与账户风险预算计算；ADR 只做压力观察，技术止损过宽或整数手后仓位过小则放弃
+  max_output: 5

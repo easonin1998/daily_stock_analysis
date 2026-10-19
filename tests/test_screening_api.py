@@ -158,7 +158,6 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
         self.assertEqual(payload["engine"], "builtin")
         self.assertEqual(payload["reference_revision"], REFERENCE_REVISION)
 
-
     def test_status_defaults_to_disabled(self) -> None:
         config = self._config(enabled=False)
 
@@ -169,7 +168,6 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
         self.assertEqual(payload["available"], False)
         self.assertEqual(payload["engine"], "builtin")
         self.assertNotIn("diagnostics", payload)
-
 
     def test_status_includes_engine_contract_metadata(self) -> None:
         config = self._config(enabled=True)
@@ -301,10 +299,52 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
         self.assertEqual(discover.call_args.kwargs["top"], 3)
 
     def test_hotspots_default_provider_uses_dsa_eastmoney_provider(self) -> None:
-        provider_name, provider = screening_service._resolve_hotspot_provider("")
+        with patch.dict(os.environ, {"INDUSTRY_PROVIDER": "free_cached"}):
+            provider_name, provider = screening_service._resolve_hotspot_provider("")
 
         self.assertEqual(provider_name, "akshare")
         self.assertIsInstance(provider, screening_service.DsaEastMoneyHotspotProvider)
+
+    def test_hotspots_lightweight_refresh_skips_constituent_discovery(self) -> None:
+        config = self._config(enabled=True)
+        provider = screening_service.DsaEastMoneyHotspotProvider()
+        provider.hotspot_rows = MagicMock(return_value=[{
+            "topic": "光通信",
+            "name": "光通信",
+            "change_pct": 3.2,
+            "heat_score": 91.0,
+            "trend_score": 80.0,
+            "persistence_score": 70.0,
+            "stage": "加速主升",
+            "leaders": ["长飞光纤"],
+        }])
+
+        with (
+            patch(
+                "src.services.screening_service._resolve_hotspot_provider",
+                return_value=("akshare", provider),
+            ),
+            patch(
+                "src.services.screening_service._write_screening_hotspot_cache",
+            ) as cache_mock,
+            patch(
+                "src.services.screening_service.screening_hotspot.discover_hotspots",
+                side_effect=AssertionError("lightweight refresh must skip full discovery"),
+            ) as discover_mock,
+        ):
+            payload = screening_service.ScreeningService(config=config).hotspots(
+                top=5,
+                refresh=True,
+                include_details=False,
+                lightweight=True,
+            )
+
+        self.assertEqual(payload["hotspot_count"], 1)
+        self.assertEqual(payload["provider_used"], "dsa_eastmoney_board_change")
+        self.assertEqual(payload["hotspots"][0]["topic"], "光通信")
+        provider.hotspot_rows.assert_called()
+        discover_mock.assert_not_called()
+        cache_mock.assert_called_once()
 
     def test_hotspots_refresh_uses_dsa_direct_rows_when_screening_rows_are_thin(self) -> None:
         config = self._config(enabled=True)
@@ -447,7 +487,6 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
         self.assertEqual(payload["hotspots"], [])
         self.assertEqual(payload["hotspot_count"], 0)
         discover_hotspots.assert_not_called()
-
 
     def test_hotspots_uses_last_success_cache_by_default(self) -> None:
         config = self._config(enabled=True)
@@ -2455,6 +2494,80 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             "正在推送飞书结果卡片",
         )
 
+    def test_screening_notification_includes_sector_theme_and_data_quality(self) -> None:
+        config = self._config(enabled=True)
+        result = {
+            "run_id": "run-1",
+            "strategy": "martin_momentum_pullback",
+            "strategy_version": "3.3",
+            "market": "cn",
+            "analysis_date": "2026-10-16",
+            "candidate_count": 0,
+            "candidates": [],
+            "snapshot_count": 5570,
+            "snapshot_source": "sina",
+            "snapshot_filtered_count": 350,
+            "seed_pool_count": 120,
+            "daily_enrich_count": 120,
+            "after_filter_count": 0,
+            "ranking_mode": "factor",
+            "market_regime": {"state": "neutral", "score": 48.0},
+            "sector_overview": {
+                "status": "available",
+                "as_of": "2026-10-16",
+                "local_heat_status": "available",
+                "top_sectors": [{"industry": "通信设备", "local_heat_score": 88.0}],
+            },
+            "warnings": ["外部热度不可用"],
+        }
+        hotspot_payload = {
+            "provider": "free",
+            "provider_used": "eastmoney",
+            "stale": False,
+            "hotspots": [{
+                "topic": "光通信",
+                "name": "光通信",
+                "heat_score": 91.0,
+                "change_pct": 3.2,
+                "stage": "加速主升",
+                "leaders": ["长飞光纤"],
+            }],
+            "source_errors": [],
+        }
+
+        with (
+            patch.object(
+                screening_endpoint.ScreeningService,
+                "hotspots",
+                return_value=hotspot_payload,
+            ) as hotspots_mock,
+            patch.object(
+                screening_endpoint.FeishuSender,
+                "send_to_feishu",
+                return_value=True,
+            ) as send_mock,
+        ):
+            notification = screening_endpoint._notify_screening_result(
+                config=config,
+                result=result,
+                web_base_url="https://stocks.example.com",
+            )
+
+        self.assertTrue(notification["sent"])
+        hotspots_mock.assert_called_once_with(
+            top=5,
+            refresh=True,
+            include_details=False,
+            lightweight=True,
+        )
+        payload = send_mock.call_args.kwargs["structured_payload"]
+        self.assertEqual(payload["strategy_version"], "3.3")
+        self.assertEqual(payload["analysis_date"], "2026-10-16")
+        self.assertEqual(payload["sector_overview"]["top_sectors"][0]["industry"], "通信设备")
+        self.assertEqual(payload["theme_overview"]["themes"][0]["name"], "光通信")
+        self.assertEqual(payload["data_diagnostics"]["daily_enrich_count"], 120)
+        self.assertEqual(payload["data_diagnostics"]["warning_count"], 1)
+
     def test_screening_detail_url_rejects_credentials_and_keeps_app_path(self) -> None:
         self.assertEqual(
             screening_endpoint._screening_detail_url("https://example.com/dsa/", "run 1"),
@@ -2534,7 +2647,6 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
 
         self.assertEqual(caught.exception.status_code, 404)
         self.assertEqual(caught.exception.detail["error"], "screening_screen_task_not_found")
-
 
     def test_screen_calls_pipeline_and_normalizes_llm_fields(self) -> None:
         config = self._config(enabled=True)
@@ -2643,12 +2755,12 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
         self.assertEqual(payload["candidates"][0]["price"], 1688.0)
         self.assertEqual(payload["candidates"][0]["industry"], "Baijiu")
 
-    def test_screen_prefers_dsa_daily_history_for_screening_enrichment(self) -> None:
+    def test_screen_uses_dsa_daily_history_after_local_enrichment_failure(self) -> None:
         config = self._config(enabled=True)
         from src.services.screening import daily as daily_module
 
         builtin_daily_fetch = daily_module.fetch_daily_history
-        original_daily_fetch = MagicMock(side_effect=AssertionError("Screening daily fetch should not run first"))
+        original_daily_fetch = MagicMock(side_effect=RuntimeError("local sources unavailable"))
         captured: Dict[str, Any] = {}
 
         def screen_with_daily_fetch(strategy: str, **kwargs: Any) -> Dict[str, Any]:
@@ -2696,10 +2808,17 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
         self.assertIn("daily_history", captured["context"]["dsa"]["capabilities"])
         self.assertIs(captured["context"]["dsa"]["get_daily_history"], dsa_history_mock)
         dsa_history_mock.assert_called_once_with("600519", lookback_days=20)
-        original_daily_fetch.assert_not_called()
+        original_daily_fetch.assert_called_once_with(
+            "600519",
+            lookback_days=20,
+            source="akshare",
+            retries=1,
+            cache_dir=None,
+            cache_ttl_seconds=None,
+        )
         self.assertIs(daily_module.fetch_daily_history, builtin_daily_fetch)
 
-    def test_screen_daily_history_falls_back_to_local_after_dsa_failure(self) -> None:
+    def test_screen_daily_history_uses_local_before_dsa(self) -> None:
         from src.services.screening import daily as daily_module
 
         local_frame = pd.DataFrame({"date": ["2026-06-03"], "close": [10.5]})
@@ -2713,10 +2832,16 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
         ):
             fetcher = screening_service._build_screening_dsa_daily_history_fetcher()
             self.assertIsNotNone(fetcher)
-            result = fetcher("600519", lookback_days=20, source="akshare", retries=1)
+            result = fetcher(
+                "600519",
+                lookback_days=20,
+                source="akshare",
+                retries=1,
+                price_adjustment="qfq",
+            )
 
         self.assertIs(result, local_frame)
-        dsa_history_mock.assert_called_once_with("600519", lookback_days=20)
+        dsa_history_mock.assert_not_called()
         local_fetch.assert_called_once_with(
             "600519",
             lookback_days=20,
@@ -2724,6 +2849,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             retries=1,
             cache_dir=None,
             cache_ttl_seconds=None,
+            price_adjustment="qfq",
         )
 
     def test_screen_enriches_top_candidates_with_dsa_context(self) -> None:
@@ -3528,6 +3654,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
                 retries=4,
                 cache_dir=Path("data/screening/daily_history"),
                 cache_ttl_seconds=321.0,
+                price_adjustment="qfq",
             )
 
         self.assertIs(result, expected)
@@ -3537,6 +3664,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
         self.assertEqual(captured["retries"], 4)
         self.assertEqual(captured["cache_dir"], Path("data/screening/daily_history"))
         self.assertEqual(captured["cache_ttl_seconds"], 321.0)
+        self.assertEqual(captured["price_adjustment"], "qfq")
         dsa_mock.assert_not_called()
 
     def test_dsa_daily_history_fetchers_are_request_local_when_calls_overlap(self) -> None:

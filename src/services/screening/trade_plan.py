@@ -8,6 +8,15 @@ from dataclasses import asdict, dataclass
 import math
 from typing import Any
 
+from src.services.screening.adaptive_exit import (
+    LEGACY_TIGHTENING_EXIT,
+    PROFIT_FLOOR_EXIT_MODELS,
+    PROFIT_FLOOR_VOLATILITY_EXIT,
+    TRANCHE_COST_PROFIT_FLOOR_EXIT,
+    resolve_profit_floor_volatility_exit,
+    resolve_tranche_cost_profit_floor_exit,
+)
+
 
 @dataclass(frozen=True)
 class MartinTradePlanConfig:
@@ -36,12 +45,44 @@ class MartinTradePlanConfig:
     trailing_drawdown_pct: float = 8.0
     follow_through_days: int = 10
     follow_through_pct: float = 3.0
-    max_holding_days: int = 20
+    # Disabled by default: winners are held until the trend-based defenses fail.
+    # A positive value is retained only for controlled research comparisons.
+    max_holding_days: int | None = None
     max_portfolio_risk_per_trade_pct: float = 0.5
     max_portfolio_heat_pct: float = 2.5
     max_position_weight_pct: float = 20.0
     max_technical_stop_pct: float = 3.0
     min_position_weight_pct: float = 12.0
+    pyramiding_enabled: bool = False
+    adaptive_exit_enabled: bool = False
+    initial_position_weight_pct: float = 20.0
+    add_on_position_weight_pct: float = 5.0
+    max_add_ons: int = 2
+    first_add_on_r_multiple: float = 1.0
+    second_add_on_r_multiple: float = 2.0
+    first_partial_r_multiple: float = 3.0
+    second_partial_r_multiple: float = 5.0
+    partial_exit_fraction: float = 0.20
+    adaptive_trailing_drawdown_pct: float = 6.0
+    mature_trailing_drawdown_pct: float = 5.0
+    adaptive_exit_model: str = LEGACY_TIGHTENING_EXIT
+    developing_exit_activation_r: float = 1.0
+    developing_trailing_adr_multiple: float = 1.0
+    developing_trailing_min_pct: float = 5.0
+    developing_trailing_max_pct: float = 8.0
+    established_trailing_adr_multiple: float = 1.5
+    established_trailing_min_pct: float = 7.0
+    established_trailing_max_pct: float = 12.0
+    mature_trailing_adr_multiple: float = 1.75
+    mature_trailing_min_pct: float = 9.0
+    mature_trailing_max_pct: float = 15.0
+    established_profit_floor_r: float = 1.0
+    mature_profit_floor_r: float = 2.5
+    first_partial_exit_fraction: float = 0.0
+    second_partial_exit_fraction: float = 0.15
+    partial_exit_requires_exhaustion: bool = True
+    ema9_confirmation_days: int = 2
+    risk_off_ema9_confirmation_days: int = 1
     adr_stress_fraction: float = 1.0
     lot_size: int = 100
 
@@ -173,17 +214,40 @@ def build_martin_trade_plan(
             "first_profit_price": _price(two_r_reference),
             "two_r_reference_price": _price(two_r_reference),
             "fixed_take_profit": False,
+            "adaptive_exit_model": rules.adaptive_exit_model,
+            "ema9_profit_protection_after_r": (
+                rules.developing_exit_activation_r
+                if rules.adaptive_exit_model in PROFIT_FLOOR_EXIT_MODELS
+                else rules.first_partial_r_multiple
+            ),
+            "partial_profit_levels": _partial_profit_levels(rules),
             "trailing_drawdown_pct": rules.trailing_drawdown_pct,
+            "profit_floor_schedule": (
+                [
+                    {
+                        "activation_r": rules.first_partial_r_multiple,
+                        "floor_r": rules.established_profit_floor_r,
+                    },
+                    {
+                        "activation_r": rules.second_partial_r_multiple,
+                        "floor_r": rules.mature_profit_floor_r,
+                    },
+                ]
+                if rules.adaptive_exit_enabled
+                and rules.adaptive_exit_model in PROFIT_FLOOR_EXIT_MODELS
+                else []
+            ),
             "follow_through_days": rules.follow_through_days,
             "follow_through_min_return_pct": rules.follow_through_pct,
+            "holding_period_mode": "trend_following",
             "max_holding_days": rules.max_holding_days,
         },
         "holding_premises": [
-            "每日收盘不低于有效防守价：初始止损、EMA21、最高收盘回撤线三者取最高",
+            "每日收盘不低于有效防守价：初始止损、EMA21、最高收盘回撤线和R利润底线取最高",
             f"持有 {rules.follow_through_days} 个交易日时收益至少达到 {rules.follow_through_pct:.1f}%",
             "EMA21 与 EMA50 维持上行，趋势结构未明显破坏",
             "板块共振和相对强度没有持续转弱",
-            f"最长持有 {rules.max_holding_days} 个交易日，届时重新评估或退出",
+            "不设固定持有期限；趋势与移动防线未破坏时继续持有",
         ],
         "position_sizing": {
             "pricing_status": "provisional_until_fill",
@@ -198,6 +262,11 @@ def build_martin_trade_plan(
             "adr_stress_pct": round(adr_stress_pct, 4),
             "adr_stress_affects_position_size": False,
             "lot_size": rules.lot_size,
+            "entry_mode": "trial_then_add" if rules.pyramiding_enabled else "single_entry",
+            "initial_position_weight_pct": rules.initial_position_weight_pct,
+            "add_on_position_weight_pct": rules.add_on_position_weight_pct,
+            "max_add_ons": rules.max_add_ons if rules.pyramiding_enabled else 0,
+            "add_only_when_profitable": rules.pyramiding_enabled,
             "quantity_formula": (
                 "floor(min(account_equity * max_weight_pct / 100 / fill_price, "
                 "available_risk_budget / technical_risk_per_share) / lot_size) * lot_size"
@@ -220,6 +289,20 @@ def build_martin_trade_plan(
                 "arm_breakeven_after_close_at": _price(breakeven_activation),
                 "two_r_review_price": _price(two_r_reference),
                 "fixed_take_profit": False,
+                "adaptive_exit_model": rules.adaptive_exit_model,
+                "partial_profit_levels": _partial_profit_levels(rules),
+                "partial_profit_r_multiples": [
+                    level["r_multiple"] for level in _partial_profit_levels(rules)
+                ],
+                "partial_exit_fraction": (
+                    rules.second_partial_exit_fraction
+                    if rules.adaptive_exit_model in PROFIT_FLOOR_EXIT_MODELS
+                    else rules.partial_exit_fraction
+                ) if rules.adaptive_exit_enabled else 0.0,
+                "ema9_confirmation_days": rules.ema9_confirmation_days,
+                "risk_off_ema9_confirmation_days": (
+                    rules.risk_off_ema9_confirmation_days
+                ),
             },
         },
         "condition_order_note": (
@@ -408,8 +491,17 @@ def update_martin_holding_plan(
     current_close: Any,
     highest_close: Any,
     ema21: Any,
+    ema9: Any = None,
+    market_regime_state: str = "",
+    partial_exit_count: int = 0,
+    previous_ema9_below_streak: int = 0,
+    adr_20_pct: Any = None,
+    exhaustion_signal: bool = False,
     holding_days: int,
     breakeven_activation_price: Any = None,
+    entry_tranches: list[dict[str, Any]] | None = None,
+    highest_position_r_multiple: Any = None,
+    estimated_exit_cost_bps: float = 0.0,
     config: MartinTradePlanConfig | None = None,
 ) -> dict[str, Any]:
     """Update the next-auction action from one end-of-day holding snapshot."""
@@ -429,24 +521,185 @@ def update_martin_holding_plan(
     activation = _positive_number(breakeven_activation_price)
     if activation is None:
         activation = entry + rules.breakeven_r_multiple * (entry - initial_stop)
+    initial_risk = entry - initial_stop
+    peak_r = (high_close - entry) / initial_risk if initial_risk > 0 else 0.0
+    current_r = (close - entry) / initial_risk if initial_risk > 0 else 0.0
+    average_cost_price = entry
+    net_breakeven_price = entry
+    position_high_water_price = high_close
+    tranche_states: tuple[dict[str, Any], ...] = ()
     breakeven_active = high_close >= activation
-    trailing_stop = high_close * (1.0 - rules.trailing_drawdown_pct / 100.0)
-    active_levels = [initial_stop, ema21_value, trailing_stop]
+    exit_stage = "legacy"
+    profit_floor_r: float | None = None
+    profit_floor_price: float | None = None
+    trailing_pct: float | None = rules.trailing_drawdown_pct
+    trailing_stop: float | None = high_close * (1.0 - trailing_pct / 100.0)
+    if (
+        rules.adaptive_exit_enabled
+        and rules.adaptive_exit_model == TRANCHE_COST_PROFIT_FLOOR_EXIT
+    ):
+        tranches = [dict(item) for item in (entry_tranches or []) if isinstance(item, dict)]
+        if not tranches:
+            tranches = [{
+                "tranche_index": 0,
+                "type": "initial",
+                "shares": 1.0,
+                "remaining_shares": 1.0,
+                "price": entry,
+                "cost_per_share": entry,
+                "protective_stop_price": initial_stop,
+                "risk_per_share": max(entry - initial_stop, 0.01),
+                "highest_close": high_close,
+            }]
+        retention = max(1.0 - max(float(estimated_exit_cost_bps), 0.0) / 10_000.0, 0.0001)
+        adaptive = resolve_tranche_cost_profit_floor_exit(
+            tranches=tranches,
+            current_close=close,
+            highest_close=high_close,
+            highest_position_r_multiple=highest_position_r_multiple,
+            adr_20_pct=adr_20_pct,
+            developing_activation_r=rules.developing_exit_activation_r,
+            established_activation_r=rules.first_partial_r_multiple,
+            mature_activation_r=rules.second_partial_r_multiple,
+            developing_adr_multiple=rules.developing_trailing_adr_multiple,
+            developing_drawdown_min_pct=rules.developing_trailing_min_pct,
+            developing_drawdown_max_pct=rules.developing_trailing_max_pct,
+            established_adr_multiple=rules.established_trailing_adr_multiple,
+            established_drawdown_min_pct=rules.established_trailing_min_pct,
+            established_drawdown_max_pct=rules.established_trailing_max_pct,
+            mature_adr_multiple=rules.mature_trailing_adr_multiple,
+            mature_drawdown_min_pct=rules.mature_trailing_min_pct,
+            mature_drawdown_max_pct=rules.mature_trailing_max_pct,
+            established_profit_floor_r=rules.established_profit_floor_r,
+            mature_profit_floor_r=rules.mature_profit_floor_r,
+            fallback_drawdown_pct=rules.trailing_drawdown_pct,
+            exit_retention_rate=retention,
+        )
+        exit_stage = adaptive.stage
+        peak_r = adaptive.peak_r_multiple
+        current_r = adaptive.current_r_multiple
+        average_cost_price = adaptive.average_cost_price or entry
+        net_breakeven_price = adaptive.net_breakeven_price or average_cost_price
+        position_high_water_price = (
+            adaptive.position_high_water_price or high_close
+        )
+        tranche_states = adaptive.tranche_states
+        total_tranche_shares = sum(item["shares"] for item in tranche_states)
+        total_tranche_risk = sum(
+            item["shares"] * item["risk_per_share"] for item in tranche_states
+        )
+        if total_tranche_shares > 0:
+            activation = (
+                average_cost_price
+                + rules.developing_exit_activation_r
+                * total_tranche_risk
+                / total_tranche_shares
+            ) / retention
+        breakeven_active = False
+        trailing_pct = adaptive.trailing_drawdown_pct
+        trailing_stop = adaptive.trailing_stop_price
+        profit_floor_r = adaptive.profit_floor_r_multiple
+        profit_floor_price = adaptive.profit_floor_price
+    elif (
+        rules.adaptive_exit_enabled
+        and rules.adaptive_exit_model == PROFIT_FLOOR_VOLATILITY_EXIT
+    ):
+        adaptive = resolve_profit_floor_volatility_exit(
+            entry_price=entry,
+            initial_stop_price=initial_stop,
+            highest_close=high_close,
+            adr_20_pct=adr_20_pct,
+            developing_activation_r=rules.developing_exit_activation_r,
+            established_activation_r=rules.first_partial_r_multiple,
+            mature_activation_r=rules.second_partial_r_multiple,
+            developing_adr_multiple=rules.developing_trailing_adr_multiple,
+            developing_drawdown_min_pct=rules.developing_trailing_min_pct,
+            developing_drawdown_max_pct=rules.developing_trailing_max_pct,
+            established_adr_multiple=rules.established_trailing_adr_multiple,
+            established_drawdown_min_pct=rules.established_trailing_min_pct,
+            established_drawdown_max_pct=rules.established_trailing_max_pct,
+            mature_adr_multiple=rules.mature_trailing_adr_multiple,
+            mature_drawdown_min_pct=rules.mature_trailing_min_pct,
+            mature_drawdown_max_pct=rules.mature_trailing_max_pct,
+            established_profit_floor_r=rules.established_profit_floor_r,
+            mature_profit_floor_r=rules.mature_profit_floor_r,
+            fallback_drawdown_pct=rules.trailing_drawdown_pct,
+        )
+        exit_stage = adaptive.stage
+        trailing_pct = adaptive.trailing_drawdown_pct
+        trailing_stop = adaptive.trailing_stop_price
+        profit_floor_r = adaptive.profit_floor_r_multiple
+        profit_floor_price = adaptive.profit_floor_price
+    elif rules.adaptive_exit_enabled:
+        if peak_r >= rules.second_partial_r_multiple:
+            trailing_pct = rules.mature_trailing_drawdown_pct
+        elif peak_r >= rules.first_partial_r_multiple:
+            trailing_pct = rules.adaptive_trailing_drawdown_pct
+        trailing_stop = high_close * (1.0 - trailing_pct / 100.0)
+
+    active_levels = [initial_stop, ema21_value]
+    if trailing_stop is not None:
+        active_levels.append(trailing_stop)
+    if profit_floor_price is not None:
+        active_levels.append(profit_floor_price)
     if breakeven_active:
-        active_levels.append(entry)
+        active_levels.append(net_breakeven_price)
     active_exit = max(active_levels)
-    return_pct = (close / entry - 1.0) * 100.0
+    return_pct = (close / average_cost_price - 1.0) * 100.0
     reasons: list[str] = []
+    ema9_value = _positive_number(ema9)
+    ema9_active = bool(
+        rules.adaptive_exit_enabled
+        and ema9_value is not None
+        and (
+            peak_r >= (
+                rules.developing_exit_activation_r
+                if rules.adaptive_exit_model in PROFIT_FLOOR_EXIT_MODELS
+                else rules.first_partial_r_multiple
+            )
+            or (str(market_regime_state) == "risk_off" and current_r >= 1.0)
+        )
+    )
+    ema9_below_streak = (
+        max(int(previous_ema9_below_streak), 0) + 1
+        if ema9_active and close < ema9_value
+        else 0
+    )
+    if ema9_active:
+        if rules.adaptive_exit_model in PROFIT_FLOOR_EXIT_MODELS:
+            required_days = (
+                rules.risk_off_ema9_confirmation_days
+                if str(market_regime_state) == "risk_off"
+                else rules.ema9_confirmation_days
+            )
+            hard_exit_armed = (
+                str(market_regime_state) == "risk_off" and current_r >= 1.0
+            ) or peak_r >= rules.first_partial_r_multiple
+            if hard_exit_armed and ema9_below_streak >= required_days:
+                reasons.append("confirmed_close_below_ema9_profit_protection")
+        else:
+            active_exit = max(active_exit, ema9_value)
+            if close < ema9_value:
+                reasons.append("close_below_ema9_profit_protection")
     if close < ema21_value:
         reasons.append("close_below_ema21")
     if close <= active_exit:
         reasons.append("close_below_active_exit")
     if holding_days >= rules.follow_through_days and return_pct < rules.follow_through_pct:
         reasons.append("no_follow_through")
-    if holding_days >= rules.max_holding_days:
+    if (
+        rules.max_holding_days is not None
+        and holding_days >= rules.max_holding_days
+    ):
         reasons.append("max_holding_days")
 
     exit_required = bool(reasons)
+    partial_targets = _holding_partial_targets(
+        rules,
+        current_r=current_r,
+        partial_exit_count=partial_exit_count,
+        exhaustion_signal=exhaustion_signal,
+    )
     return {
         "status": "exit_signal" if exit_required else "hold",
         "action": "sell_next_open_call_auction" if exit_required else "keep_and_review_after_close",
@@ -457,10 +710,104 @@ def update_martin_holding_plan(
         "breakeven_active": breakeven_active,
         "initial_stop_price": _price(initial_stop),
         "ema21": _price(ema21_value),
-        "trailing_stop_price": _price(trailing_stop),
+        "ema9": _price(ema9_value) if ema9_value is not None else None,
+        "ema9_profit_protection_active": ema9_active,
+        "ema9_below_streak": ema9_below_streak,
+        "adaptive_exit_stage": exit_stage,
+        "profit_floor_r_multiple": profit_floor_r,
+        "profit_floor_price": (
+            _price(profit_floor_price) if profit_floor_price is not None else None
+        ),
+        "average_entry_cost_price": _price(average_cost_price),
+        "net_breakeven_price": _price(net_breakeven_price),
+        "position_high_water_price": _price(position_high_water_price),
+        "trailing_stop_price": _price(trailing_stop) if trailing_stop is not None else None,
+        "trailing_drawdown_pct": trailing_pct,
+        "current_r_multiple": round(current_r, 4),
+        "peak_r_multiple": round(peak_r, 4),
+        "tranche_r_states": [
+            {
+                **item,
+                "shares": round(float(item["shares"]), 6),
+                "entry_price": _price(item["entry_price"]),
+                "cost_per_share": _price(item["cost_per_share"]),
+                "protective_stop_price": (
+                    _price(item["protective_stop_price"])
+                    if item["protective_stop_price"] is not None
+                    else None
+                ),
+                "risk_per_share": _price(item["risk_per_share"]),
+                "highest_close": _price(item["highest_close"]),
+                "current_r_multiple": round(float(item["current_r_multiple"]), 4),
+                "peak_r_multiple": round(float(item["peak_r_multiple"]), 4),
+            }
+            for item in tranche_states
+        ],
+        "partial_exit_orders": partial_targets if not exit_required else [],
         "holding_days": int(holding_days),
         "reasons": reasons,
     }
+
+
+def _partial_profit_levels(rules: MartinTradePlanConfig) -> list[dict[str, Any]]:
+    if not rules.adaptive_exit_enabled:
+        return []
+    if rules.adaptive_exit_model not in PROFIT_FLOOR_EXIT_MODELS:
+        return [
+            {
+                "r_multiple": rules.first_partial_r_multiple,
+                "sell_fraction": rules.partial_exit_fraction,
+                "requires_exhaustion": False,
+            },
+            {
+                "r_multiple": rules.second_partial_r_multiple,
+                "sell_fraction": rules.partial_exit_fraction,
+                "requires_exhaustion": False,
+            },
+        ]
+    levels = []
+    for target_r, fraction in (
+        (rules.first_partial_r_multiple, rules.first_partial_exit_fraction),
+        (rules.second_partial_r_multiple, rules.second_partial_exit_fraction),
+    ):
+        if fraction > 0:
+            levels.append({
+                "r_multiple": target_r,
+                "sell_fraction": fraction,
+                "requires_exhaustion": rules.partial_exit_requires_exhaustion,
+            })
+    return levels
+
+
+def _holding_partial_targets(
+    rules: MartinTradePlanConfig,
+    *,
+    current_r: float,
+    partial_exit_count: int,
+    exhaustion_signal: bool,
+) -> list[dict[str, float]]:
+    levels = _partial_profit_levels(rules)
+    if rules.adaptive_exit_model in PROFIT_FLOOR_EXIT_MODELS:
+        if partial_exit_count > 0:
+            return []
+        for level in levels:
+            if current_r < float(level["r_multiple"]):
+                continue
+            if bool(level["requires_exhaustion"]) and not exhaustion_signal:
+                continue
+            return [{
+                "r_multiple": float(level["r_multiple"]),
+                "sell_fraction": float(level["sell_fraction"]),
+            }]
+        return []
+    return [
+        {
+            "r_multiple": float(level["r_multiple"]),
+            "sell_fraction": float(level["sell_fraction"]),
+        }
+        for stage, level in enumerate(levels, start=1)
+        if partial_exit_count < stage and current_r >= float(level["r_multiple"])
+    ]
 
 
 def _number(value: Any) -> float | None:
@@ -487,7 +834,12 @@ def _position_weight_cap(
     if initial_risk_pct <= 0:
         return 0.0
     risk_based_cap = rules.max_portfolio_risk_per_trade_pct / initial_risk_pct * 100.0
-    return max(min(risk_based_cap, rules.max_position_weight_pct), 0.0)
+    nominal_cap = (
+        min(rules.max_position_weight_pct, rules.initial_position_weight_pct)
+        if rules.pyramiding_enabled
+        else rules.max_position_weight_pct
+    )
+    return max(min(risk_based_cap, nominal_cap), 0.0)
 
 
 def _price(value: float) -> float:

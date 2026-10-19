@@ -970,6 +970,7 @@ class ScreeningService:
         top: int = 12,
         refresh: bool = False,
         include_details: bool = False,
+        lightweight: bool = False,
     ) -> Dict[str, Any]:
         _ensure_screening_enabled(self.config)
         _ensure_screening_available_for_use()
@@ -990,12 +991,15 @@ class ScreeningService:
             # hold the process-wide Screening environment lock during network
             # I/O, otherwise a hotspot refresh that starts first can delay a
             # concurrent stock-screening request for the full source timeout.
-            raw = screening_hotspot.discover_hotspots(
-                provider=provider_arg,
-                top=cache_top_count,
-                history_path=_screening_hotspot_history_path(),
-                fallback_cache_path=_screening_hotspot_cache_path(),
-            )
+            if lightweight and isinstance(provider_arg, DsaEastMoneyHotspotProvider):
+                raw = provider_arg.hotspot_rows(top=cache_top_count)
+            else:
+                raw = screening_hotspot.discover_hotspots(
+                    provider=provider_arg,
+                    top=cache_top_count,
+                    history_path=_screening_hotspot_history_path(),
+                    fallback_cache_path=_screening_hotspot_cache_path(),
+                )
         except HTTPException:
             raise
         except Exception as exc:
@@ -1065,7 +1069,13 @@ class ScreeningService:
         payload = {
             "enabled": True,
             "provider": provider_name,
-            "provider_used": "dsa_eastmoney_board_change" if direct_hotspot_fallback_used else str(getattr(raw, "provider_used", "")),
+            "provider_used": (
+                "dsa_eastmoney_board_change"
+                if direct_hotspot_fallback_used or (
+                    lightweight and isinstance(provider_arg, DsaEastMoneyHotspotProvider)
+                )
+                else str(getattr(raw, "provider_used", ""))
+            ),
             "fallback_used": direct_hotspot_fallback_used or bool(getattr(raw, "fallback_used", False)),
             "cache_used": False,
             "cached_at": None,
@@ -1268,7 +1278,9 @@ class ScreeningService:
             "candidate_count": len(selected),
             "run_id": raw_data.get("run_id") or uuid.uuid4().hex,
             "strategy": raw_data.get("strategy") or strategy,
+            "strategy_version": raw_data.get("strategy_version") or "",
             "market": raw_data.get("market") or market,
+            "analysis_date": raw_data.get("analysis_date") or "",
             "snapshot_count": raw_data.get("snapshot_count"),
             "snapshot_source": raw_data.get("snapshot_source") or "",
             "snapshot_filtered_count": raw_data.get("snapshot_filtered_count"),
@@ -1305,6 +1317,8 @@ class ScreeningService:
             "result_variant_applied": bool(raw_data.get("result_variant_applied")),
             "result_variant_pool_size": raw_data.get("result_variant_pool_size") or 0,
             "result_variant_rotated_slots": raw_data.get("result_variant_rotated_slots") or 0,
+            "market_regime": raw_data.get("market_regime") or {},
+            "sector_overview": raw_data.get("sector_overview") or {},
         }
         if self.db_manager is not None:
             self.db_manager.save_screening_run(response)
@@ -1785,10 +1799,11 @@ def _screening_runtime_env(config: Config, *, max_results: Optional[int] = None)
 
 
 def _build_screening_dsa_daily_history_fetcher() -> Optional[Callable[..., Any]]:
-    """Build one request-local DSA-first daily-history fetcher.
+    """Build one request-local daily-history fetcher with DSA fallback.
 
-    DSA owns the configured AkShare-primary/Baostock-validation contract. The
-    lightweight Screening providers remain a fallback. The closure never
+    Screening's local cache and lightweight providers stay first so a normal
+    run does not repeat expensive host-level fetches. DSA owns the final
+    fallback and AkShare/Baostock validation contract. The closure never
     replaces ``daily.fetch_daily_history``, so overlapping requests cannot
     restore stale wrappers or build wrapper chains.
     """
@@ -1809,70 +1824,73 @@ def _build_screening_dsa_daily_history_fetcher() -> Optional[Callable[..., Any]]
         retries: int = 2,
         cache_dir: str | Path | None = None,
         cache_ttl_seconds: float | None = None,
+        price_adjustment: str | None = None,
     ) -> Any:
-        dsa_error: Exception | None = None
+        local_kwargs = {
+            "lookback_days": lookback_days,
+            "source": source,
+            "retries": retries,
+            "cache_dir": cache_dir,
+            "cache_ttl_seconds": cache_ttl_seconds,
+        }
+        if price_adjustment is not None:
+            local_kwargs["price_adjustment"] = price_adjustment
+        local_error: Exception | None = None
         try:
-            dsa_df, dsa_source = get_dsa_daily_history(code, lookback_days=lookback_days)
-            normalized = _normalize_dsa_daily_history(dsa_df)
-            if normalized is not None and not normalized.empty:
-                resolved_source = f"dsa:{dsa_source}"
-                normalized_code = code
-                normalize_code = getattr(daily_module, "_normalize_daily_code", None)
-                if callable(normalize_code):
-                    normalized_code = normalize_code(code)
-                normalized.attrs["source"] = resolved_source
-                normalized.attrs["daily_source"] = resolved_source
-                normalized.attrs["daily_requested_source"] = source
-                normalized.attrs["daily_source_order"] = [resolved_source]
-                normalized.attrs["daily_source_order_notes"] = []
-                normalized.attrs["source_errors"] = []
-                normalized.attrs["daily_source_health"] = {}
-                if cache_dir is not None:
-                    cache_path_builder = getattr(daily_module, "_daily_history_cache_path", None)
-                    cache_writer = getattr(daily_module, "_write_daily_history_cache", None)
-                    if callable(cache_path_builder) and callable(cache_writer):
-                        cache_path = cache_path_builder(
-                            cache_dir,
-                            code=normalized_code,
-                            source=source,
-                            lookback_days=int(lookback_days),
-                        )
-                        cache_writer(
-                            cache_path,
-                            normalized,
-                            code=normalized_code,
-                            source=source,
-                            lookback_days=int(lookback_days),
-                        )
-                return normalized
-            dsa_error = RuntimeError("DSA daily history returned no usable rows")
+            local_result = original_fetch(code, **local_kwargs)
+            if local_result is not None and not bool(getattr(local_result, "empty", False)):
+                return local_result
+            local_error = RuntimeError("local source returned no usable rows")
         except Exception as exc:
-            dsa_error = exc
-            logger.warning(
-                "Screening DSA daily history failed for %s; falling back to local source %s: %s",
-                code,
-                source,
-                exc,
+            local_error = exc
+
+        normalized_adjustment = _env_text(price_adjustment).lower()
+        if normalized_adjustment not in {"", "qfq"}:
+            raise RuntimeError(
+                f"No daily history returned for {code}; local: {local_error}; "
+                f"DSA only supports qfq, requested {normalized_adjustment}"
             )
 
         try:
-            local_result = original_fetch(
-                code,
-                lookback_days=lookback_days,
-                source=source,
-                retries=retries,
-                cache_dir=cache_dir,
-                cache_ttl_seconds=cache_ttl_seconds,
-            )
-            if local_result is not None and not bool(getattr(local_result, "empty", False)):
-                return local_result
-        except Exception as local_error:
+            dsa_df, dsa_source = get_dsa_daily_history(code, lookback_days=lookback_days)
+            normalized = _normalize_dsa_daily_history(dsa_df)
+            if normalized is None or normalized.empty:
+                raise RuntimeError("DSA daily history returned no usable rows")
+            resolved_source = f"dsa:{dsa_source}"
+            normalized_code = code
+            normalize_code = getattr(daily_module, "_normalize_daily_code", None)
+            if callable(normalize_code):
+                normalized_code = normalize_code(code)
+            normalized.attrs["source"] = resolved_source
+            normalized.attrs["daily_source"] = resolved_source
+            normalized.attrs["daily_price_adjustment"] = "qfq"
+            normalized.attrs["daily_requested_source"] = source
+            normalized.attrs["daily_source_order"] = [resolved_source]
+            normalized.attrs["daily_source_order_notes"] = []
+            normalized.attrs["source_errors"] = [f"local: {local_error}"]
+            normalized.attrs["daily_source_health"] = {}
+            if cache_dir is not None:
+                cache_path_builder = getattr(daily_module, "_daily_history_cache_path", None)
+                cache_writer = getattr(daily_module, "_write_daily_history_cache", None)
+                if callable(cache_path_builder) and callable(cache_writer):
+                    cache_path = cache_path_builder(
+                        cache_dir,
+                        code=normalized_code,
+                        source=source,
+                        lookback_days=int(lookback_days),
+                    )
+                    cache_writer(
+                        cache_path,
+                        normalized,
+                        code=normalized_code,
+                        source=source,
+                        lookback_days=int(lookback_days),
+                    )
+            return normalized
+        except Exception as dsa_error:
             raise RuntimeError(
-                f"No daily history returned for {code}; DSA: {dsa_error}; local: {local_error}"
-            ) from local_error
-        raise RuntimeError(
-            f"No daily history returned for {code}; DSA: {dsa_error}; local source returned no usable rows"
-        )
+                f"No daily history returned for {code}; local: {local_error}; DSA: {dsa_error}"
+            ) from dsa_error
 
     return fetch_daily_history_with_dsa
 
@@ -1967,15 +1985,19 @@ def _build_screening_runtime_env(config: Config, *, max_results: Optional[int] =
 
 def _resolve_hotspot_provider(provider: str) -> Tuple[str, Any]:
     requested = (provider or "").strip()
-    if requested.lower() == "akshare":
-        return requested, DsaEastMoneyHotspotProvider()
+    if requested.lower() in {
+        "akshare",
+        "eastmoney",
+        "dsa_eastmoney",
+        "free",
+        "free_cached",
+    }:
+        return "akshare", DsaEastMoneyHotspotProvider()
     if requested:
         return requested, requested
-    configured = (os.getenv("INDUSTRY_PROVIDER") or "").strip()
-    if configured.lower() == "akshare":
-        return configured, DsaEastMoneyHotspotProvider()
-    if configured:
-        return configured, configured
+    # Industry mapping and hotspot discovery are separate contracts. In
+    # particular, ``free_cached`` is a valid industry overlay but not a
+    # hotspot engine provider name.
     return "akshare", DsaEastMoneyHotspotProvider()
 
 
@@ -3896,6 +3918,10 @@ def _normalize_candidate(raw: Any, rank: int) -> Dict[str, Any]:
         "volume_contraction_ratio": _first_present(item, source, "volume_contraction_ratio"),
         "support_confluence_count": _first_present(item, source, "support_confluence_count"),
         "trigger_distance_pct": _first_present(item, source, "trigger_distance_pct"),
+        "setup_type": item.get("setup_type") or source.get("setup_type") or "",
+        "setup_confirmed": _first_present(item, source, "setup_confirmed"),
+        "setup_trade_eligible": _first_present(item, source, "setup_trade_eligible"),
+        "setup_execution_status": item.get("setup_execution_status") or source.get("setup_execution_status") or "",
         "sector_breadth_count": _first_present(item, source, "sector_breadth_count"),
         "factor_scores": item.get("factor_scores") or source.get("factor_scores") or {},
         "trade_plan": item.get("trade_plan") or source.get("trade_plan") or {},

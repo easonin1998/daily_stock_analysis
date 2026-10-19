@@ -17,7 +17,7 @@ BaostockFetcher - 备用数据源 2 (Priority 3)
 import logging
 import re
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional, Generator
 
 import pandas as pd
@@ -374,10 +374,22 @@ class BaostockFetcher(BaseFetcher):
         
         return None
 
-    def get_industry_map(self) -> dict[str, str]:
+    def get_industry_map(
+        self,
+        as_of: str | date | datetime | None = None,
+    ) -> dict[str, str]:
         """Return one full-market A-share code-to-industry mapping."""
         with self._baostock_session() as bs:
-            rs = bs.query_stock_industry()
+            query_date = ""
+            if as_of is not None:
+                parsed = pd.to_datetime(as_of, errors="coerce")
+                if not pd.isna(parsed):
+                    query_date = parsed.strftime("%Y-%m-%d")
+            rs = (
+                bs.query_stock_industry(date=query_date)
+                if query_date
+                else bs.query_stock_industry()
+            )
             if rs.error_code != '0':
                 raise DataFetchError(f"Baostock 行业查询失败: {rs.error_msg}")
 

@@ -10,6 +10,7 @@ from src.services.screening.daily import (
     _fetch_daily_sina,
     _fetch_daily_tencent,
     compute_daily_features,
+    enrich_daily_features,
 )
 from src.services.screening.filter import apply_hard_filters
 from src.services.screening.models import Pick, ScreeningConfig
@@ -17,6 +18,7 @@ from src.services.screening.pipeline import (
     _attach_market_regime_features,
     _attach_martin_cross_sectional_features,
     _attach_martin_cross_sectional_features_from_universe,
+    _build_market_aware_trade_plan,
 )
 from src.services.screening.risk import apply_sector_quota, assess_pick_risk
 from src.services.screening.scorer import compute_screen_scores, factor_score_columns
@@ -51,7 +53,17 @@ def test_only_martin_strategy_is_bundled() -> None:
 
     assert set(strategies) == {"martin_momentum_pullback"}
     strategy = strategies["martin_momentum_pullback"]
-    assert strategy.version == "2.6"
+    assert strategy.version == "3.3"
+    assert strategy.screening.execution_profile["profile_version"] == "3.3"
+    assert strategy.screening.execution_profile["adaptive_exit_enabled"] is True
+    assert strategy.screening.execution_profile["adaptive_exit_model"] == (
+        "tranche_cost_profit_floor_volatility"
+    )
+    assert strategy.screening.execution_profile["entry_setup_mode"] == "multi"
+    assert strategy.screening.execution_profile["tradable_setup_types"] == [
+        "first_pullback"
+    ]
+    assert strategy.screening.execution_profile["reentry_cooldown_days"] == 0
     assert strategy.screening.hard_filters.price_min == 1.5
     assert strategy.screening.hard_filters.relative_strength_60d_pctile_min == 95.0
     assert strategy.screening.hard_filters.trigger_distance_pct_max is None
@@ -140,6 +152,31 @@ def test_cached_sina_history_estimates_missing_amount_before_feature_calculation
     assert features["avg_amount_20d"] == round(expected, 4)
 
 
+def test_daily_enrichment_keeps_precomputed_boolean_columns_nullable_on_fetch_failure() -> None:
+    frame = pd.DataFrame([{
+        "code": "600519",
+        "ema_stack_bullish": True,
+        "ema21_rising": True,
+        "ema50_rising": True,
+        "one_word_limit_up": False,
+        "ma_bullish": True,
+        "price_above_ma20": True,
+    }])
+
+    def failed_history_fetcher(*args, **kwargs):
+        raise RuntimeError("source unavailable")
+
+    enriched = enrich_daily_features(
+        frame,
+        history_fetcher=failed_history_fetcher,
+    )
+
+    assert str(enriched["ema_stack_bullish"].dtype) == "boolean"
+    assert pd.isna(enriched.loc[0, "ema_stack_bullish"])
+    assert enriched.attrs["daily_success_count"] == 0
+    assert enriched.attrs["daily_errors"] == ["600519: source unavailable"]
+
+
 def test_market_regime_gate_rejects_broad_risk_off_snapshots() -> None:
     strategy = load_all_strategies(STRATEGIES_DIR)["martin_momentum_pullback"]
     frame = pd.DataFrame([
@@ -153,6 +190,67 @@ def test_market_regime_gate_rejects_broad_risk_off_snapshots() -> None:
 
     assert float(gated.iloc[0]["market_positive_ratio"]) < 35.0
     assert apply_hard_filters(gated, snapshot_filters).empty
+
+
+def test_live_trade_plan_blocks_confirmed_entry_during_risk_off() -> None:
+    pick = Pick(
+        rank=1,
+        code="000001",
+        name="Example",
+        final_score=80.0,
+        screen_score=80.0,
+        price=10.0,
+        trigger_distance_pct=1.0,
+        adr_20_pct=4.0,
+        atr_20_pct=4.0,
+        ema21=9.5,
+        anchored_vwap_60d_high=9.5,
+    )
+
+    plan = _build_market_aware_trade_plan(
+        pick,
+        market_regime={
+            "state": "risk_off",
+            "score": 30.0,
+            "reason": "多日市场状态不足以支持新开仓",
+        },
+        enabled=True,
+    )
+
+    assert plan["signal_status"] == "market_blocked"
+    assert plan["action"] == "no_order"
+    assert plan["condition_orders"]["entry"]["status"] == "not_armed"
+
+
+def test_live_trade_plan_never_arms_watch_only_setup() -> None:
+    pick = Pick(
+        rank=1,
+        code="000002",
+        name="Platform Example",
+        final_score=82.0,
+        screen_score=82.0,
+        price=10.0,
+        trigger_distance_pct=1.0,
+        adr_20_pct=4.0,
+        atr_20_pct=4.0,
+        ema21=9.5,
+        anchored_vwap_60d_high=9.5,
+        setup_type="platform_breakout",
+        setup_confirmed=True,
+        setup_trade_eligible=False,
+        setup_execution_status="watch_only",
+    )
+
+    plan = _build_market_aware_trade_plan(
+        pick,
+        market_regime={"state": "risk_on", "score": 80.0, "reason": "趋势扩散"},
+        enabled=True,
+    )
+
+    assert plan["signal_status"] == "watch_only_setup"
+    assert plan["action"] == "no_order"
+    assert plan["condition_orders"]["entry"]["status"] == "not_armed"
+    assert plan["setup_permission"]["setup_type"] == "platform_breakout"
 
 
 def test_martin_hard_filters_and_seven_factor_score_form_one_pipeline() -> None:
