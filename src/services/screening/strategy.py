@@ -771,6 +771,8 @@ def _active_hard_filters(filters_config: HardFilterConfig) -> list[str]:
 
 def _required_snapshot_fields(filters_config: HardFilterConfig) -> list[str]:
     fields: list[str] = []
+    if filters_config.exclude_beijing_stock_exchange:
+        fields.append("code")
     if filters_config.exclude_st:
         fields.append("name")
     if filters_config.amount_min is not None:

@@ -39,6 +39,8 @@ import {
   type ScreeningStrategy,
 } from '../api/screening';
 import { formatParsedApiError, getParsedApiError, toApiErrorMessage, type ParsedApiError } from '../api/error';
+import { portfolioApi } from '../api/portfolio';
+import type { PortfolioAccountItem } from '../types/portfolio';
 import { AppPage, Button, InlineAlert, Select } from '../components/common';
 
 const MARKETS = [{ id: 'cn', label: 'A 股' }];
@@ -69,6 +71,7 @@ type PersistedScreenTask = {
   market: string;
   strategy: string;
   maxResults: number;
+  accountId?: number;
 };
 
 const readPersistedScreenTask = (): PersistedScreenTask | null => {
@@ -90,6 +93,7 @@ const readPersistedScreenTask = (): PersistedScreenTask | null => {
       market: typeof parsed.market === 'string' && parsed.market.trim() ? parsed.market : 'cn',
       strategy: typeof parsed.strategy === 'string' && parsed.strategy.trim() ? parsed.strategy : DEFAULT_SCREENING_STRATEGY,
       maxResults: Number.isFinite(restoredMaxResults) ? Math.min(100, Math.max(1, restoredMaxResults)) : 3,
+      accountId: Number.isFinite(Number(parsed.accountId)) ? Number(parsed.accountId) : undefined,
     };
   } catch {
     return null;
@@ -822,6 +826,8 @@ const StockScreeningPage: React.FC = () => {
   const [strategy, setStrategy] = useState(restoredTask?.strategy || DEFAULT_SCREENING_STRATEGY);
   const [strategies, setStrategies] = useState<ScreeningStrategy[]>([]);
   const [maxResults, setMaxResults] = useState(restoredTask?.maxResults || 3);
+  const [accounts, setAccounts] = useState<PortfolioAccountItem[]>([]);
+  const [accountId, setAccountId] = useState<number | ''>(restoredTask?.accountId || '');
   const [notifyOnComplete, setNotifyOnComplete] = useState(true);
   const [candidates, setCandidates] = useState<ScreeningCandidate[]>([]);
   const [hotspots, setHotspots] = useState<ScreeningHotspot[]>([]);
@@ -1091,6 +1097,26 @@ const StockScreeningPage: React.FC = () => {
 
   useEffect(() => {
     let active = true;
+    portfolioApi.getAccounts(false)
+      .then((result) => {
+        if (!active) return;
+        const nextAccounts = (result.accounts || []).filter((item) => item.market === market);
+        setAccounts(nextAccounts);
+        setAccountId((current) => {
+          if (current && nextAccounts.some((item) => item.id === current)) return current;
+          return nextAccounts[0]?.id || '';
+        });
+      })
+      .catch(() => {
+        if (active) setAccounts([]);
+      });
+    return () => {
+      active = false;
+    };
+  }, [market]);
+
+  useEffect(() => {
+    let active = true;
     screeningApi
       .getStatus()
       .then((status) => {
@@ -1279,6 +1305,13 @@ const StockScreeningPage: React.FC = () => {
     setMaxResults(nextMaxResults);
   };
 
+  const handleAccountChange = (nextAccountId: number | '') => {
+    if (nextAccountId !== accountId) {
+      clearScreeningResults();
+    }
+    setAccountId(nextAccountId);
+  };
+
   const handleSubmit = async () => {
     setLoading(true);
     setError('');
@@ -1290,6 +1323,7 @@ const StockScreeningPage: React.FC = () => {
         market,
         strategy,
         maxResults,
+        accountId: accountId || undefined,
         notify: notifyOnComplete,
         webBaseUrl: window.location.origin,
       });
@@ -1298,6 +1332,7 @@ const StockScreeningPage: React.FC = () => {
         market,
         strategy,
         maxResults,
+        accountId: accountId || undefined,
       });
       setActiveTaskId(task.taskId);
       setTaskProgress(0);
@@ -1607,7 +1642,7 @@ const StockScreeningPage: React.FC = () => {
           </span>
         </div>
 
-        <div className="grid gap-4 lg:grid-cols-[1fr_1.2fr_180px_auto] lg:items-end">
+        <div className="grid gap-4 lg:grid-cols-[1fr_1fr_1.2fr_150px_auto] lg:items-end">
           <label className="space-y-2 text-xs font-medium text-secondary-text">
             市场
             <select
@@ -1620,6 +1655,21 @@ const StockScreeningPage: React.FC = () => {
                 <option key={item.id} value={item.id}>
                   {item.label}
                 </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="space-y-2 text-xs font-medium text-secondary-text">
+            执行账户
+            <select
+              className="h-11 w-full rounded-xl border border-border bg-surface px-3 text-sm text-foreground outline-none transition-colors focus:border-cyan"
+              value={accountId}
+              disabled={loading}
+              onChange={(event) => handleAccountChange(event.target.value ? Number(event.target.value) : '')}
+            >
+              <option value="">不关联账户</option>
+              {accounts.map((item) => (
+                <option key={item.id} value={item.id}>{item.name}</option>
               ))}
             </select>
           </label>
@@ -1690,6 +1740,11 @@ const StockScreeningPage: React.FC = () => {
             ? strategyLoadError
             : selectedStrategy?.description || '策略会先执行硬过滤和因子评分，再进行风险与组合约束。'}
         </div>
+        {accountId ? (
+          <p className="mt-2 text-xs text-secondary-text">
+            候选将按所选账户的现金、持仓上限、技术止损和组合风险热度换算为可执行股数；飞书同时展示持仓动作。
+          </p>
+        ) : null}
         <label className="mt-3 inline-flex cursor-pointer items-center gap-2 text-xs font-medium text-secondary-text">
           <input
             type="checkbox"
@@ -1750,6 +1805,12 @@ const StockScreeningPage: React.FC = () => {
                   飞书：{screenMeta.notification.sent ? '已推送' : '推送失败，请检查机器人配置'}
                 </span>
               ) : null}
+              {screenMeta?.portfolioPlan ? (
+                <span>
+                  执行账户：{screenMeta.portfolioPlan.account.accountName} · 权益 {screenMeta.portfolioPlan.account.totalEquity.toFixed(2)} ·
+                  风险热度 {screenMeta.portfolioPlan.account.strategyRiskHeatPct.toFixed(2)}%
+                </span>
+              ) : null}
             </div>
           </details>
         </section>
@@ -1779,7 +1840,7 @@ const StockScreeningPage: React.FC = () => {
           </div>
         ) : (
           <div className="overflow-hidden rounded-xl border border-border">
-            <table className="w-full min-w-[860px] border-collapse text-sm">
+            <table className="w-full min-w-[1020px] border-collapse text-sm">
               <thead className="bg-surface text-left text-xs text-secondary-text">
                 <tr>
                   <th className="w-14 px-4 py-3 font-semibold">#</th>
@@ -1789,6 +1850,7 @@ const StockScreeningPage: React.FC = () => {
                   <th className="px-4 py-3 font-semibold">价格</th>
                   <th className="px-4 py-3 font-semibold">涨跌幅</th>
                   <th className="px-4 py-3 font-semibold">评分</th>
+                  <th className="px-4 py-3 font-semibold">账户计划</th>
                   <th className="px-4 py-3 font-semibold">排序依据</th>
                   <th className="px-4 py-3 font-semibold">风险</th>
                   <th className="px-4 py-3 font-semibold">详情</th>
@@ -1813,6 +1875,24 @@ const StockScreeningPage: React.FC = () => {
                         <td className="px-4 py-3 text-secondary-text">{formatNumber(item.price)}</td>
                         <td className="px-4 py-3 text-secondary-text">{formatNumber(item.changePct)}%</td>
                         <td className="px-4 py-3 font-bold text-cyan">{formatScore(item.score)}</td>
+                        <td className="px-4 py-3 text-secondary-text">
+                          {item.tradePlan?.positionSizing?.recommendedQuantity ? (
+                            <div>
+                              <div className="font-semibold text-foreground">
+                                {item.tradePlan.positionSizing.recommendedQuantity} 股
+                              </div>
+                              <div className="text-[11px]">
+                                约 {Number(item.tradePlan.positionSizing.estimatedNotional || 0).toFixed(2)}
+                              </div>
+                            </div>
+                          ) : screenMeta.portfolioPlan ? (
+                            <span className="text-[11px]">
+                              {item.tradePlan?.positionSizing?.constraintReason || '观察/受账户约束'}
+                            </span>
+                          ) : (
+                            <span className="text-[11px]">未关联账户</span>
+                          )}
+                        </td>
                         <td className="px-4 py-3 text-secondary-text">{factorRanking ? '因子排序' : formatScore(item.llmScore)}</td>
                         <td className="px-4 py-3">
                           <span className={`rounded-lg px-2.5 py-1 text-xs font-semibold ${getRiskClassName(item.riskLevel)}`}>
@@ -1831,7 +1911,7 @@ const StockScreeningPage: React.FC = () => {
                       </tr>
                       {expanded ? (
                         <tr className="border-t border-border bg-surface/45">
-                          <td colSpan={10} className="px-4 py-4">
+                          <td colSpan={11} className="px-4 py-4">
                             <div className="grid gap-4 lg:grid-cols-[1.1fr_1fr]">
                               <div className="space-y-3">
                                 <div>
@@ -1841,6 +1921,15 @@ const StockScreeningPage: React.FC = () => {
                                 <div>
                                   <p className="text-xs font-semibold text-secondary-text">操作信号</p>
                                   <p className="mt-1 text-sm text-foreground">{getSignal(item)}</p>
+                                  {item.tradePlan?.entry ? (
+                                    <div className="mt-2 rounded-lg border border-border bg-card px-3 py-2 text-xs leading-5 text-secondary-text">
+                                      竞价区间 {item.tradePlan.entry.minPrice ?? '--'} - {item.tradePlan.entry.maxPrice ?? '--'} ·
+                                      初始止损 {item.tradePlan.exit?.initialStopPrice ?? '--'}
+                                      {item.tradePlan.positionSizing?.recommendedQuantity
+                                        ? ` · 计划 ${item.tradePlan.positionSizing.recommendedQuantity} 股`
+                                        : ''}
+                                    </div>
+                                  ) : null}
                                   <button
                                     className="mt-2 rounded-lg border border-cyan/40 px-3 py-1.5 text-xs font-semibold text-cyan transition-colors hover:bg-cyan/10"
                                     type="button"

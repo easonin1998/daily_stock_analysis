@@ -378,32 +378,39 @@ def load_cached_daily_history(
     price_adjustment: str | None = None,
 ) -> pd.DataFrame | None:
     """Load an exact or longer compatible cache without a network refresh."""
-    path = _daily_history_cache_path(
+    exact_path = _daily_history_cache_path(
         cache_dir,
         code=_normalize_daily_code(code),
         source=_normalize_daily_source(source),
         lookback_days=int(lookback_days),
     )
-    cached = _read_daily_history_cache(path, ttl_seconds=None, allow_stale=True)
     required_adjustment = _normalize_price_adjustment(price_adjustment)
-    if cached is not None and _matches_price_adjustment(cached, required_adjustment):
+    normalized_code = _normalize_daily_code(code)
+    normalized_source = _normalize_daily_source(source)
+    candidate_paths = [exact_path]
+    candidate_paths.extend(
+        path
+        for candidate_lookback, path in sorted(
+            _list_daily_history_cache_candidates(
+                cache_dir,
+                code=normalized_code,
+                source=normalized_source,
+            ),
+            key=lambda item: item[0],
+        )
+        if candidate_lookback >= int(lookback_days) and path != exact_path
+    )
+    for candidate_path in candidate_paths:
+        cached = _read_daily_history_cache(
+            candidate_path,
+            ttl_seconds=None,
+            allow_stale=True,
+        )
+        if cached is None or not _matches_price_adjustment(cached, required_adjustment):
+            continue
+        if candidate_path != exact_path:
+            cached.attrs["daily_cache_compatible_fallback"] = True
         return cached
-    compatible_path = _find_compatible_daily_history_cache(
-        cache_dir,
-        code=_normalize_daily_code(code),
-        source=_normalize_daily_source(source),
-        minimum_lookback_days=int(lookback_days),
-    )
-    if compatible_path is None:
-        return None
-    compatible = _read_daily_history_cache(
-        compatible_path,
-        ttl_seconds=None,
-        allow_stale=True,
-    )
-    if compatible is not None and _matches_price_adjustment(compatible, required_adjustment):
-        compatible.attrs["daily_cache_compatible_fallback"] = True
-        return compatible
     return None
 
 

@@ -182,6 +182,14 @@ class Config:
         _PROJECT_ROOT / "data" / "snapshot.last_good.json"
     )
     snapshot_cache_ttl_seconds: float = 300.0
+    qmt_quotes_enabled: bool = False
+    qmt_python: Path | None = None
+    qmt_xtquant_path: Path | None = None
+    qmt_port: int | None = None
+    qmt_timeout_sec: float = 45.0
+    qmt_primary_min_coverage_pct: float = 90.0
+    qmt_sector_prefixes: list[str] = field(default_factory=lambda: ["TGN"])
+    qmt_industry_sector_prefixes: list[str] = field(default_factory=lambda: ["THY"])
 
     # Strategy directory
     strategies_dir: Path = field(default_factory=_default_strategies_dir)
@@ -224,6 +232,7 @@ class Config:
     daily_feature_library_path: Path | None = None
     daily_feature_library_max_age_days: int = 7
     sector_strength_history_path: Path | None = None
+    sector_heat_enabled: bool = True
     seed_pool_core_ratio: float = 0.55
     seed_pool_strength_ratio: float = 0.20
     seed_pool_activity_ratio: float = 0.15
@@ -336,6 +345,32 @@ class Config:
                 0.0,
                 _parse_float_env("SCREENING_SNAPSHOT_CACHE_TTL_SEC", 300.0),
             ),
+            qmt_quotes_enabled=_parse_bool_env("SCREENING_QMT_QUOTES_ENABLED", False),
+            qmt_python=_parse_optional_path_env("SCREENING_QMT_PYTHON"),
+            qmt_xtquant_path=_parse_optional_path_env("SCREENING_QMT_XTQUANT_PATH"),
+            qmt_port=_parse_optional_int_env("SCREENING_QMT_PORT"),
+            qmt_timeout_sec=max(
+                1.0,
+                _parse_float_env("SCREENING_QMT_TIMEOUT_SEC", 45.0),
+            ),
+            qmt_primary_min_coverage_pct=max(
+                0.0,
+                min(
+                    _parse_float_env(
+                        "SCREENING_QMT_PRIMARY_MIN_COVERAGE_PCT",
+                        90.0,
+                    ),
+                    100.0,
+                ),
+            ),
+            qmt_sector_prefixes=_parse_csv_env(
+                "SCREENING_QMT_SECTOR_PREFIXES",
+                ["TGN"],
+            ),
+            qmt_industry_sector_prefixes=_parse_csv_env(
+                "SCREENING_QMT_INDUSTRY_SECTOR_PREFIXES",
+                ["THY"],
+            ),
             snapshot_fallback_max_age_hours=_parse_optional_float_env(
                 "SNAPSHOT_FALLBACK_MAX_AGE_HOURS"
             ),
@@ -399,6 +434,7 @@ class Config:
                 int(os.getenv("SCREENING_DAILY_FEATURE_LIBRARY_MAX_AGE_DAYS", "7")),
             ),
             sector_strength_history_path=sector_strength_history_path,
+            sector_heat_enabled=_parse_bool_env("SCREENING_SECTOR_HEAT_ENABLED", True),
             seed_pool_core_ratio=_parse_ratio_env("SCREENING_SEED_POOL_CORE_RATIO", 0.55),
             seed_pool_strength_ratio=_parse_ratio_env("SCREENING_SEED_POOL_STRENGTH_RATIO", 0.20),
             seed_pool_activity_ratio=_parse_ratio_env("SCREENING_SEED_POOL_ACTIVITY_RATIO", 0.15),
@@ -448,6 +484,11 @@ def _parse_float_env(name: str, default: float) -> float:
     if value is None or value == "":
         return default
     return float(value)
+
+
+def _parse_optional_int_env(name: str) -> int | None:
+    value = os.getenv(name, "").strip()
+    return int(value) if value else None
 
 
 def _parse_ratio_env(name: str, default: float) -> float:

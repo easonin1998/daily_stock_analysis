@@ -36,6 +36,13 @@ VALID_COST_METHODS = {"fifo", "avg"}
 VALID_SIDES = {"buy", "sell"}
 VALID_CASH_DIRECTIONS = {"in", "out"}
 VALID_CORPORATE_ACTIONS = {"cash_dividend", "split_adjustment"}
+VALID_STRATEGY_ACTIONS = {
+    "initial_entry",
+    "add_on",
+    "partial_exit",
+    "full_exit",
+    "manual",
+}
 PORTFOLIO_FX_REFRESH_DISABLED_REASON = "portfolio_fx_update_disabled"
 PORTFOLIO_REALTIME_QUOTE_MAX_WORKERS = 4
 
@@ -198,6 +205,11 @@ class PortfolioService:
         currency: Optional[str] = None,
         trade_uid: Optional[str] = None,
         dedup_hash: Optional[str] = None,
+        strategy: Optional[str] = None,
+        strategy_version: Optional[str] = None,
+        signal_run_id: Optional[str] = None,
+        strategy_action: Optional[str] = None,
+        initial_stop_price: Optional[float] = None,
         note: Optional[str] = None,
     ) -> Dict[str, Any]:
         side_norm = (side or "").strip().lower()
@@ -212,6 +224,30 @@ class PortfolioService:
             raise ValueError("symbol is required")
         trade_uid_norm = (trade_uid or "").strip() or None
         dedup_hash_norm = (dedup_hash or "").strip() or None
+        strategy_norm = (strategy or "").strip() or None
+        strategy_version_norm = (strategy_version or "").strip() or None
+        signal_run_id_norm = (signal_run_id or "").strip() or None
+        strategy_action_norm = (strategy_action or "").strip().lower() or None
+        if strategy_action_norm and strategy_action_norm not in VALID_STRATEGY_ACTIONS:
+            raise ValueError(
+                "strategy_action must be one of: "
+                + ", ".join(sorted(VALID_STRATEGY_ACTIONS))
+            )
+        if strategy_action_norm and not strategy_norm:
+            raise ValueError("strategy is required when strategy_action is provided")
+        if strategy_norm and not strategy_action_norm:
+            raise ValueError("strategy_action is required for strategy-managed trades")
+        if strategy_action_norm in {"initial_entry", "add_on"} and side_norm != "buy":
+            raise ValueError(f"strategy_action {strategy_action_norm} requires a buy trade")
+        if strategy_action_norm in {"partial_exit", "full_exit"} and side_norm != "sell":
+            raise ValueError(f"strategy_action {strategy_action_norm} requires a sell trade")
+        if strategy_norm and side_norm == "buy" and initial_stop_price is None:
+            raise ValueError("initial_stop_price is required for strategy-managed buys")
+        if initial_stop_price is not None:
+            if initial_stop_price <= 0:
+                raise ValueError("initial_stop_price must be > 0")
+            if side_norm == "buy" and initial_stop_price >= price:
+                raise ValueError("initial_stop_price must be below the buy price")
         try:
             with self.repo.portfolio_write_session() as session:
                 account = self._require_active_account_in_session(session=session, account_id=account_id)
@@ -246,6 +282,15 @@ class PortfolioService:
                     price=float(price),
                     fee=float(fee),
                     tax=float(tax),
+                    strategy=strategy_norm,
+                    strategy_version=strategy_version_norm,
+                    signal_run_id=signal_run_id_norm,
+                    strategy_action=strategy_action_norm,
+                    initial_stop_price=(
+                        float(initial_stop_price)
+                        if initial_stop_price is not None
+                        else None
+                    ),
                     note=(note or "").strip() or None,
                     dedup_hash=dedup_hash_norm,
                 )
@@ -327,8 +372,18 @@ class PortfolioService:
             return {"id": int(row.id)}
 
     def delete_trade_event(self, trade_id: int) -> bool:
+        trade = self.repo.get_trade(trade_id)
+        if trade is None:
+            return False
         with self.repo.portfolio_write_session() as session:
-            return self.repo.delete_trade_in_session(session=session, trade_id=trade_id)
+            deleted = self.repo.delete_trade_in_session(session=session, trade_id=trade_id)
+        if deleted:
+            self.repo.delete_strategy_position(
+                account_id=int(trade.account_id),
+                symbol=self._normalize_symbol_for_position(trade.symbol),
+                market=self._normalize_market(trade.market),
+            )
+        return deleted
 
     def delete_cash_ledger_event(self, entry_id: int) -> bool:
         with self.repo.portfolio_write_session() as session:
@@ -685,6 +740,7 @@ class PortfolioService:
             account_id=account_id,
             key=key,
             as_of_date=trade_date,
+            sellable_only=key[1] == "cn",
             session=session,
         )
         if available_quantity + EPS < quantity:
@@ -701,6 +757,7 @@ class PortfolioService:
         account_id: int,
         key: Tuple[str, str, str],
         as_of_date: date,
+        sellable_only: bool = False,
         session: Optional[Any] = None,
     ) -> float:
         if session is None:
@@ -757,7 +814,8 @@ class PortfolioService:
                 raise ValueError(f"Invalid trade quantity for {key[0]}")
             side = (event.side or "").strip().lower()
             if side == "buy":
-                quantity_held += qty
+                if not (sellable_only and event_date == as_of_date):
+                    quantity_held += qty
                 continue
             if side != "sell":
                 raise ValueError(f"Unsupported trade side: {event.side}")
@@ -773,6 +831,49 @@ class PortfolioService:
                 quantity_held = 0.0
 
         return quantity_held
+
+    def _calculate_sellable_quantities(
+        self,
+        *,
+        trades: Iterable[Any],
+        corporate_actions: Iterable[Any],
+        as_of_date: date,
+    ) -> Dict[Tuple[str, str, str], float]:
+        """Calculate end-of-day sellable shares, including the A-share T+1 rule."""
+
+        events = []
+        for row in corporate_actions:
+            events.append(("corp", row.effective_date, row.id, row))
+        for row in trades:
+            events.append(("trade", row.trade_date, row.id, row))
+        priority = {"corp": 1, "trade": 2}
+        events.sort(key=lambda item: (item[1], priority[item[0]], item[2]))
+
+        quantities: Dict[Tuple[str, str, str], float] = defaultdict(float)
+        for event_type, event_date, _, event in events:
+            key = (
+                self._normalize_symbol_for_position(event.symbol),
+                self._normalize_market(event.market),
+                self._normalize_currency(event.currency),
+            )
+            # Keep zero-valued keys so a CN position opened today is reported as
+            # unsellable instead of falling back to its full held quantity.
+            quantities[key] += 0.0
+            if event_type == "corp":
+                if (event.action_type or "").strip().lower() == "split_adjustment":
+                    ratio = float(event.split_ratio or 0.0)
+                    if ratio > 0:
+                        quantities[key] *= ratio
+                continue
+
+            qty = float(event.quantity or 0.0)
+            side = (event.side or "").strip().lower()
+            if side == "buy":
+                if key[1] != "cn" or event_date < as_of_date:
+                    quantities[key] += qty
+            elif side == "sell":
+                quantities[key] = max(0.0, quantities[key] - qty)
+        return dict(quantities)
 
     def _replay_account(
         self,
@@ -940,6 +1041,11 @@ class PortfolioService:
             cost_method=cost_method,
             fifo_lots=fifo_lots,
             avg_state=avg_state,
+            sellable_quantities=self._calculate_sellable_quantities(
+                trades=trades,
+                corporate_actions=corporate_actions,
+                as_of_date=as_of_date,
+            ),
             include_realtime=include_realtime,
         )
         fx_stale = fx_stale or stale_pos
@@ -1012,6 +1118,7 @@ class PortfolioService:
         cost_method: str,
         fifo_lots: Dict[Tuple[str, str, str], List[Dict[str, Any]]],
         avg_state: Dict[Tuple[str, str, str], _AvgState],
+        sellable_quantities: Optional[Dict[Tuple[str, str, str], float]] = None,
         include_realtime: bool = True,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], float, float, bool]:
         position_rows: List[Dict[str, Any]] = []
@@ -1116,6 +1223,16 @@ class PortfolioService:
                     "market": market,
                     "currency": currency,
                     "quantity": round(qty, 8),
+                    "sellable_quantity": round(
+                        min(
+                            qty,
+                            max(
+                                0.0,
+                                float((sellable_quantities or {}).get(key, qty)),
+                            ),
+                        ),
+                        8,
+                    ),
                     "avg_cost": round(avg_cost, 8),
                     "total_cost": round(total_cost, 8),
                     "last_price": round(float(last_price), 8),
@@ -1676,6 +1793,15 @@ class PortfolioService:
             "price": float(row.price),
             "fee": float(row.fee),
             "tax": float(row.tax),
+            "strategy": row.strategy,
+            "strategy_version": row.strategy_version,
+            "signal_run_id": row.signal_run_id,
+            "strategy_action": row.strategy_action,
+            "initial_stop_price": (
+                float(row.initial_stop_price)
+                if row.initial_stop_price is not None
+                else None
+            ),
             "note": row.note,
             "created_at": row.created_at.isoformat() if row.created_at else None,
         }

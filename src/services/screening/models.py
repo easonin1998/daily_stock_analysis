@@ -11,6 +11,7 @@ from datetime import datetime
 @dataclass
 class HardFilterConfig:
     exclude_st: bool = True
+    exclude_beijing_stock_exchange: bool = False
     price_min: float | None = None
     price_max: float | None = None
     amount_min: float | None = None
@@ -307,6 +308,7 @@ class ScreenResult:
     result_variant_rotated_slots: int = 0
     market_regime: dict[str, Any] = field(default_factory=dict)
     sector_overview: dict[str, Any] = field(default_factory=dict)
+    board_heat_overview: dict[str, Any] = field(default_factory=dict)
     analysis_date: str = ""
     saved_path: str = ""
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())

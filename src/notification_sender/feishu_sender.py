@@ -224,6 +224,16 @@ class FeishuSender:
             return "--"
 
     @staticmethod
+    def _format_quantity(value: Any) -> str:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return "--"
+        if number.is_integer():
+            return f"{int(number):,}"
+        return f"{number:,.2f}"
+
+    @staticmethod
     def _strip_markdown_tables(markdown: str) -> str:
         """Keep narrative in markdown while structured tables render natively."""
         lines = (markdown or "").splitlines()
@@ -506,6 +516,98 @@ class FeishuSender:
             ),
         })
 
+        board_heat_overview = (
+            payload.get("board_heat_overview")
+            if isinstance(payload.get("board_heat_overview"), dict)
+            else {}
+        )
+        board_heat_rows: List[Dict[str, Any]] = []
+        raw_board_heat = board_heat_overview.get("industry")
+        if isinstance(raw_board_heat, list):
+            for index, item in enumerate(raw_board_heat[:5], start=1):
+                if not isinstance(item, dict):
+                    continue
+                board_heat_rows.append({
+                    "sector": f"{index}. {cls._compact_card_text(item.get('name'), 24) or '--'}",
+                    "heat": cls._format_decimal(item.get("score")),
+                    "change": cls._format_change(item.get("change_pct")),
+                    "advance": cls._format_change(item.get("advance_ratio")),
+                    "amount": cls._format_change(item.get("amount_share_pct")),
+                })
+        board_heat_status = str(board_heat_overview.get("status") or "unavailable")
+        board_heat_status_text = {
+            "available": "可用",
+            "unavailable": "不可用",
+            "stale": "过期缓存",
+        }.get(board_heat_status, board_heat_status)
+        board_heat_date = cls._compact_card_text(
+            board_heat_overview.get("trading_date"), 16
+        ) or analysis_date
+        board_heat_observed_at = cls._compact_card_text(
+            board_heat_overview.get("observed_at"), 32
+        )
+        elements.append({
+            "tag": "markdown",
+            "content": (
+                "### ⚡ 当日行业热度\n"
+                f"状态 **{board_heat_status_text}** ｜ 行情源 "
+                f"**{cls._compact_card_text(board_heat_overview.get('quote_source'), 20) or '--'}**\n"
+                f"<font color='grey'>Baostock 行业归属 · 交易日 {board_heat_date}"
+                f"{(' · 观测时间 ' + board_heat_observed_at) if board_heat_observed_at else ''}</font>"
+            ),
+        })
+        if board_heat_rows and board_heat_status == "available":
+            elements.append(cls._build_table("screening_daily_sectors", [
+                {"name": "sector", "display_name": "行业", "data_type": "text", "width": "32%", "vertical_align": "top"},
+                {"name": "heat", "display_name": "当日热度", "data_type": "text", "width": "17%", "horizontal_align": "right"},
+                {"name": "change", "display_name": "涨跌", "data_type": "text", "width": "15%", "horizontal_align": "right"},
+                {"name": "advance", "display_name": "上涨占比", "data_type": "text", "width": "18%", "horizontal_align": "right"},
+                {"name": "amount", "display_name": "成交占比", "data_type": "text", "width": "18%", "horizontal_align": "right"},
+            ], board_heat_rows))
+        else:
+            elements.append({
+                "tag": "markdown",
+                "content": "<font color='grey'>暂无与分析交易日一致的收盘行业热度快照。</font>",
+            })
+
+        concept_heat_rows: List[Dict[str, Any]] = []
+        raw_concept_heat = board_heat_overview.get("concept")
+        if isinstance(raw_concept_heat, list):
+            for index, item in enumerate(raw_concept_heat[:5], start=1):
+                if not isinstance(item, dict):
+                    continue
+                concept_heat_rows.append({
+                    "theme": f"{index}. {cls._compact_card_text(item.get('name'), 24) or '--'}",
+                    "heat": cls._format_decimal(item.get("score")),
+                    "change": cls._format_change(item.get("change_pct")),
+                    "flow": cls._format_decimal(item.get("fund_flow_score")),
+                    "members": str(item.get("member_count") or "--"),
+                })
+        concept_source = cls._compact_card_text(
+            board_heat_overview.get("concept_source"), 40
+        ) or "--"
+        elements.append({
+            "tag": "markdown",
+            "content": (
+                "### 🎯 当日题材热度\n"
+                f"状态 **{'可用' if concept_heat_rows else '不可用'}** ｜ 来源 **{concept_source}**\n"
+                "<font color='grey'>题材与行业分榜；资金分位为当日概念板块横截面排名。</font>"
+            ),
+        })
+        if concept_heat_rows:
+            elements.append(cls._build_table("screening_daily_concepts", [
+                {"name": "theme", "display_name": "题材", "data_type": "text", "width": "34%", "vertical_align": "top"},
+                {"name": "heat", "display_name": "综合热度", "data_type": "text", "width": "18%", "horizontal_align": "right"},
+                {"name": "change", "display_name": "涨跌", "data_type": "text", "width": "16%", "horizontal_align": "right"},
+                {"name": "flow", "display_name": "资金分位", "data_type": "text", "width": "18%", "horizontal_align": "right"},
+                {"name": "members", "display_name": "成分数", "data_type": "text", "width": "14%", "horizontal_align": "right"},
+            ], concept_heat_rows))
+        else:
+            elements.append({
+                "tag": "markdown",
+                "content": "<font color='grey'>当日概念资金流源不可用，未用行业榜代替题材榜。</font>",
+            })
+
         sector_overview = (
             payload.get("sector_overview")
             if isinstance(payload.get("sector_overview"), dict)
@@ -534,14 +636,25 @@ class FeishuSender:
         flow_status = status_label.get(
             str(sector_overview.get("fund_flow_status") or "unavailable"), "不可用"
         )
+        sector_count = int(sector_overview.get("sector_count") or 0)
+        external_count = int(sector_overview.get("external_heat_coverage_count") or 0)
+        flow_count = int(sector_overview.get("fund_flow_coverage_count") or 0)
         sector_as_of = cls._compact_card_text(sector_overview.get("as_of"), 16) or analysis_date
+        feature_coverage = cls._format_decimal(
+            sector_overview.get("daily_feature_coverage_pct")
+        )
+        industry_coverage = cls._format_decimal(
+            sector_overview.get("industry_coverage_pct")
+        )
         elements.append({
             "tag": "markdown",
             "content": (
-                "### 🔥 行业板块热度\n"
-                f"本地量价 **{local_status}** ｜ 外部热度 **{external_status}** ｜ "
-                f"资金流 **{flow_status}**\n"
-                f"<font color='grey'>数据日 {sector_as_of} · 覆盖 {sector_overview.get('sector_count') or 0} 个行业"
+                "### 🔥 行业板块热度（中期趋势）\n"
+                f"本地量价 **{local_status}** ｜ 外部热度 **{external_status} "
+                f"({external_count}/{sector_count})** ｜ 资金流 **{flow_status} "
+                f"({flow_count}/{sector_count})**\n"
+                f"<font color='grey'>数据日 {sector_as_of} · 覆盖 {sector_count} 个行业"
+                f" · 日线覆盖 {feature_coverage}% · 行业归属覆盖 {industry_coverage}%"
                 f"{' · 使用最近缓存' if sector_overview.get('stale') else ''}</font>"
             ),
         })
@@ -579,17 +692,40 @@ class FeishuSender:
                     "leaders": cls._compact_card_text("、".join(str(value) for value in leaders), 30) or "--",
                 })
         theme_status = str(theme_overview.get("status") or "unavailable")
-        theme_status_text = status_label.get(theme_status, theme_status)
+        theme_status_text = {
+            "available": "可用",
+            "unavailable": "不可用",
+            "stale": "过期缓存",
+        }.get(theme_status, theme_status)
         provider_text = cls._compact_card_text(theme_overview.get("provider"), 36) or "免费源"
+        theme_data_as_of = cls._compact_card_text(
+            theme_overview.get("data_as_of") or theme_overview.get("cached_at"),
+            32,
+        )
+        theme_freshness_reason = cls._compact_card_text(
+            theme_overview.get("freshness_reason"),
+            80,
+        )
+        freshness_line = ""
+        if theme_status == "stale":
+            freshness_line = (
+                "\n<font color='red'>"
+                f"缓存时间 {theme_data_as_of or '--'}"
+                f" · {theme_freshness_reason or '未通过分析日时效校验'}"
+                "；旧榜单已隐藏，不参与当日题材判断。</font>"
+            )
+        elif theme_data_as_of:
+            freshness_line = f"\n<font color='grey'>数据时间 {theme_data_as_of}</font>"
         elements.append({
             "tag": "markdown",
             "content": (
                 "### 🧭 题材异动热度\n"
                 f"状态 **{theme_status_text}** ｜ 来源 **{provider_text}**"
                 f"{' ｜ 已回退缓存' if theme_overview.get('cache_used') or theme_overview.get('fallback_used') else ''}"
+                f"{freshness_line}"
             ),
         })
-        if theme_rows:
+        if theme_rows and theme_status != "stale":
             elements.append(cls._build_table("screening_themes", [
                 {"name": "theme", "display_name": "题材", "data_type": "text", "width": "30%", "vertical_align": "top"},
                 {"name": "heat", "display_name": "热度", "data_type": "text", "width": "13%", "horizontal_align": "right"},
@@ -597,7 +733,7 @@ class FeishuSender:
                 {"name": "stage", "display_name": "阶段", "data_type": "text", "width": "18%"},
                 {"name": "leaders", "display_name": "代表股", "data_type": "text", "width": "26%", "vertical_align": "top"},
             ], theme_rows))
-        else:
+        elif theme_status != "stale":
             source_errors = theme_overview.get("source_errors")
             reason = ""
             if isinstance(source_errors, list) and source_errors:
@@ -610,6 +746,102 @@ class FeishuSender:
                 ),
             })
 
+        portfolio_plan = (
+            payload.get("portfolio_plan")
+            if isinstance(payload.get("portfolio_plan"), dict)
+            else {}
+        )
+        portfolio_account = (
+            portfolio_plan.get("account")
+            if isinstance(portfolio_plan.get("account"), dict)
+            else {}
+        )
+        holding_rows: List[Dict[str, Any]] = []
+        raw_holdings = portfolio_plan.get("holdings")
+        if isinstance(raw_holdings, list):
+            action_labels = {
+                "sell_next_open_call_auction": "次日竞价卖出",
+                "partial_sell_next_open_call_auction": "次日竞价减仓",
+                "keep_and_review_after_close": "继续持有",
+                "wait_for_complete_close": "等待当日收盘",
+                "hold_without_rule_change": "数据不足，保持条件",
+                "manual_review": "人工确认",
+            }
+            for item in raw_holdings[:8]:
+                if not isinstance(item, dict):
+                    continue
+                action = action_labels.get(
+                    str(item.get("action") or ""),
+                    cls._compact_card_text(item.get("status"), 16) or "--",
+                )
+                if item.get("execution_status") == "blocked_t1":
+                    action = "T+1 暂不可卖"
+                elif item.get("recommended_partial_sell_quantity"):
+                    action = (
+                        f"减仓 {cls._format_quantity(item.get('recommended_partial_sell_quantity'))}股"
+                    )
+                add_on = item.get("add_on_plan")
+                if (
+                    action == "继续持有"
+                    and isinstance(add_on, dict)
+                    and add_on.get("status") == "ready"
+                ):
+                    action = (
+                        f"可加仓 {cls._format_quantity(add_on.get('recommended_quantity'))}股\n"
+                        f"竞价≤{cls._format_decimal(add_on.get('max_price'))}"
+                    )
+                holding_rows.append({
+                    "symbol": cls._compact_card_text(item.get("symbol"), 14) or "--",
+                    "quantity": (
+                        f"{cls._format_quantity(item.get('quantity'))} / "
+                        f"{cls._format_quantity(item.get('sellable_quantity'))}"
+                    ),
+                    "cost_close": (
+                        f"{cls._format_decimal(item.get('avg_cost'))} / "
+                        f"{cls._format_decimal(item.get('current_close'))}"
+                    ),
+                    "risk": (
+                        f"{cls._format_decimal(item.get('current_r_multiple'))}R / "
+                        f"{cls._format_decimal(item.get('active_exit_price'))}"
+                        if item.get("managed")
+                        else "未绑定策略"
+                    ),
+                    "action": action,
+                })
+        if portfolio_account:
+            regime_labels = {
+                "strong_risk_on": "强势进攻",
+                "risk_on": "正常进攻",
+                "neutral": "中性防守",
+                "risk_off": "风险关闭",
+                "unavailable": "暂不可用",
+            }
+            regime_state = str(portfolio_account.get("market_regime_state") or "unavailable")
+            elements.append({
+                "tag": "markdown",
+                "content": (
+                    "### 💼 账户执行摘要\n"
+                    f"账户 **{cls._compact_card_text(portfolio_account.get('account_name'), 28) or portfolio_account.get('account_id')}** ｜ "
+                    f"权益 **{cls._format_decimal(portfolio_account.get('total_equity'))}** ｜ "
+                    f"现金 **{cls._format_decimal(portfolio_account.get('total_cash'))}**\n"
+                    f"持仓 **{portfolio_account.get('position_count', 0)}** 只 ｜ "
+                    f"策略管理 **{portfolio_account.get('managed_position_count', 0)}** 只 ｜ "
+                    f"风险热度 **{cls._format_decimal(portfolio_account.get('strategy_risk_heat_pct'))}%**\n"
+                    f"市场状态 **{regime_labels.get(regime_state, regime_state)}**"
+                    f"（{portfolio_account.get('market_regime_date') or '日期不可用'}）\n"
+                    f"<font color='grey'>计划日期 {portfolio_account.get('as_of') or analysis_date}；"
+                    "未纳入策略的持仓不计入策略风险热度，也不会自动生成卖出条件。</font>"
+                ),
+            })
+            if holding_rows:
+                elements.append(cls._build_table("screening_portfolio_holdings", [
+                    {"name": "symbol", "display_name": "持仓", "data_type": "text", "width": "16%"},
+                    {"name": "quantity", "display_name": "持有/可卖", "data_type": "text", "width": "20%", "horizontal_align": "right"},
+                    {"name": "cost_close", "display_name": "成本/收盘", "data_type": "text", "width": "22%", "horizontal_align": "right"},
+                    {"name": "risk", "display_name": "当前R/防线", "data_type": "text", "width": "22%", "horizontal_align": "right"},
+                    {"name": "action", "display_name": "动作", "data_type": "text", "width": "20%"},
+                ], holding_rows))
+
         rows: List[Dict[str, Any]] = []
         for index, item in enumerate(candidates[:5], start=1):
             if not isinstance(item, dict):
@@ -619,9 +851,25 @@ class FeishuSender:
                 score_text = f"{float(score):.1f}"
             except (TypeError, ValueError):
                 score_text = "--"
+            candidate_plan = (
+                item.get("trade_plan")
+                if isinstance(item.get("trade_plan"), dict)
+                else {}
+            )
+            candidate_sizing = (
+                candidate_plan.get("position_sizing")
+                if isinstance(candidate_plan.get("position_sizing"), dict)
+                else {}
+            )
             rows.append({
                 "name": f"{index}. {cls._compact_card_text(item.get('name'), 24) or '--'}\n{cls._compact_card_text(item.get('code'), 16) or '--'}",
                 "score": score_text,
+                "order": (
+                    f"{int(candidate_sizing.get('recommended_quantity') or 0)}股\n"
+                    f"≈{cls._format_decimal(candidate_sizing.get('estimated_notional'))}"
+                    if candidate_sizing.get("recommended_quantity")
+                    else "观察/受限"
+                ),
                 "reason": cls._compact_card_text(item.get("reason") or item.get("recommendation_reason"), 88) or "通过策略硬条件",
             })
         if rows:
@@ -629,8 +877,9 @@ class FeishuSender:
                 {"tag": "markdown", "content": "### 🎯 前列候选"},
                 cls._build_table("screening_candidates", [
                     {"name": "name", "display_name": "标的", "data_type": "text", "width": "28%", "vertical_align": "top"},
-                    {"name": "score", "display_name": "评分", "data_type": "text", "width": "14%", "horizontal_align": "right", "vertical_align": "top"},
-                    {"name": "reason", "display_name": "入选依据", "data_type": "text", "width": "58%", "vertical_align": "top"},
+                    {"name": "score", "display_name": "评分", "data_type": "text", "width": "12%", "horizontal_align": "right", "vertical_align": "top"},
+                    {"name": "order", "display_name": "账户计划", "data_type": "text", "width": "22%", "horizontal_align": "right", "vertical_align": "top"},
+                    {"name": "reason", "display_name": "入选依据", "data_type": "text", "width": "38%", "vertical_align": "top"},
                 ], rows),
             ])
         else:
@@ -695,6 +944,21 @@ class FeishuSender:
             if heat_cap is not None:
                 risk_limits.append(f"组合风险热度上限 {heat_cap}%")
             risk_limits_text = f"（{'｜'.join(risk_limits)}）" if risk_limits else ""
+            account_quantity = sizing.get("recommended_quantity")
+            account_notional = sizing.get("estimated_notional")
+            execution_status = str(sizing.get("execution_status") or "")
+            account_sizing_line = ""
+            if account_quantity:
+                account_sizing_line = (
+                    f"账户计划：**{int(account_quantity)} 股**，按最高允许价估算 **{account_notional}**；"
+                    f"预计仓位 {sizing.get('estimated_weight_pct', '--')}%，风险热度 "
+                    f"{sizing.get('estimated_heat_pct', '--')}%\n"
+                )
+            elif portfolio_account:
+                account_sizing_line = (
+                    f"账户计划：**不下单**（{execution_status or '受限'}）"
+                    f"；{sizing.get('constraint_reason') or '未满足账户执行约束'}\n"
+                )
             sizing_line = (
                 f"仓位区间：**{minimum_weight if minimum_weight is not None else '--'}% - {weight_cap}%**"
                 f"{risk_limits_text}\n"
@@ -725,6 +989,7 @@ class FeishuSender:
                 f"1R 保本观察 {exit_plan.get('breakeven_activation_price', '--')}；"
                 f"2R 观察价 {exit_plan.get('two_r_reference_price', exit_plan.get('first_profit_price', '--'))}（非固定止盈）\n"
                 f"{risk_line}"
+                f"{account_sizing_line}"
                 f"{sizing_line}"
                 f"持仓纪律：{exit_plan.get('follow_through_days', 10)} 日至少 "
                 f"{exit_plan.get('follow_through_min_return_pct', 3)}%；{holding_period_text}；"

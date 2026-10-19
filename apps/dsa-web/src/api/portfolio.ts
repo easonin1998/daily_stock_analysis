@@ -19,6 +19,8 @@ import type {
   PortfolioPositionAnalysisRequest,
   PortfolioRiskResponse,
   PortfolioSnapshotResponse,
+  PortfolioStrategyAdoptRequest,
+  PortfolioStrategyPlanResponse,
   PortfolioTradeCreateRequest,
   PortfolioTradeListResponse,
 } from '../types/portfolio';
@@ -175,6 +177,11 @@ export const portfolioApi = {
       market: payload.market,
       currency: payload.currency,
       trade_uid: payload.tradeUid,
+      strategy: payload.strategy,
+      strategy_version: payload.strategyVersion,
+      signal_run_id: payload.signalRunId,
+      strategy_action: payload.strategyAction,
+      initial_stop_price: payload.initialStopPrice,
       note: payload.note,
     });
     return toCamelCase<PortfolioEventCreatedResponse>(response.data);
@@ -253,6 +260,38 @@ export const portfolioApi = {
     }
     const response = await apiClient.get<Record<string, unknown>>('/api/v1/portfolio/corporate-actions', { params });
     return toCamelCase<PortfolioCorporateActionListResponse>(response.data);
+  },
+
+  async getStrategyPlan(
+    accountId: number,
+    asOf?: string,
+    strategy = 'martin_momentum_pullback',
+  ): Promise<PortfolioStrategyPlanResponse> {
+    const response = await apiClient.get<Record<string, unknown>>('/api/v1/portfolio/strategy-plan', {
+      params: {
+        account_id: accountId,
+        ...(asOf ? { as_of: asOf } : {}),
+        strategy,
+      },
+    });
+    return toCamelCase<PortfolioStrategyPlanResponse>(response.data);
+  },
+
+  async adoptStrategyPosition(
+    symbol: string,
+    payload: PortfolioStrategyAdoptRequest,
+  ): Promise<PortfolioStrategyPlanResponse> {
+    const response = await apiClient.post<Record<string, unknown>>(
+      `/api/v1/portfolio/positions/${encodeURIComponent(symbol)}/strategy`,
+      {
+        account_id: payload.accountId,
+        initial_stop_price: payload.initialStopPrice,
+        as_of: payload.asOf,
+        strategy: payload.strategy ?? 'martin_momentum_pullback',
+        signal_run_id: payload.signalRunId,
+      },
+    );
+    return toCamelCase<PortfolioStrategyPlanResponse>(response.data);
   },
 
   async listImportBrokers(): Promise<PortfolioImportBrokerListResponse> {

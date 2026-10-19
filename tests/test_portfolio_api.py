@@ -179,6 +179,37 @@ class PortfolioApiTestCase(unittest.TestCase):
         self.assertAlmostEqual(account_snapshot["total_market_value"], 11000.0, places=6)
         self.assertAlmostEqual(account_snapshot["total_equity"], 11000.0, places=6)
 
+    def test_strategy_plan_and_legacy_position_adoption_flow(self) -> None:
+        account_id = self._create_position(quantity=100)
+
+        adopt_resp = self.client.post(
+            "/api/v1/portfolio/positions/600519/strategy",
+            json={
+                "account_id": account_id,
+                "initial_stop_price": 90.0,
+                "as_of": "2026-01-03",
+                "strategy": "martin_momentum_pullback",
+                "signal_run_id": "legacy-adoption",
+            },
+        )
+
+        self.assertEqual(adopt_resp.status_code, 200, adopt_resp.text)
+        adopted = adopt_resp.json()
+        self.assertEqual(adopted["status"], "available")
+        self.assertTrue(adopted["holdings"][0]["managed"])
+        self.assertEqual(adopted["holdings"][0]["opened_date"], "2026-01-03")
+        self.assertEqual(adopted["holdings"][0]["risk_amount"], 1000.0)
+        self.assertEqual(adopted["holdings"][0]["status"], "data_insufficient")
+
+        plan_resp = self.client.get(
+            "/api/v1/portfolio/strategy-plan",
+            params={"account_id": account_id, "as_of": "2026-01-03"},
+        )
+        self.assertEqual(plan_resp.status_code, 200, plan_resp.text)
+        plan = plan_resp.json()
+        self.assertEqual(plan["account"]["account_id"], account_id)
+        self.assertEqual(plan["holdings"][0]["strategy"], "martin_momentum_pullback")
+
     def test_snapshot_include_realtime_false_skips_realtime_quote(self) -> None:
         today = date.today()
         create_resp = self.client.post(

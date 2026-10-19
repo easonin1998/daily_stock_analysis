@@ -318,6 +318,8 @@ def summarize_sector_strength_snapshot(
             "fund_flow_status": SECTOR_STATUS_UNAVAILABLE,
             "external_heat_coverage_count": 0,
             "fund_flow_coverage_count": 0,
+            "external_heat_coverage_pct": 0.0,
+            "fund_flow_coverage_pct": 0.0,
             "top_sectors": [],
         }
 
@@ -371,10 +373,11 @@ def summarize_sector_strength_snapshot(
         if str(value).strip()
     ]
     selected_as_of = str(snapshot.attrs.get("selected_as_of") or "").strip()
+    sector_count = int(work["industry"].nunique())
     return {
         "status": SECTOR_STATUS_AVAILABLE if local_available else SECTOR_STATUS_UNAVAILABLE,
         "as_of": as_of_values[0] if as_of_values else selected_as_of,
-        "sector_count": int(work["industry"].nunique()),
+        "sector_count": sector_count,
         "source": source_values[0] if source_values else "",
         "stale": bool(snapshot.attrs.get("stale", False)),
         "local_heat_status": (
@@ -388,6 +391,12 @@ def summarize_sector_strength_snapshot(
         ),
         "external_heat_coverage_count": external_count,
         "fund_flow_coverage_count": flow_count,
+        "external_heat_coverage_pct": round(
+            external_count / sector_count * 100.0, 2
+        ) if sector_count else 0.0,
+        "fund_flow_coverage_pct": round(
+            flow_count / sector_count * 100.0, 2
+        ) if sector_count else 0.0,
         "top_sectors": rows,
     }
 

@@ -47,6 +47,7 @@ import type {
   PortfolioRiskResponse,
   PortfolioSide,
   PortfolioSnapshotResponse,
+  PortfolioStrategyPlanResponse,
   PortfolioTradeListItem,
 } from '../types/portfolio';
 import { areStockCodesEquivalent, normalizeStockCode } from '../utils/stockCode';
@@ -217,6 +218,10 @@ const PortfolioPage: React.FC = () => {
   const portfolioSignalsRequestRef = useRef(0);
   const [positionAnalysisLoadingKey, setPositionAnalysisLoadingKey] = useState<string | null>(null);
   const [positionAnalysisMessage, setPositionAnalysisMessage] = useState<string | null>(null);
+  const [strategyPlan, setStrategyPlan] = useState<PortfolioStrategyPlanResponse | null>(null);
+  const [strategyPlanWarning, setStrategyPlanWarning] = useState<string | null>(null);
+  const [strategyAdoptStops, setStrategyAdoptStops] = useState<Record<string, string>>({});
+  const [strategyAdoptLoadingKey, setStrategyAdoptLoadingKey] = useState<string | null>(null);
 
   const [brokers, setBrokers] = useState<PortfolioImportBrokerItem[]>([]);
   const [selectedBroker, setSelectedBroker] = useState('huatai');
@@ -255,6 +260,10 @@ const PortfolioPage: React.FC = () => {
     fee: '',
     tax: '',
     tradeUid: '',
+    manageWithStrategy: false,
+    strategyAction: 'initial_entry' as 'initial_entry' | 'add_on' | 'partial_exit' | 'full_exit',
+    initialStopPrice: '',
+    signalRunId: '',
     note: '',
   });
   const [cashForm, setCashForm] = useState({
@@ -370,6 +379,22 @@ const PortfolioPage: React.FC = () => {
     }
   }, [queryAccountId, costMethod]);
 
+  const loadStrategyPlan = useCallback(async () => {
+    if (!writableAccountId) {
+      setStrategyPlan(null);
+      setStrategyPlanWarning(null);
+      return;
+    }
+    try {
+      const result = await portfolioApi.getStrategyPlan(writableAccountId);
+      setStrategyPlan(result);
+      setStrategyPlanWarning(result.limitations?.[0] || null);
+    } catch (err) {
+      setStrategyPlan(null);
+      setStrategyPlanWarning(getParsedApiError(err).message || '策略持仓计划加载失败。');
+    }
+  }, [writableAccountId]);
+
   const loadEventsPage = useCallback(async (page: number) => {
     setEventLoading(true);
     try {
@@ -430,8 +455,8 @@ const PortfolioPage: React.FC = () => {
   }, [eventPage, loadEventsPage]);
 
   const refreshPortfolioData = useCallback(async (page = eventPage) => {
-    await Promise.all([loadSnapshotAndRisk(), loadEventsPage(page)]);
-  }, [eventPage, loadEventsPage, loadSnapshotAndRisk]);
+    await Promise.all([loadSnapshotAndRisk(), loadEventsPage(page), loadStrategyPlan()]);
+  }, [eventPage, loadEventsPage, loadSnapshotAndRisk, loadStrategyPlan]);
 
   useEffect(() => {
     void loadAccounts();
@@ -441,6 +466,10 @@ const PortfolioPage: React.FC = () => {
   useEffect(() => {
     void loadSnapshotAndRisk();
   }, [loadSnapshotAndRisk]);
+
+  useEffect(() => {
+    void loadStrategyPlan();
+  }, [loadStrategyPlan]);
 
   useEffect(() => {
     void loadEvents();
@@ -480,6 +509,14 @@ const PortfolioPage: React.FC = () => {
     rows.sort((a, b) => Number(b.marketValueBase || 0) - Number(a.marketValueBase || 0));
     return rows;
   }, [snapshot]);
+
+  const strategyPlanByPosition = useMemo(() => {
+    const mapped = new Map<string, PortfolioStrategyPlanResponse['holdings'][number]>();
+    for (const item of strategyPlan?.holdings || []) {
+      mapped.set(normalizeStockCode(item.symbol).toUpperCase(), item);
+    }
+    return mapped;
+  }, [strategyPlan]);
 
   const snapshotMatchesAccountScope = useMemo(() => {
     if (!snapshot) return false;
@@ -636,12 +673,53 @@ const PortfolioPage: React.FC = () => {
         fee: Number(tradeForm.fee || 0),
         tax: Number(tradeForm.tax || 0),
         tradeUid: tradeForm.tradeUid || undefined,
+        strategy: tradeForm.manageWithStrategy ? 'martin_momentum_pullback' : undefined,
+        strategyVersion: tradeForm.manageWithStrategy ? strategyPlan?.strategyVersion : undefined,
+        strategyAction: tradeForm.manageWithStrategy
+          ? (tradeForm.side === 'buy'
+              ? (tradeForm.strategyAction === 'add_on' ? 'add_on' : 'initial_entry')
+              : (tradeForm.strategyAction === 'partial_exit' ? 'partial_exit' : 'full_exit'))
+          : undefined,
+        initialStopPrice: tradeForm.manageWithStrategy && tradeForm.side === 'buy'
+          ? Number(tradeForm.initialStopPrice)
+          : undefined,
+        signalRunId: tradeForm.manageWithStrategy ? tradeForm.signalRunId || undefined : undefined,
         note: tradeForm.note || undefined,
       });
       await refreshPortfolioData();
-      setTradeForm((prev) => ({ ...prev, symbol: '', tradeUid: '', note: '' }));
+      setTradeForm((prev) => ({
+        ...prev,
+        symbol: '',
+        tradeUid: '',
+        initialStopPrice: '',
+        signalRunId: '',
+        note: '',
+      }));
     } catch (err) {
       setError(getParsedApiError(err));
+    }
+  };
+
+  const handleAdoptStrategy = async (row: FlatPosition) => {
+    const key = `${row.accountId}-${row.symbol}-${row.market}`;
+    const stop = Number(strategyAdoptStops[key]);
+    if (!Number.isFinite(stop) || stop <= 0) {
+      setWriteWarning(`请先为 ${row.symbol} 输入有效的初始止损价。`);
+      return;
+    }
+    setStrategyAdoptLoadingKey(key);
+    setWriteWarning(null);
+    try {
+      const result = await portfolioApi.adoptStrategyPosition(row.symbol, {
+        accountId: row.accountId,
+        initialStopPrice: stop,
+      });
+      setStrategyPlan(result);
+      setStrategyAdoptStops((current) => ({ ...current, [key]: '' }));
+    } catch (err) {
+      setError(getParsedApiError(err));
+    } finally {
+      setStrategyAdoptLoadingKey(null);
     }
   };
 
@@ -1191,6 +1269,23 @@ const PortfolioPage: React.FC = () => {
               className="mb-3 rounded-xl px-3 py-2 text-xs shadow-none"
             />
           ) : null}
+          {strategyPlan ? (
+            <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-cyan/25 bg-cyan/5 px-3 py-2 text-xs text-secondary">
+              <span className="font-semibold text-foreground">Martin v{strategyPlan.strategyVersion}</span>
+              <span>管理 {strategyPlan.account.managedPositionCount}/{strategyPlan.account.positionCount} 只</span>
+              <span>风险热度 {Number(strategyPlan.account.strategyRiskHeatPct || 0).toFixed(2)}%</span>
+              <span>市场状态 {strategyPlan.account.marketRegimeState || 'unavailable'}</span>
+              <span>计划日 {strategyPlan.account.asOf}</span>
+            </div>
+          ) : null}
+          {strategyPlanWarning ? (
+            <InlineAlert
+              variant="warning"
+              title="策略持仓提醒"
+              message={strategyPlanWarning}
+              className="mb-3 rounded-xl px-3 py-2 text-xs shadow-none"
+            />
+          ) : null}
           {positionRows.length === 0 ? (
             <EmptyState
               title={text.noPositionsTitle}
@@ -1199,7 +1294,7 @@ const PortfolioPage: React.FC = () => {
             />
           ) : (
             <div className="overflow-x-auto">
-              <table className="min-w-[860px] w-full text-sm">
+              <table className="min-w-[1080px] w-full text-sm">
                 <thead className="text-xs text-secondary border-b border-white/10">
                   <tr>
                     <th className="text-left py-2 pr-2">{text.account}</th>
@@ -1210,6 +1305,7 @@ const PortfolioPage: React.FC = () => {
                     <th className="text-right py-2 pr-2">{text.marketValue}</th>
                     <th className="text-right py-2 pr-3">{text.unrealizedPnl}</th>
                     <th className="text-right py-2 pr-3">{text.returnPct}</th>
+                    <th className="min-w-[13rem] text-left py-2 pr-3">策略计划</th>
                     <th className="min-w-[9rem] text-right py-2 pr-3">{t('decisionSignals.portfolioColumn')}</th>
                     <th className="w-20 text-right py-2">{text.action}</th>
                   </tr>
@@ -1219,11 +1315,16 @@ const PortfolioPage: React.FC = () => {
                     const rowKey = `${row.accountId}-${row.symbol}-${row.market}`;
                     const analyzing = positionAnalysisLoadingKey === rowKey;
                     const signal = signalByPositionKey.get(rowKey);
+                    const strategyHolding = strategyPlanByPosition.get(normalizeStockCode(row.symbol).toUpperCase());
+                    const adopting = strategyAdoptLoadingKey === rowKey;
                     return (
                     <tr key={rowKey} className="border-b border-white/5">
                       <td className="py-2 pr-2 text-secondary">{row.accountName}</td>
                       <td className="py-2 pr-2 font-mono text-foreground">{row.symbol}</td>
-                      <td className="py-2 pr-2 text-right">{row.quantity.toFixed(2)}</td>
+                      <td className="py-2 pr-2 text-right">
+                        <div>{row.quantity.toFixed(2)}</div>
+                        <div className="text-[11px] text-secondary">可卖 {(row.sellableQuantity ?? row.quantity).toFixed(2)}</div>
+                      </td>
                       <td className="py-2 pr-2 text-right">{row.avgCost.toFixed(4)}</td>
                       <td className="py-2 pr-2 text-right">
                         <div>{formatPositionPrice(row)}</div>
@@ -1253,6 +1354,70 @@ const PortfolioPage: React.FC = () => {
                         }`}
                       >
                         {formatSignedPct(row.unrealizedPnlPct)}
+                      </td>
+                      <td className="py-2 pr-3 align-top text-xs">
+                        {strategyHolding?.managed ? (
+                          <div className="space-y-1">
+                            <div className="font-semibold text-foreground">
+                              {strategyHolding.status === 'data_insufficient'
+                                ? '数据不足，人工确认'
+                                : strategyHolding.status === 'awaiting_close'
+                                  ? '等待当日收盘'
+                                : strategyHolding.action === 'sell_next_open_call_auction'
+                                  ? '次日竞价卖出'
+                                  : strategyHolding.action === 'partial_sell_next_open_call_auction'
+                                    ? '次日竞价减仓'
+                                    : strategyHolding.addOnPlan?.status === 'ready'
+                                      ? '达到加仓条件'
+                                      : '继续持有'}
+                            </div>
+                            <div className="text-secondary">
+                              当前 {strategyHolding.currentRMultiple?.toFixed(2) ?? '--'}R · 防线 {strategyHolding.activeExitPrice?.toFixed(3) ?? '--'}
+                            </div>
+                            {strategyHolding.recommendedSellQuantity ? (
+                              <div className="text-danger">计划卖出 {strategyHolding.recommendedSellQuantity} 股</div>
+                            ) : null}
+                            {strategyHolding.recommendedPartialSellQuantity ? (
+                              <div className="text-warning">计划减仓 {strategyHolding.recommendedPartialSellQuantity} 股</div>
+                            ) : null}
+                            {strategyHolding.addOnPlan?.status === 'ready' ? (
+                              <>
+                                <div className="text-cyan">
+                                  可加仓 {strategyHolding.addOnPlan.recommendedQuantity || 0} 股 · 防守价 {strategyHolding.addOnPlan.protectiveStopPrice?.toFixed(3) ?? '--'}
+                                </div>
+                                <div className="text-[11px] text-secondary">
+                                  次日竞价 {strategyHolding.addOnPlan.minPrice?.toFixed(3) ?? '--'} - {strategyHolding.addOnPlan.maxPrice?.toFixed(3) ?? '--'}
+                                </div>
+                              </>
+                            ) : null}
+                          </div>
+                        ) : writableAccountId === row.accountId ? (
+                          <div className="flex items-center gap-2">
+                            <input
+                              aria-label={`${row.symbol} 初始止损价`}
+                              className="input-surface input-focus-glow h-8 w-24 rounded-lg border bg-transparent px-2 text-xs"
+                              type="number"
+                              min="0"
+                              step="0.001"
+                              placeholder="初始止损"
+                              value={strategyAdoptStops[rowKey] || ''}
+                              onChange={(event) => setStrategyAdoptStops((current) => ({
+                                ...current,
+                                [rowKey]: event.target.value,
+                              }))}
+                            />
+                            <button
+                              type="button"
+                              className="btn-secondary shrink-0 !px-2 !py-1 !text-[11px]"
+                              disabled={adopting}
+                              onClick={() => void handleAdoptStrategy(row)}
+                            >
+                              {adopting ? '处理中' : '纳入策略'}
+                            </button>
+                          </div>
+                        ) : (
+                          <span className="text-secondary">选择单账户后可配置</span>
+                        )}
                       </td>
                       <td className="py-2 pr-3 text-right align-top">
                         <PortfolioSignalSummary item={signal} loading={portfolioSignalsLoading} />
@@ -1380,7 +1545,11 @@ const PortfolioPage: React.FC = () => {
               <input className={PORTFOLIO_INPUT_CLASS} type="date" value={tradeForm.tradeDate}
                 onChange={(e) => setTradeForm((prev) => ({ ...prev, tradeDate: e.target.value }))} required />
               <select className={PORTFOLIO_SELECT_CLASS} value={tradeForm.side}
-                onChange={(e) => setTradeForm((prev) => ({ ...prev, side: e.target.value as PortfolioSide }))}>
+                onChange={(e) => setTradeForm((prev) => ({
+                  ...prev,
+                  side: e.target.value as PortfolioSide,
+                  strategyAction: e.target.value === 'buy' ? 'initial_entry' : 'full_exit',
+                }))}>
                 <option value="buy">买入</option>
                 <option value="sell">卖出</option>
               </select>
@@ -1397,6 +1566,57 @@ const PortfolioPage: React.FC = () => {
               <input className={PORTFOLIO_INPUT_CLASS} type="number" min="0" step="0.0001" placeholder="税费（可选）" value={tradeForm.tax}
                 onChange={(e) => setTradeForm((prev) => ({ ...prev, tax: e.target.value }))} />
             </div>
+            <label className="flex items-center gap-2 rounded-lg border border-border/70 bg-surface/60 px-3 py-2 text-xs text-secondary">
+              <input
+                type="checkbox"
+                className="h-4 w-4 accent-cyan"
+                checked={tradeForm.manageWithStrategy}
+                onChange={(event) => setTradeForm((prev) => ({ ...prev, manageWithStrategy: event.target.checked }))}
+              />
+              将这笔成交关联到 Martin 策略持仓
+            </label>
+            {tradeForm.manageWithStrategy ? (
+              <div className="space-y-2 rounded-lg border border-cyan/20 bg-cyan/5 p-2">
+                <select
+                  className={PORTFOLIO_SELECT_CLASS}
+                  value={tradeForm.strategyAction}
+                  onChange={(event) => setTradeForm((prev) => ({
+                    ...prev,
+                    strategyAction: event.target.value as typeof prev.strategyAction,
+                  }))}
+                >
+                  {tradeForm.side === 'buy' ? (
+                    <>
+                      <option value="initial_entry">首次试仓</option>
+                      <option value="add_on">盈利确认加仓</option>
+                    </>
+                  ) : (
+                    <>
+                      <option value="partial_exit">分批减仓</option>
+                      <option value="full_exit">全部退出</option>
+                    </>
+                  )}
+                </select>
+                {tradeForm.side === 'buy' ? (
+                  <input
+                    className={PORTFOLIO_INPUT_CLASS}
+                    type="number"
+                    min="0"
+                    step="0.001"
+                    placeholder="该批次初始止损价（必填）"
+                    value={tradeForm.initialStopPrice}
+                    onChange={(event) => setTradeForm((prev) => ({ ...prev, initialStopPrice: event.target.value }))}
+                    required
+                  />
+                ) : null}
+                <input
+                  className={PORTFOLIO_INPUT_CLASS}
+                  placeholder="选股 Run ID（可选，用于追溯信号）"
+                  value={tradeForm.signalRunId}
+                  onChange={(event) => setTradeForm((prev) => ({ ...prev, signalRunId: event.target.value }))}
+                />
+              </div>
+            ) : null}
             <p className="text-xs text-secondary">手续费和税费可留空，系统将按 0 处理。</p>
             <button type="submit" className="btn-secondary w-full" disabled={!writableAccountId}>提交交易</button>
           </form>
@@ -1559,6 +1779,12 @@ const PortfolioPage: React.FC = () => {
                 <div key={`t-${item.id}`} className="flex items-start justify-between gap-3 border-b border-white/5 py-2 text-xs text-secondary">
                   <div className="min-w-0">
                     {item.tradeDate} {formatSideLabel(item.side)} {item.symbol} 数量={item.quantity} 价格={item.price}
+                    {item.strategy ? (
+                      <div className="mt-1 text-[11px] text-cyan">
+                        {item.strategy} · {item.strategyAction || 'manual'}
+                        {item.initialStopPrice ? ` · 初始止损 ${item.initialStopPrice}` : ''}
+                      </div>
+                    ) : null}
                   </div>
                   {!writeBlocked ? (
                     <button

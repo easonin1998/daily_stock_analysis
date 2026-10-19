@@ -283,6 +283,7 @@ describe('screeningApi', () => {
         strategy: 'martin_momentum_pullback',
         market: 'cn',
         max_results: 3,
+        account_id: 7,
       },
     });
 
@@ -290,6 +291,7 @@ describe('screeningApi', () => {
       market: 'cn',
       strategy: 'martin_momentum_pullback',
       maxResults: 3,
+      accountId: 7,
       notify: true,
       webBaseUrl: 'http://192.168.1.8:8000',
     });
@@ -301,12 +303,14 @@ describe('screeningApi', () => {
         strategy: 'martin_momentum_pullback',
         max_results: 3,
         variant_seed: 'browser-seed',
+        account_id: 7,
         notify: true,
         web_base_url: 'http://192.168.1.8:8000',
       }
     );
     expect(result.taskId).toBe('screen-task-1');
     expect(result.maxResults).toBe(3);
+    expect(result.accountId).toBe(7);
   });
 
   it('keeps one opaque screening variant seed per browser', async () => {

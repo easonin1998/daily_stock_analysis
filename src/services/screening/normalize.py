@@ -14,6 +14,12 @@ _NULL_TEXT_VALUES = {"", "nan", "none", "<na>", "na", "null"}
 # at least one letter (pure digits are A-share codes).
 _TICKER_RE = re.compile(r"^(?=.*[A-Za-z])[A-Za-z0-9][A-Za-z0-9.\-]{0,19}$")
 
+# Beijing Stock Exchange stocks used legacy 43/81/82/83/87/88 prefixes before the
+# market-wide migration to the dedicated 920 segment.  Keep the legacy
+# families here so historical libraries and backtests obey the same scope as
+# live screening.
+_BEIJING_STOCK_PREFIXES = ("43", "81", "82", "83", "87", "88", "920")
+
 
 def safe_text(value: object, *, max_len: int | None = None) -> str:
     """Return cleaned text, treating common null spellings as empty."""
@@ -53,6 +59,16 @@ def normalize_code(value: object, *, width: int = 6, allow_ticker: bool = False)
         return text.upper()
     digits = "".join(ch for ch in text if ch.isdigit())
     return digits.zfill(width)[-width:] if digits else ""
+
+
+def is_beijing_stock_code(value: object) -> bool:
+    """Return whether *value* belongs to a current or legacy BSE stock family."""
+    code = normalize_code(value)
+    return bool(
+        len(code) == 6
+        and code.isdigit()
+        and code.startswith(_BEIJING_STOCK_PREFIXES)
+    )
 
 
 def safe_float(value: object, default: float | None = None) -> float | None:

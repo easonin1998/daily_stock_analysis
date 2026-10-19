@@ -36,6 +36,7 @@ from src.services.screening.daily import (
 )
 from src.services.screening.daily_library import load_daily_feature_library
 from src.services.screening.filter import apply_hard_filters
+from src.services.screening.normalize import is_beijing_stock_code
 from src.services.screening.market_regime import (
     MarketRegimePolicy,
     REGIME_UNAVAILABLE,
@@ -330,7 +331,8 @@ def load_local_backtest_panel(
         library_path,
         max_age_days=36_500,
     )
-    codes = sorted(set(library.get("code", pd.Series(dtype=str)).astype(str)))
+    library_codes = sorted(set(library.get("code", pd.Series(dtype=str)).astype(str)))
+    codes = [code for code in library_codes if not is_beijing_stock_code(code)]
     histories: dict[str, pd.DataFrame] = {}
     source_counts: dict[str, int] = {}
     adjustment_counts: dict[str, int] = {}
@@ -419,6 +421,7 @@ def load_local_backtest_panel(
     )
     diagnostics = {
         "library_codes": len(codes),
+        "beijing_exchange_codes_excluded": len(library_codes) - len(codes),
         "loaded_codes": len(histories),
         "lookback_days": int(lookback_days),
         "missing_cache_codes": len(missing_codes),

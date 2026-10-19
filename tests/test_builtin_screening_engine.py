@@ -121,6 +121,102 @@ def test_screening_config_reads_snapshot_cache_ttl() -> None:
     assert config.snapshot_cache_ttl_seconds == 120.0
 
 
+def test_pipeline_uses_qmt_as_primary_quote_overlay_and_falls_back(monkeypatch) -> None:
+    snapshot_df = pd.DataFrame([{
+        "code": "600000",
+        "name": "浦发银行",
+        "price": 10.0,
+        "change_pct": 0.0,
+        "amount": 200_000_000.0,
+        "total_mv": 300_000_000_000.0,
+    }])
+    snapshot_df.attrs.update({
+        "snapshot_source": "sina",
+        "source_errors": [],
+        "fallback_used": False,
+    })
+    qmt_frame = pd.DataFrame([{
+        "code": "600000",
+        "qmt_code": "600000.SH",
+        "price": 10.8,
+        "previous_close": 10.0,
+        "change_pct": 8.0,
+        "open": 10.1,
+        "high": 10.9,
+        "low": 10.0,
+        "amount": 800_000_000.0,
+        "volume": 50_000_000.0,
+        "quote_time": "2026-10-19T15:00:00",
+    }])
+    qmt_frame.attrs.update({
+        "trading_date": "2026-10-19",
+        "quote_as_of": "2026-10-19T15:00:00",
+    })
+    strategy = Strategy(
+        name="demo",
+        display_name="Demo",
+        description="demo",
+        screening=ScreeningConfig(
+            enabled=True,
+            market_scope=["cn"],
+            hard_filters=HardFilterConfig(),
+            factor_weights={"liquidity": 1.0},
+            max_output=1,
+        ),
+    )
+    config = ScreeningRuntimeConfig(
+        strategies_dir=SCREENING_ROOT / "strategies",
+        qmt_quotes_enabled=True,
+        qmt_primary_min_coverage_pct=90.0,
+        daily_feature_library_enabled=False,
+        market_regime_enabled=False,
+        sector_heat_enabled=False,
+        post_analyzers=[],
+        risk_enabled=False,
+        portfolio_diversity_enabled=False,
+    )
+    monkeypatch.setattr(
+        screening_pipeline,
+        "load_all_strategies",
+        lambda _path: {"demo": strategy},
+    )
+    monkeypatch.setattr(
+        screening_pipeline,
+        "fetch_snapshot_with_fallback",
+        lambda *args, **kwargs: snapshot_df.copy(),
+    )
+    monkeypatch.setattr(
+        screening_pipeline,
+        "fetch_qmt_quotes",
+        lambda *args, **kwargs: qmt_frame.copy(),
+    )
+    monkeypatch.setattr(
+        screening_pipeline,
+        "_effective_cn_trading_date",
+        lambda: "2026-10-19",
+    )
+
+    primary = screening_pipeline.screen("demo", use_llm=False, config=config)
+
+    assert primary.snapshot_source == "qmt_readonly"
+    assert primary.picks[0].price == 10.8
+    assert primary.picks[0].amount == 800_000_000.0
+    assert any("QMT primary quote overlay" in item for item in primary.degradation)
+
+    def fail_qmt(*_args, **_kwargs):
+        raise RuntimeError("terminal unavailable")
+
+    monkeypatch.setattr(screening_pipeline, "fetch_qmt_quotes", fail_qmt)
+    fallback = screening_pipeline.screen("demo", use_llm=False, config=config)
+
+    assert fallback.snapshot_source == "sina"
+    assert fallback.picks[0].price == 10.0
+    assert any(
+        "QMT primary quote overlay failed: terminal unavailable" in item
+        for item in fallback.degradation
+    )
+
+
 def test_pipeline_passes_daily_history_cache_settings_to_enrichment(monkeypatch) -> None:
     snapshot_df = pd.DataFrame(
         [
@@ -618,6 +714,28 @@ def test_hard_filter_and_martin_factor_scoring_keep_core_semantics() -> None:
         ScreeningConfig(factor_weights={"liquidity": 1.0}),
     ).set_index("code")
     assert scored.loc["low_value", "screen_score"] > scored.loc["high_value", "screen_score"]
+
+
+def test_hard_filter_excludes_current_and_legacy_beijing_stock_codes() -> None:
+    frame = pd.DataFrame([
+        {"code": "600519", "name": "Shanghai"},
+        {"code": "000001", "name": "Shenzhen"},
+        {"code": "920001", "name": "Beijing Current"},
+        {"code": "810001", "name": "Beijing Legacy 81"},
+        {"code": "820001", "name": "Beijing Legacy 82"},
+        {"code": "830001", "name": "Beijing Legacy"},
+        {"code": "870001", "name": "Beijing Legacy Two"},
+    ])
+
+    filtered = apply_hard_filters(
+        frame,
+        HardFilterConfig(
+            exclude_st=False,
+            exclude_beijing_stock_exchange=True,
+        ),
+    )
+
+    assert filtered["code"].tolist() == ["600519", "000001"]
 
 
 def test_snapshot_schema_mismatch_counts_toward_source_circuit_breaker(

@@ -245,6 +245,37 @@ def test_full_market_signal_mode_excludes_current_st_names() -> None:
     assert "current ST names excluded" in diagnostics["historical_static_filters"]
 
 
+def test_signal_generation_excludes_beijing_exchange_codes() -> None:
+    signal_date = pd.Timestamp("2026-08-03")
+    panel = pd.DataFrame([
+        {
+            "date": signal_date,
+            "code": "920001",
+            "name": "BSE Example",
+            "trigger_distance_pct": 0.5,
+            "relative_strength_60d_pctile": 99.0,
+        },
+        {
+            "date": signal_date,
+            "code": "600001",
+            "name": "SSE Example",
+            "trigger_distance_pct": 0.5,
+            "relative_strength_60d_pctile": 98.0,
+        },
+    ])
+    screening = ScreeningConfig(
+        hard_filters=HardFilterConfig(
+            exclude_st=False,
+            exclude_beijing_stock_exchange=True,
+            trigger_distance_pct_min=-4.0,
+        )
+    )
+
+    book, _ = generate_martin_signals(panel, screening)
+
+    assert list(book[signal_date]["code"]) == ["600001"]
+
+
 def test_portfolio_executes_close_signal_at_next_open_only() -> None:
     dates = pd.to_datetime(["2026-08-03", "2026-08-04", "2026-08-05"])
     panel = pd.DataFrame({

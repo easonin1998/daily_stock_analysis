@@ -54,6 +54,13 @@ class PortfolioTradeCreateRequest(BaseModel):
     market: Optional[Literal["cn", "hk", "us", "jp", "kr", "tw"]] = None
     currency: Optional[str] = Field(None, min_length=3, max_length=8)
     trade_uid: Optional[str] = Field(None, max_length=128)
+    strategy: Optional[str] = Field(None, max_length=64)
+    strategy_version: Optional[str] = Field(None, max_length=32)
+    signal_run_id: Optional[str] = Field(None, max_length=64)
+    strategy_action: Optional[
+        Literal["initial_entry", "add_on", "partial_exit", "full_exit", "manual"]
+    ] = None
+    initial_stop_price: Optional[float] = Field(None, gt=0)
     note: Optional[str] = Field(None, max_length=255)
 
 
@@ -99,6 +106,11 @@ class PortfolioTradeListItem(BaseModel):
     price: float
     fee: float
     tax: float
+    strategy: Optional[str] = None
+    strategy_version: Optional[str] = None
+    signal_run_id: Optional[str] = None
+    strategy_action: Optional[str] = None
+    initial_stop_price: Optional[float] = None
     note: Optional[str] = None
     created_at: Optional[str] = None
 
@@ -154,6 +166,7 @@ class PortfolioPositionItem(BaseModel):
     market: str
     currency: str
     quantity: float
+    sellable_quantity: float
     avg_cost: float
     total_cost: float
     last_price: float
@@ -174,6 +187,24 @@ class PortfolioPositionAnalysisRequest(BaseModel):
     account_id: Optional[int] = Field(None, description="Optional account id; required when a symbol is held in multiple accounts")
     analysis_phase: Literal["auto", "premarket", "intraday", "postmarket"] = "auto"
     force: bool = Field(False, description="Force refresh analysis inputs without bypassing duplicate in-flight tasks")
+
+
+class PortfolioStrategyAdoptRequest(BaseModel):
+    account_id: int
+    initial_stop_price: float = Field(..., gt=0)
+    as_of: Optional[date] = None
+    strategy: str = Field("martin_momentum_pullback", min_length=1, max_length=64)
+    signal_run_id: Optional[str] = Field(None, max_length=64)
+
+
+class PortfolioStrategyPlanResponse(BaseModel):
+    status: str
+    strategy: str
+    strategy_version: str
+    account: Dict[str, Any] = Field(default_factory=dict)
+    holdings: List[Dict[str, Any]] = Field(default_factory=list)
+    rules: Dict[str, Any] = Field(default_factory=dict)
+    limitations: List[str] = Field(default_factory=list)
 
 
 class PortfolioAccountSnapshot(BaseModel):

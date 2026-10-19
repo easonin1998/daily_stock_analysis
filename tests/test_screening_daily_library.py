@@ -17,9 +17,11 @@ from src.services.screening.daily import (
 )
 from src.services.screening.daily_library import (
     completed_snapshot_bar_date,
+    daily_feature_library_date_coverage,
     load_daily_feature_library,
     merge_daily_feature_library,
     refresh_daily_feature_library_from_cache,
+    select_daily_feature_library_date_missing,
     select_daily_library_batch,
     upsert_daily_feature_library,
 )
@@ -168,6 +170,75 @@ def test_cache_loader_reuses_a_longer_compatible_window(tmp_path) -> None:
     assert cached is not None
     assert len(cached) == len(history)
     assert cached.attrs["daily_cache_compatible_fallback"] is True
+
+
+def test_cache_loader_skips_incompatible_exact_file_for_adjusted_longer_cache(
+    tmp_path,
+) -> None:
+    cache_dir = tmp_path / "daily"
+    unadjusted = _history(periods=180)
+    save_cached_daily_history(
+        "000001",
+        unadjusted,
+        source="auto",
+        lookback_days=220,
+        cache_dir=cache_dir,
+    )
+    adjusted = _history(periods=240)
+    adjusted.attrs["daily_source"] = "tencent"
+    save_cached_daily_history(
+        "000001",
+        adjusted,
+        source="auto",
+        lookback_days=320,
+        cache_dir=cache_dir,
+    )
+
+    cached = load_cached_daily_history(
+        "000001",
+        source="auto",
+        lookback_days=220,
+        cache_dir=cache_dir,
+        price_adjustment="qfq",
+    )
+
+    assert cached is not None
+    assert len(cached) == len(adjusted)
+    assert cached.attrs["daily_price_adjustment"] == "qfq"
+    assert cached.attrs["daily_cache_compatible_fallback"] is True
+
+
+def test_exact_date_coverage_does_not_treat_one_current_entry_as_full_refresh(
+    tmp_path,
+) -> None:
+    library_path = tmp_path / "features.json"
+    upsert_daily_feature_library(
+        pd.DataFrame([
+            {"code": "000001", "daily_latest_date": "2026-10-19", "daily_data_points": 160},
+            {"code": "000002", "daily_latest_date": "2026-10-16", "daily_data_points": 160},
+        ]),
+        library_path=library_path,
+    )
+
+    coverage = daily_feature_library_date_coverage(
+        pd.DataFrame({"code": ["000001", "000002", "000003"]}),
+        library_path=library_path,
+        as_of=date(2026, 10, 19),
+    )
+
+    assert coverage == {
+        "as_of": "2026-10-19",
+        "candidate_count": 3,
+        "matched_count": 1,
+        "missing_count": 2,
+        "coverage_pct": 33.3333,
+    }
+    missing = select_daily_feature_library_date_missing(
+        pd.DataFrame({"code": ["000001", "000002", "000003"]}),
+        library_path=library_path,
+        as_of=date(2026, 10, 19),
+    )
+    assert missing["code"].tolist() == ["000002", "000003"]
 
 
 def test_period_cache_loader_accepts_shorter_key_when_dates_prove_coverage(

@@ -18,14 +18,17 @@ from src.services.screening.context import build_llm_context
 from src.services.screening.daily import enrich_daily_features
 from src.services.screening.daily_library import (
     completed_snapshot_bar_date,
+    daily_feature_library_date_coverage,
     latest_daily_feature_date,
     merge_daily_feature_library,
     refresh_daily_feature_library_from_cache,
+    select_daily_feature_library_date_missing,
     upsert_daily_feature_library,
 )
 from src.services.screening.dsa_provider import apply_dsa_provider_context
 from src.services.screening.filter import (
     apply_hard_filters,
+    exclude_beijing_stock_exchange_rows,
     hard_filter_rejection_summary,
     hard_filter_waterfall,
     requires_daily_features,
@@ -45,6 +48,10 @@ from src.services.screening.sector_strength import (
     summarize_sector_strength_snapshot,
     upsert_sector_strength_history,
 )
+from src.services.screening.sector_heat import (
+    load_latest_board_heat_snapshot,
+    summarize_board_heat_snapshot,
+)
 from src.services.screening.market_regime import (
     MarketRegimePolicy,
     REGIME_RISK_OFF,
@@ -62,6 +69,7 @@ from src.services.screening.normalize import (
     safe_text,
 )
 from src.services.screening.post_analysis import normalize_post_analyzers, run_post_analyzers
+from src.services.screening.qmt_quotes import fetch_qmt_quotes, overlay_qmt_quotes
 from src.services.screening.ranker import rank_candidates_with_metadata
 from src.services.screening.risk import apply_portfolio_overlay, apply_risk_overlay, apply_sector_quota
 from src.services.screening.scorer import compute_screen_scores, factor_score_columns
@@ -183,6 +191,40 @@ def screen(
         cache_ttl_seconds=config.snapshot_cache_ttl_seconds,
         market=market,
     )
+    if market == "cn" and screening.hard_filters.exclude_beijing_stock_exchange:
+        snapshot_before_exchange_scope = len(snapshot_df)
+        snapshot_df = exclude_beijing_stock_exchange_rows(snapshot_df)
+        degradation.append(
+            "Market scope: Beijing Stock Exchange excluded "
+            f"({snapshot_before_exchange_scope - len(snapshot_df)} rows removed)"
+        )
+    if market == "cn" and config.qmt_quotes_enabled:
+        try:
+            qmt_quotes = fetch_qmt_quotes(
+                snapshot_df.get("code", pd.Series(dtype=object)),
+                python_executable=config.qmt_python,
+                xtquant_path=config.qmt_xtquant_path,
+                port=config.qmt_port,
+                timeout_sec=config.qmt_timeout_sec,
+            )
+            snapshot_df = overlay_qmt_quotes(
+                snapshot_df,
+                qmt_quotes,
+                min_coverage_pct=config.qmt_primary_min_coverage_pct,
+                expected_trading_date=_effective_cn_trading_date(),
+            )
+            degradation.append(
+                "QMT primary quote overlay: "
+                f"matched={snapshot_df.attrs.get('qmt_coverage_count', 0)} of "
+                f"{snapshot_df.attrs.get('qmt_universe_count', len(snapshot_df))} "
+                f"({snapshot_df.attrs.get('qmt_coverage_pct', 0)}%), "
+                f"reference={snapshot_df.attrs.get('snapshot_reference_source', '--')}"
+            )
+        except Exception as exc:  # QMT must remain an optional primary source.
+            qmt_error = f"QMT primary quote overlay failed: {exc}"
+            existing_errors = list(snapshot_df.attrs.get("source_errors", []) or [])
+            snapshot_df.attrs["source_errors"] = [*existing_errors, qmt_error]
+            degradation.append(qmt_error)
     effective_industry_map_files = (
         list(industry_map_files)
         if industry_map_files is not None
@@ -228,13 +270,37 @@ def screen(
     ):
         completed_bar_date = completed_snapshot_bar_date(snapshot_df, market=market)
         library_latest_date = latest_daily_feature_date(config.daily_feature_library_path)
+        library_date_coverage = (
+            daily_feature_library_date_coverage(
+                snapshot_df,
+                library_path=config.daily_feature_library_path,
+                as_of=completed_bar_date,
+            )
+            if completed_bar_date is not None
+            else None
+        )
         needs_library_refresh = library_latest_date is None or (
             completed_bar_date is not None
-            and library_latest_date < completed_bar_date
+            and (
+                library_latest_date < completed_bar_date
+                or bool(
+                    library_date_coverage
+                    and library_date_coverage["missing_count"]
+                )
+            )
         )
         if needs_library_refresh and config.daily_history_cache_dir is not None:
+            refresh_candidates = (
+                select_daily_feature_library_date_missing(
+                    snapshot_df,
+                    library_path=config.daily_feature_library_path,
+                    as_of=completed_bar_date,
+                )
+                if completed_bar_date is not None
+                else snapshot_df
+            )
             library_refresh = refresh_daily_feature_library_from_cache(
-                snapshot_df,
+                refresh_candidates,
                 cache_dir=config.daily_history_cache_dir,
                 library_path=config.daily_feature_library_path,
                 source=config.daily_source,
@@ -248,8 +314,16 @@ def screen(
                 f"cached={library_refresh.get('cache_count', 0)}, "
                 f"updated={library_refresh.get('updated_count', 0)}, "
                 f"appended={library_refresh.get('appended_count', 0)}, "
-                f"errors={library_refresh.get('error_count', 0)}"
+                f"errors={library_refresh.get('error_count', 0)}, "
+                f"missing_candidates={len(refresh_candidates)}"
             )
+            if library_date_coverage is not None:
+                degradation.append(
+                    "Local daily-feature exact-date coverage before maintenance: "
+                    f"matched={library_date_coverage['matched_count']} of "
+                    f"{library_date_coverage['candidate_count']} "
+                    f"({library_date_coverage['coverage_pct']}%)"
+                )
             library_latest_date = latest_daily_feature_date(
                 config.daily_feature_library_path
             )
@@ -338,6 +412,7 @@ def screen(
 
     sector_snapshot = pd.DataFrame()
     sector_overview = summarize_sector_strength_snapshot(sector_snapshot)
+    board_heat_overview = summarize_board_heat_snapshot(pd.DataFrame())
     if market == "cn" and bool(execution_profile.get("sector_leadership_enabled", False)):
         persisted_snapshot = pd.DataFrame()
         if config.sector_strength_history_path is not None:
@@ -390,6 +465,56 @@ def screen(
                 f"as_of={persisted_date or '--'}"
             )
         sector_overview = summarize_sector_strength_snapshot(sector_snapshot)
+        if config.sector_strength_history_path is not None and effective_bar_date is not None:
+            board_heat_snapshot = load_latest_board_heat_snapshot(
+                config.sector_strength_history_path
+            )
+            if not board_heat_snapshot.empty:
+                trading_dates = board_heat_snapshot.get(
+                    "trading_date",
+                    pd.Series("", index=board_heat_snapshot.index),
+                ).astype(str)
+                board_heat_snapshot = board_heat_snapshot.loc[
+                    trading_dates.eq(effective_bar_date.isoformat())
+                ].copy()
+            board_heat_overview = summarize_board_heat_snapshot(
+                board_heat_snapshot,
+                top=5,
+            )
+            degradation.append(
+                "Daily board heat: "
+                f"status={board_heat_overview.get('status')}, "
+                f"date={board_heat_overview.get('trading_date') or '--'}, "
+                f"industries={len(board_heat_overview.get('industry') or [])}"
+            )
+
+        if effective_bar_date is not None and config.daily_feature_library_path is not None:
+            exact_coverage = daily_feature_library_date_coverage(
+                snapshot_df,
+                library_path=config.daily_feature_library_path,
+                as_of=effective_bar_date,
+            )
+            industry_member_count = int(
+                pd.to_numeric(
+                    sector_snapshot.get(
+                        "sector_member_count",
+                        pd.Series(dtype=float),
+                    ),
+                    errors="coerce",
+                ).fillna(0).sum()
+            )
+            exact_matched = int(exact_coverage["matched_count"])
+            sector_overview.update({
+                "daily_feature_matched_count": exact_matched,
+                "daily_feature_universe_count": int(exact_coverage["candidate_count"]),
+                "daily_feature_coverage_pct": exact_coverage["coverage_pct"],
+                "industry_member_count": industry_member_count,
+                "industry_coverage_pct": (
+                    round(industry_member_count / exact_matched * 100.0, 2)
+                    if exact_matched
+                    else 0.0
+                ),
+            })
 
     # 3. L1 hard filter. If a strategy needs daily features, first apply only
     # snapshot-safe filters, then enrich a narrowed candidate pool.
@@ -446,6 +571,7 @@ def screen(
             portfolio_diversity_enabled=config.portfolio_diversity_enabled,
             market_regime=market_regime,
             sector_overview=sector_overview,
+            board_heat_overview=board_heat_overview,
             analysis_date=(
                 effective_bar_date.isoformat() if effective_bar_date is not None else ""
             ),
@@ -631,6 +757,7 @@ def screen(
             portfolio_diversity_enabled=config.portfolio_diversity_enabled,
             market_regime=market_regime,
             sector_overview=sector_overview,
+            board_heat_overview=board_heat_overview,
             analysis_date=(
                 effective_bar_date.isoformat() if effective_bar_date is not None else ""
             ),
@@ -909,10 +1036,21 @@ def screen(
         result_variant_rotated_slots=selection_variant.rotated_slots,
         market_regime=market_regime,
         sector_overview=sector_overview,
+        board_heat_overview=board_heat_overview,
         analysis_date=(
             effective_bar_date.isoformat() if effective_bar_date is not None else ""
         ),
     )
+
+
+def _effective_cn_trading_date() -> str | None:
+    """Return the trading date a current CN quote is expected to represent."""
+    try:
+        from src.core.trading_calendar import get_effective_trading_date
+
+        return get_effective_trading_date("cn").isoformat()
+    except Exception:
+        return None
 
 
 def _emit_progress(

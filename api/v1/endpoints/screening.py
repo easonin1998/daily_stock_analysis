@@ -6,6 +6,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -24,6 +25,8 @@ from src.storage import DatabaseManager
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+_CN_MARKET_TIMEZONE = timezone(timedelta(hours=8))
+
 
 class ScreeningScreenRequest(BaseModel):
     market: str = Field("cn", min_length=1, max_length=16)
@@ -31,6 +34,7 @@ class ScreeningScreenRequest(BaseModel):
     max_results: int = Field(20, ge=1, le=100)
     variant_seed: str = Field("", max_length=128)
     notify: bool = False
+    account_id: Optional[int] = Field(None, gt=0)
     web_base_url: str = Field("", max_length=2048)
 
 
@@ -55,6 +59,7 @@ class ScreeningScreenAccepted(BaseModel):
     strategy: str
     market: str
     max_results: int
+    account_id: Optional[int] = None
 
 
 class ScreeningScreenTaskStatus(BaseModel):
@@ -174,7 +179,71 @@ def _screening_notification_content(result: Dict[str, Any]) -> str:
     return "\n\n".join(lines)
 
 
-def _screening_theme_overview(config: Config, *, top: int = 5) -> Dict[str, Any]:
+def _screening_theme_cache_freshness(
+    payload: Dict[str, Any],
+    *,
+    analysis_date: str,
+) -> Dict[str, Any]:
+    """Classify fallback topic data against the completed market session."""
+    cached_at = str(payload.get("cached_at") or "").strip()
+    cache_used = bool(payload.get("cache_used") or payload.get("fallback_used"))
+    stale = bool(payload.get("stale"))
+    stale_age_hours = payload.get("stale_age_hours")
+    data_as_of = ""
+    reason = ""
+
+    cached_dt: Optional[datetime] = None
+    if cached_at:
+        try:
+            cached_dt = datetime.fromisoformat(cached_at.replace("Z", "+00:00"))
+        except ValueError:
+            cached_dt = None
+        if cached_dt is not None:
+            if cached_dt.tzinfo is None:
+                cached_dt = cached_dt.replace(tzinfo=timezone.utc)
+            cached_dt = cached_dt.astimezone(timezone.utc)
+            data_as_of = cached_dt.astimezone(_CN_MARKET_TIMEZONE).strftime("%Y-%m-%d %H:%M")
+            if stale_age_hours is None:
+                stale_age_hours = round(
+                    max(0.0, (datetime.now(timezone.utc) - cached_dt).total_seconds()) / 3600,
+                    2,
+                )
+
+    if cache_used:
+        if cached_dt is None:
+            stale = True
+            reason = "回退缓存缺少可验证的数据时间"
+        elif analysis_date:
+            try:
+                session_date = datetime.strptime(analysis_date, "%Y-%m-%d").date()
+            except ValueError:
+                session_date = None
+            if session_date is not None:
+                session_close = datetime.combine(
+                    session_date,
+                    datetime.min.time().replace(hour=15),
+                    tzinfo=_CN_MARKET_TIMEZONE,
+                ).astimezone(timezone.utc)
+                if cached_dt < session_close:
+                    stale = True
+                    reason = "回退缓存早于分析日收盘"
+
+    if stale and not reason:
+        reason = "上游已将该题材快照标记为过期"
+    return {
+        "stale": stale,
+        "stale_age_hours": stale_age_hours,
+        "data_as_of": data_as_of,
+        "freshness_reason": reason,
+    }
+
+
+def _screening_theme_overview(
+    config: Config,
+    *,
+    top: int = 5,
+    analysis_date: str = "",
+) -> Dict[str, Any]:
     """Fetch a concise theme snapshot without making notification delivery fragile."""
     try:
         payload = ScreeningService(config=config).hotspots(
@@ -220,13 +289,19 @@ def _screening_theme_overview(config: Config, *, top: int = 5) -> Dict[str, Any]
             "leaders": leaders,
             "quality_status": str(row.get("quality_status") or "").strip(),
         })
-    stale = bool(payload.get("stale")) if isinstance(payload, dict) else False
+    freshness = _screening_theme_cache_freshness(
+        payload,
+        analysis_date=analysis_date,
+    )
+    stale = bool(freshness["stale"])
     return {
         "status": "stale" if themes and stale else ("available" if themes else "unavailable"),
         "provider": str(payload.get("provider_used") or payload.get("provider") or "").strip(),
         "cached_at": payload.get("cached_at"),
         "stale": stale,
-        "stale_age_hours": payload.get("stale_age_hours"),
+        "stale_age_hours": freshness["stale_age_hours"],
+        "data_as_of": freshness["data_as_of"],
+        "freshness_reason": freshness["freshness_reason"],
         "cache_used": bool(payload.get("cache_used")),
         "fallback_used": bool(payload.get("fallback_used")),
         "themes": themes,
@@ -246,7 +321,10 @@ def _notify_screening_result(
 ) -> Dict[str, Any]:
     detail_url = _screening_detail_url(web_base_url, result.get("run_id"))
     theme_overview = (
-        _screening_theme_overview(config)
+        _screening_theme_overview(
+            config,
+            analysis_date=str(result.get("analysis_date") or "").strip(),
+        )
         if str(result.get("market") or "cn").strip().lower() == "cn"
         else {"status": "unavailable", "themes": []}
     )
@@ -269,6 +347,8 @@ def _notify_screening_result(
         "candidates": result.get("candidates") or [],
         "market_regime": result.get("market_regime") or {},
         "sector_overview": result.get("sector_overview") or {},
+        "board_heat_overview": result.get("board_heat_overview") or {},
+        "portfolio_plan": result.get("portfolio_plan") or {},
         "theme_overview": theme_overview,
         "data_diagnostics": {
             "analysis_date": result.get("analysis_date"),
@@ -380,6 +460,7 @@ def screening_start_screen_task(
             strategy=request.strategy,
             market=request.market,
             max_results=request.max_results,
+            account_id=request.account_id,
             selection_seed=request.variant_seed,
             progress_callback=report_progress,
         )
@@ -414,6 +495,7 @@ def screening_start_screen_task(
         strategy=request.strategy,
         market=request.market,
         max_results=request.max_results,
+        account_id=request.account_id,
     )
 
 
@@ -446,6 +528,7 @@ def screening_screen(
         strategy=request.strategy,
         market=request.market,
         max_results=request.max_results,
+        account_id=request.account_id,
         selection_seed=request.variant_seed,
     )
     if request.notify:

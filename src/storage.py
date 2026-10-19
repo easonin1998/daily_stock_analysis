@@ -63,7 +63,7 @@ from src.utils.sniper_points import extract_sniper_points, parse_sniper_value
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
-CURRENT_SCHEMA_VERSION = "2026-06-05-create-all-baseline"
+CURRENT_SCHEMA_VERSION = "2026-10-20-portfolio-strategy-state"
 INTELLIGENCE_ITEM_NULL_SCOPE_VALUE = "__dsa_null_scope__"
 
 # SQLAlchemy ORM 基类
@@ -550,6 +550,11 @@ class PortfolioTrade(Base):
     price = Column(Float, nullable=False)
     fee = Column(Float, default=0.0)
     tax = Column(Float, default=0.0)
+    strategy = Column(String(64), index=True)
+    strategy_version = Column(String(32))
+    signal_run_id = Column(String(64), index=True)
+    strategy_action = Column(String(24))
+    initial_stop_price = Column(Float)
     note = Column(String(255))
     dedup_hash = Column(String(64), index=True)
     created_at = Column(DateTime, default=datetime.now, index=True)
@@ -558,6 +563,51 @@ class PortfolioTrade(Base):
         UniqueConstraint('account_id', 'trade_uid', name='uix_portfolio_trade_uid'),
         UniqueConstraint('account_id', 'dedup_hash', name='uix_portfolio_trade_dedup_hash'),
         Index('ix_portfolio_trade_account_date', 'account_id', 'trade_date'),
+    )
+
+
+class PortfolioStrategyPosition(Base):
+    """Persistent end-of-day strategy state for one live portfolio position."""
+
+    __tablename__ = 'portfolio_strategy_positions'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, ForeignKey('portfolio_accounts.id'), nullable=False, index=True)
+    symbol = Column(String(16), nullable=False, index=True)
+    market = Column(String(8), nullable=False, default='cn')
+    currency = Column(String(8), nullable=False, default='CNY')
+    strategy = Column(String(64), nullable=False, index=True)
+    strategy_version = Column(String(32))
+    status = Column(String(24), nullable=False, default='active', index=True)
+    tracking_mode = Column(String(24), nullable=False, default='trade_events')
+    opened_date = Column(Date)
+    closed_date = Column(Date)
+    initial_signal_run_id = Column(String(64))
+    initial_stop_price = Column(Float)
+    highest_close = Column(Float)
+    highest_position_r_multiple = Column(Float)
+    partial_exit_count = Column(Integer, nullable=False, default=0)
+    ema9_below_streak = Column(Integer, nullable=False, default=0)
+    tracking_trade_cutoff_id = Column(Integer, nullable=False, default=0)
+    entry_tranches_json = Column(Text)
+    last_plan_json = Column(Text)
+    last_evaluated_date = Column(Date)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'account_id',
+            'symbol',
+            'market',
+            'strategy',
+            name='uix_portfolio_strategy_position',
+        ),
+        Index(
+            'ix_portfolio_strategy_position_account_status',
+            'account_id',
+            'status',
+        ),
     )
 
 
@@ -1361,6 +1411,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             Base.metadata.create_all(self._engine)
             self._ensure_llm_usage_telemetry_columns()
             self._ensure_decision_signal_profile_schema()
+            self._ensure_portfolio_strategy_schema()
             self._ensure_intelligence_item_scope_values()
             self._ensure_schema_migration_record()
             self._ensure_intelligence_items_unique_index()
@@ -1386,7 +1437,10 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         session = self._SessionLocal()
         values = {
             "version": CURRENT_SCHEMA_VERSION,
-            "description": "Baseline schema created through SQLAlchemy metadata.create_all",
+            "description": (
+                "Baseline schema created through SQLAlchemy metadata.create_all; "
+                "portfolio strategy state and trade provenance compatibility upgrade"
+            ),
         }
         try:
             if self._is_sqlite_engine:
@@ -1407,6 +1461,47 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             raise
         finally:
             session.close()
+
+    def _ensure_portfolio_strategy_schema(self) -> None:
+        """Add strategy provenance columns to existing SQLite trade ledgers."""
+
+        if not self._is_sqlite_engine:
+            return
+        inspector = inspect(self._engine)
+        if not inspector.has_table(PortfolioTrade.__tablename__):
+            return
+
+        existing = {
+            column["name"]
+            for column in inspector.get_columns(PortfolioTrade.__tablename__)
+        }
+        columns = {
+            "strategy": "VARCHAR(64)",
+            "strategy_version": "VARCHAR(32)",
+            "signal_run_id": "VARCHAR(64)",
+            "strategy_action": "VARCHAR(24)",
+            "initial_stop_price": "FLOAT",
+        }
+        with self._engine.begin() as connection:
+            for column_name, column_type in columns.items():
+                if column_name in existing:
+                    continue
+                try:
+                    connection.exec_driver_sql(
+                        f"ALTER TABLE {PortfolioTrade.__tablename__} "
+                        f"ADD COLUMN {column_name} {column_type}"
+                    )
+                except OperationalError as exc:
+                    if not self._is_sqlite_duplicate_column_error(exc, column_name):
+                        raise
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_portfolio_trades_strategy "
+                "ON portfolio_trades (strategy)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_portfolio_trades_signal_run_id "
+                "ON portfolio_trades (signal_run_id)"
+            )
 
     def _ensure_decision_signal_profile_schema(self) -> None:
         """Add and backfill nullable decision_profile for existing SQLite DBs."""

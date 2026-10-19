@@ -28,6 +28,8 @@ const {
   createAccount,
   deleteAccount,
   analyzePosition,
+  getStrategyPlan,
+  adoptStrategyPosition,
   listDecisionSignals,
   getLatestDecisionSignals,
 } = vi.hoisted(() => ({
@@ -50,6 +52,8 @@ const {
   createAccount: vi.fn(),
   deleteAccount: vi.fn(),
   analyzePosition: vi.fn(),
+  getStrategyPlan: vi.fn(),
+  adoptStrategyPosition: vi.fn(),
   listDecisionSignals: vi.fn(),
   getLatestDecisionSignals: vi.fn(),
 }));
@@ -82,6 +86,8 @@ vi.mock('../../api/portfolio', () => ({
     createAccount,
     deleteAccount,
     analyzePosition,
+    getStrategyPlan,
+    adoptStrategyPosition,
   },
 }));
 
@@ -333,6 +339,52 @@ describe('PortfolioPage FX refresh', () => {
       message: '分析任务已加入队列: HK00700',
       analysisPhase: 'auto',
     });
+    getStrategyPlan.mockResolvedValue({
+      status: 'available',
+      strategy: 'martin_momentum_pullback',
+      strategyVersion: '3.3',
+      account: {
+        accountId: 1,
+        accountName: 'Main',
+        asOf: '2026-03-19',
+        market: 'cn',
+        totalCash: 1000,
+        totalMarketValue: 2000,
+        totalEquity: 3000,
+        positionCount: 0,
+        managedPositionCount: 0,
+        unmanagedPositionCount: 0,
+        strategyRiskHeatPct: 0,
+        marketRegimeState: 'risk_on',
+        marketRegimeDate: '2026-01-03',
+      },
+      holdings: [],
+      rules: {},
+      limitations: [],
+    });
+    adoptStrategyPosition.mockResolvedValue({
+      status: 'available',
+      strategy: 'martin_momentum_pullback',
+      strategyVersion: '3.3',
+      account: {
+        accountId: 1,
+        accountName: 'Main',
+        asOf: '2026-03-19',
+        market: 'cn',
+        totalCash: 1000,
+        totalMarketValue: 2000,
+        totalEquity: 3000,
+        positionCount: 0,
+        managedPositionCount: 0,
+        unmanagedPositionCount: 0,
+        strategyRiskHeatPct: 0,
+        marketRegimeState: 'risk_on',
+        marketRegimeDate: '2026-01-03',
+      },
+      holdings: [],
+      rules: {},
+      limitations: [],
+    });
     getLatestDecisionSignals.mockResolvedValue({ items: [], total: 0, page: 1, pageSize: 1 });
   });
 
@@ -352,6 +404,16 @@ describe('PortfolioPage FX refresh', () => {
 
     expect(getSnapshot).toHaveBeenCalledWith({ accountId: undefined, costMethod: 'fifo', includeRealtime: false });
     expect(getRisk).toHaveBeenCalledWith({ accountId: undefined, costMethod: 'fifo', includeRealtime: false });
+  });
+
+  it('loads the Martin account plan after selecting one account', async () => {
+    render(<PortfolioPage />);
+
+    await waitForInitialLoad();
+    fireEvent.change(screen.getAllByRole('combobox')[0], { target: { value: '1' } });
+
+    await waitFor(() => expect(getStrategyPlan).toHaveBeenCalledWith(1));
+    expect(await screen.findByText('Martin v3.3')).toBeInTheDocument();
   });
 
   it('renders stale FX status with a manual refresh button', async () => {
@@ -574,8 +636,8 @@ describe('PortfolioPage FX refresh', () => {
 
     const hkRowCells = within(hkRow as HTMLTableRowElement).getAllByRole('cell');
     const aaplRowCells = within(aaplRow as HTMLTableRowElement).getAllByRole('cell');
-    expect(hkRowCells.at(-3)).toHaveClass('text-success');
-    expect(aaplRowCells.at(-3)).toHaveClass('text-secondary');
+    expect(hkRowCells.at(-4)).toHaveClass('text-success');
+    expect(aaplRowCells.at(-4)).toHaveClass('text-secondary');
   });
 
   it('loads latest active signals for holdings without scanning paginated signal lists', async () => {

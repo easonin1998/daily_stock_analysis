@@ -981,6 +981,96 @@ class PortfolioServiceTestCase(unittest.TestCase):
         self.assertEqual(len(trades["items"]), 1)
         self.assertEqual(trades["items"][0]["side"], "buy")
 
+    def test_cn_same_day_buy_is_not_sellable_until_next_trade_date(self) -> None:
+        account = self.service.create_account(name="Main", broker="Demo", market="cn", base_currency="CNY")
+        aid = account["id"]
+        trade_date = date(2026, 1, 2)
+        self.service.record_trade(
+            account_id=aid,
+            symbol="600519",
+            trade_date=trade_date,
+            side="buy",
+            quantity=100,
+            price=10,
+            market="cn",
+            currency="CNY",
+        )
+        self._save_close("600519", trade_date, 10.0)
+
+        with self.assertRaises(PortfolioOversellError):
+            self.service.record_trade(
+                account_id=aid,
+                symbol="600519",
+                trade_date=trade_date,
+                side="sell",
+                quantity=100,
+                price=10,
+                market="cn",
+                currency="CNY",
+            )
+
+        same_day = self.service.get_portfolio_snapshot(account_id=aid, as_of=trade_date)
+        next_day = self.service.get_portfolio_snapshot(
+            account_id=aid,
+            as_of=trade_date + timedelta(days=1),
+        )
+        self.assertEqual(same_day["accounts"][0]["positions"][0]["sellable_quantity"], 0.0)
+        self.assertEqual(next_day["accounts"][0]["positions"][0]["sellable_quantity"], 100.0)
+
+    def test_non_cn_same_day_buy_remains_sellable(self) -> None:
+        account = self.service.create_account(name="HK", broker="Demo", market="hk", base_currency="HKD")
+        aid = account["id"]
+        trade_date = date(2026, 1, 2)
+        self.service.record_trade(
+            account_id=aid,
+            symbol="00700",
+            trade_date=trade_date,
+            side="buy",
+            quantity=100,
+            price=300,
+            market="hk",
+            currency="HKD",
+        )
+        self.service.record_trade(
+            account_id=aid,
+            symbol="00700",
+            trade_date=trade_date,
+            side="sell",
+            quantity=100,
+            price=301,
+            market="hk",
+            currency="HKD",
+        )
+        trades = self.service.list_trade_events(account_id=aid, page=1, page_size=20)
+        self.assertEqual(len(trades["items"]), 2)
+
+    def test_strategy_trade_requires_consistent_action_and_side(self) -> None:
+        account = self.service.create_account(name="Main", broker="Demo", market="cn", base_currency="CNY")
+        aid = account["id"]
+
+        with self.assertRaisesRegex(ValueError, "strategy_action is required"):
+            self.service.record_trade(
+                account_id=aid,
+                symbol="600519",
+                trade_date=date(2026, 1, 2),
+                side="buy",
+                quantity=100,
+                price=10,
+                strategy="martin_momentum_pullback",
+                initial_stop_price=9.5,
+            )
+        with self.assertRaisesRegex(ValueError, "requires a buy trade"):
+            self.service.record_trade(
+                account_id=aid,
+                symbol="600519",
+                trade_date=date(2026, 1, 2),
+                side="sell",
+                quantity=100,
+                price=10,
+                strategy="martin_momentum_pullback",
+                strategy_action="add_on",
+            )
+
     def test_duplicate_full_close_sell_keeps_conflict_semantics(self) -> None:
         account = self.service.create_account(name="Main", broker="Demo", market="cn", base_currency="CNY")
         aid = account["id"]

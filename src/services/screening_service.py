@@ -36,6 +36,8 @@ from src.services.screening.config import Config as ScreeningPipelineConfig
 from src.services.screening.pipeline import screen as run_screening_pipeline
 from src.services.screening.source_guard import parse_source_timeout_seconds
 from src.services.screening.strategy import list_strategies as load_screening_strategies
+from src.repositories.portfolio_repo import PortfolioRepository
+from src.services.portfolio_strategy_service import PortfolioStrategyService
 from src.storage import DatabaseManager
 
 logger = logging.getLogger(__name__)
@@ -1223,6 +1225,7 @@ class ScreeningService:
         strategy: str,
         market: str,
         max_results: int,
+        account_id: Optional[int] = None,
         selection_seed: str = "",
         progress_callback: Callable[[int, str], None] | None = None,
     ) -> Dict[str, Any]:
@@ -1319,7 +1322,25 @@ class ScreeningService:
             "result_variant_rotated_slots": raw_data.get("result_variant_rotated_slots") or 0,
             "market_regime": raw_data.get("market_regime") or {},
             "sector_overview": raw_data.get("sector_overview") or {},
+            "board_heat_overview": raw_data.get("board_heat_overview") or {},
         }
+        if account_id is not None:
+            try:
+                portfolio_repo = PortfolioRepository(db_manager=self.db_manager)
+                response = PortfolioStrategyService(
+                    repo=portfolio_repo,
+                ).enrich_screening_result(
+                    response,
+                    account_id=int(account_id),
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "screening_portfolio_rejected",
+                        "message": str(exc),
+                    },
+                ) from exc
         if self.db_manager is not None:
             self.db_manager.save_screening_run(response)
         return response

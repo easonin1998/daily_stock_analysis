@@ -179,6 +179,60 @@ class TestStorage(unittest.TestCase):
 
         DatabaseManager.reset_instance()
 
+    def test_legacy_portfolio_trade_schema_adds_strategy_provenance(self):
+        DatabaseManager.reset_instance()
+        temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        db_path = os.path.join(temp_dir.name, "legacy_portfolio.db")
+
+        try:
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """CREATE TABLE portfolio_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    currency TEXT NOT NULL,
+                    trade_date DATE NOT NULL,
+                    side TEXT NOT NULL,
+                    quantity FLOAT NOT NULL,
+                    price FLOAT NOT NULL,
+                    fee FLOAT,
+                    tax FLOAT,
+                    note TEXT,
+                    dedup_hash TEXT,
+                    created_at DATETIME
+                )"""
+                )
+
+            DatabaseManager(db_url=f"sqlite:///{db_path}")
+
+            with sqlite3.connect(db_path) as conn:
+                columns = {
+                    row[1] for row in conn.execute("PRAGMA table_info(portfolio_trades)")
+                }
+                strategy_table = conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name='portfolio_strategy_positions'"
+                ).fetchone()
+            self.assertTrue({
+                "strategy",
+                "strategy_version",
+                "signal_run_id",
+                "strategy_action",
+                "initial_stop_price",
+            }.issubset(columns))
+            self.assertIsNotNone(strategy_table)
+            indexes = self._list_sqlite_indexes(db_path, "portfolio_trades")
+            self.assertEqual(indexes.get("ix_portfolio_trades_strategy"), ["strategy"])
+            self.assertEqual(
+                indexes.get("ix_portfolio_trades_signal_run_id"),
+                ["signal_run_id"],
+            )
+        finally:
+            DatabaseManager.reset_instance()
+            temp_dir.cleanup()
+
     def test_fresh_decision_signal_schema_has_profile_indexes(self):
         DatabaseManager.reset_instance()
         temp_dir = tempfile.TemporaryDirectory()

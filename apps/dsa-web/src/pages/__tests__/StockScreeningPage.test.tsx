@@ -58,6 +58,10 @@ const {
   };
 });
 
+const { getPortfolioAccounts } = vi.hoisted(() => ({
+  getPortfolioAccounts: vi.fn(),
+}));
+
 vi.mock('react-router-dom', async () => {
   const actual = await vi.importActual<typeof import('react-router-dom')>('react-router-dom');
   return {
@@ -77,6 +81,12 @@ vi.mock('../../api/screening', () => ({
     getScreenTask: (taskId: string) => getScreenTask(taskId),
     screen: (payload: unknown) => screenStocks(payload),
     startScreen: (payload: unknown) => startScreenTask(payload),
+  },
+}));
+
+vi.mock('../../api/portfolio', () => ({
+  portfolioApi: {
+    getAccounts: (...args: unknown[]) => getPortfolioAccounts(...args),
   },
 }));
 
@@ -120,6 +130,17 @@ describe('StockScreeningPage', () => {
     resetLastScreenResult();
     screenStocks.mockReset();
     startScreenTask.mockClear();
+    getPortfolioAccounts.mockReset();
+    getPortfolioAccounts.mockResolvedValue({
+      accounts: [{
+        id: 1,
+        name: '模拟账户',
+        broker: 'Demo',
+        market: 'cn',
+        baseCurrency: 'CNY',
+        isActive: true,
+      }],
+    });
     getStrategies.mockResolvedValue(mockStrategiesResponse);
     getHotspotDetail.mockResolvedValue({
       enabled: true,
@@ -997,6 +1018,7 @@ describe('StockScreeningPage', () => {
       market: 'cn',
       strategy: 'trend_demo',
       maxResults: 3,
+      accountId: 1,
       notify: true,
       webBaseUrl: window.location.origin,
     });

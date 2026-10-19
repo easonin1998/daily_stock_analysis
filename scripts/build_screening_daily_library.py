@@ -25,13 +25,15 @@ from src.services.screening.config import Config, _load_env_file  # noqa: E402
 from src.services.screening.daily import enrich_daily_features  # noqa: E402
 from src.services.screening.daily_library import (  # noqa: E402
     completed_snapshot_bar_date,
+    daily_feature_library_date_coverage,
     latest_daily_feature_date,
     refresh_daily_feature_library_from_cache,
+    select_daily_feature_library_date_missing,
     select_daily_library_batch,
     upsert_daily_feature_library,
 )
 from src.services.screening.filter import apply_hard_filters, without_daily_filters  # noqa: E402
-from src.services.screening.normalize import normalize_code  # noqa: E402
+from src.services.screening.normalize import is_beijing_stock_code, normalize_code  # noqa: E402
 from src.services.screening.pipeline import _attach_market_regime_features  # noqa: E402
 from src.services.screening.snapshot import fetch_snapshot_with_fallback  # noqa: E402
 from src.services.screening.strategy import load_all_strategies  # noqa: E402
@@ -95,13 +97,34 @@ def main() -> int:
         and source.strip().lower() in {"auto", "sina", "tencent"}
     )
     library_latest_date = latest_daily_feature_date(library_path)
+    date_coverage = (
+        daily_feature_library_date_coverage(
+            candidates,
+            library_path=library_path,
+            as_of=completed_trade_date,
+        )
+        if completed_trade_date is not None
+        else None
+    )
+    cache_refresh_candidates = (
+        select_daily_feature_library_date_missing(
+            candidates,
+            library_path=library_path,
+            as_of=completed_trade_date,
+        )
+        if completed_trade_date is not None
+        else candidates
+    )
     should_refresh_cache = library_latest_date is None or (
         completed_trade_date is not None
-        and library_latest_date < completed_trade_date
+        and (
+            library_latest_date < completed_trade_date
+            or bool(date_coverage and date_coverage["missing_count"])
+        )
     )
     if should_refresh_cache:
         cache_refresh = refresh_daily_feature_library_from_cache(
-            candidates,
+            cache_refresh_candidates,
             cache_dir=cache_dir,
             library_path=library_path,
             source=source,
@@ -175,6 +198,8 @@ def main() -> int:
         "price_adjustment": price_adjustment,
         "lookback_days": lookback_days,
         "cache_refresh": cache_refresh,
+        "date_coverage_before_refresh": date_coverage,
+        "cache_refresh_candidate_count": len(cache_refresh_candidates),
         "completed_trade_date": completed_trade_date.isoformat() if completed_trade_date else "",
         "snapshot_bar_append_enabled": can_append_snapshot,
         "batch_count": len(batches),
@@ -222,11 +247,11 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _is_a_share_code(value: object) -> bool:
-    """Keep Shanghai, Shenzhen, and Beijing common-share code families."""
+    """Keep Shanghai and Shenzhen common-share code families used by the strategy."""
     code = str(value or "").strip()
     if len(code) != 6 or not code.isdigit():
         return False
-    return code.startswith(("0", "3", "6", "4", "8", "920"))
+    return code.startswith(("0", "3", "6")) and not is_beijing_stock_code(code)
 
 
 def _print_status(status: dict[str, object]) -> None:

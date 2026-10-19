@@ -20,7 +20,7 @@ from src.services.screening.normalize import (
 )
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_AKSHARE_BOARD_CACHE_SCHEMA = "v2"
+_AKSHARE_BOARD_CACHE_SCHEMA = "v3"
 _BAOSTOCK_INDUSTRY_CACHE_SCHEMA = "v1"
 _CACHE_DIR_UNSET = object()
 _NUMERIC_FIELDS = (
@@ -231,6 +231,7 @@ def fetch_akshare_board_map(
     """
     board_limit = max(int(max_boards), 1)
     notes: list[str] = []
+    mapping: dict[str, dict[str, object]] = {}
     resolved_cache_dir = _resolve_akshare_board_cache_dir(cache_dir)
     cache_path = (
         _akshare_board_cache_path(
@@ -254,39 +255,86 @@ def fetch_akshare_board_map(
         if cache_note:
             notes.append(cache_note)
         if cached_mapping is not None:
-            return cached_mapping, notes
+            if all(
+                _mapping_has_board_field(cached_mapping, field)
+                for field in ("industry", "concepts")
+            ):
+                return cached_mapping, notes
+            mapping.update(cached_mapping)
+            missing = [
+                field
+                for field in ("industry", "concepts")
+                if not _mapping_has_board_field(mapping, field)
+            ]
+            notes.append(
+                "industry provider cache is partial; refreshing missing fields: "
+                + ",".join(missing)
+            )
 
     import akshare as ak
 
-    mapping: dict[str, dict[str, object]] = {}
     flow_maps = _fetch_akshare_board_fund_flow(ak, notes) if include_fund_flow else {}
     board_specs = [
-        ("industry", ak.stock_board_industry_name_em, ak.stock_board_industry_cons_em),
-        ("concepts", ak.stock_board_concept_name_em, ak.stock_board_concept_cons_em),
+        (
+            "industry",
+            ("eastmoney", ak.stock_board_industry_name_em, ak.stock_board_industry_cons_em),
+            ("eastmoney_http", lambda: _fetch_eastmoney_http_boards("industry"), None),
+        ),
+        (
+            "concepts",
+            ("eastmoney", ak.stock_board_concept_name_em, ak.stock_board_concept_cons_em),
+            ("eastmoney_http", lambda: _fetch_eastmoney_http_boards("concepts"), None),
+        ),
     ]
-    for field, list_func, cons_func in board_specs:
-        try:
-            boards = list_func()
-        except Exception as exc:
-            notes.append(f"akshare {field} board list failed: {exc}")
+    for field, *providers in board_specs:
+        if _mapping_has_board_field(mapping, field):
+            notes.append(f"akshare {field} retained from partial cache")
             continue
-        board_items = _board_items(boards)[:board_limit]
+        provider_name = ""
+        boards = pd.DataFrame()
+        cons_func = None
+        for candidate_name, list_func, candidate_cons_func in providers:
+            try:
+                boards = list_func()
+            except Exception as exc:
+                notes.append(f"akshare {field} {candidate_name} board list failed: {exc}")
+                continue
+            if isinstance(boards, pd.DataFrame) and not boards.empty:
+                provider_name = candidate_name
+                cons_func = candidate_cons_func
+                break
+        if not provider_name or boards.empty:
+            continue
+        board_items = _board_items(
+            boards,
+            infer_rank=provider_name in {"eastmoney", "eastmoney_http"},
+        )[:board_limit]
         loaded = 0
         for board_item in board_items:
             board = board_item["name"]
             try:
-                members = cons_func(symbol=board)
+                if provider_name == "eastmoney_http":
+                    members = _fetch_eastmoney_http_constituents(
+                        board_code=_safe_text(board_item.get("code")),
+                    )
+                else:
+                    members = cons_func(symbol=board)
+                if not isinstance(members, pd.DataFrame) or members.empty:
+                    raise RuntimeError("empty constituent response")
             except Exception as exc:
                 notes.append(f"akshare {field} board skipped {board}: {exc}")
                 continue
-            heat_score = _board_heat_score(
-                change_pct=_safe_float(board_item.get("change_pct")),
-                rank=_safe_float(board_item.get("rank")),
+            change_pct = _safe_float(board_item.get("change_pct"))
+            rank = _safe_float(board_item.get("rank"))
+            heat_score = (
+                _board_heat_score(change_pct=change_pct, rank=rank)
+                if change_pct is not None or rank is not None
+                else None
             )
             heat_summary = _board_heat_summary(
                 board,
-                change_pct=_safe_float(board_item.get("change_pct")),
-                rank=_safe_float(board_item.get("rank")),
+                change_pct=change_pct,
+                rank=rank,
             )
             flow_item = flow_maps.get(field, {}).get(board, {})
             for _, row in members.iterrows():
@@ -304,7 +352,10 @@ def fetch_akshare_board_map(
                 elif field == "concepts":
                     item["concepts"] = _merge_label_text(item.get("concepts", ""), board)
                     item["concept_heat_score"] = _max_numeric(item.get("concept_heat_score"), heat_score)
-                item["board_heat_score"] = _max_numeric(item.get("board_heat_score"), heat_score)
+                if heat_score is not None:
+                    item["board_heat_score"] = _max_numeric(
+                        item.get("board_heat_score"), heat_score
+                    )
                 flow_score = _safe_float(flow_item.get("score"))
                 flow_amount = _safe_float(flow_item.get("net_amount"))
                 if flow_score is not None:
@@ -321,7 +372,9 @@ def fetch_akshare_board_map(
                     heat_summary,
                 )
             loaded += 1
-        notes.append(f"akshare {field} boards loaded: {loaded}/{len(board_items)}")
+        notes.append(
+            f"akshare {field} {provider_name} boards loaded: {loaded}/{len(board_items)}"
+        )
     if not mapping and cache_path is not None:
         stale_mapping, stale_note = _read_akshare_board_cache(
             cache_path,
@@ -839,22 +892,128 @@ def _board_names(df: pd.DataFrame) -> list[str]:
     return []
 
 
-def _board_items(df: pd.DataFrame) -> list[dict[str, object]]:
+def _board_items(
+    df: pd.DataFrame,
+    *,
+    infer_rank: bool = True,
+) -> list[dict[str, object]]:
     items: list[dict[str, object]] = []
     for idx, row in df.iterrows():
         name = _first_row_value(row, ["板块名称", "名称", "name"])
         if not _safe_text(name):
             continue
         rank = _safe_float(_first_row_value(row, ["排名", "序号", "rank"]))
-        if rank is None:
+        if rank is None and infer_rank:
             rank = float(idx + 1)
         change_pct = _safe_float(_first_row_value(row, ["涨跌幅", "涨幅", "change_pct"]))
         items.append({
             "name": _safe_text(name),
+            "code": _safe_text(_first_row_value(row, ["板块代码", "代码", "code"])),
             "rank": rank,
             "change_pct": change_pct,
         })
     return items
+
+
+def _fetch_eastmoney_http_boards(board_type: str) -> pd.DataFrame:
+    """Fetch the live board ranking from the HTTP endpoint used as EM fallback."""
+    market_type = "2" if board_type == "industry" else "3"
+    rows = _fetch_eastmoney_http_pages({
+        "po": "1",
+        "np": "1",
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": "2",
+        "invt": "2",
+        "fid": "f3",
+        "fs": f"m:90 t:{market_type} f:!50",
+        "fields": "f3,f12,f14",
+    })
+    return pd.DataFrame([
+        {
+            "name": _safe_text(item.get("f14")),
+            "code": _safe_text(item.get("f12")),
+            "change_pct": _safe_float(item.get("f3")),
+            "rank": index + 1,
+        }
+        for index, item in enumerate(rows)
+        if _safe_text(item.get("f12")) and _safe_text(item.get("f14"))
+    ])
+
+
+def _fetch_eastmoney_http_constituents(*, board_code: str) -> pd.DataFrame:
+    """Fetch complete constituents for one EastMoney board code."""
+    if not board_code:
+        raise RuntimeError("EastMoney board code is missing")
+    rows = _fetch_eastmoney_http_pages({
+        "po": "1",
+        "np": "1",
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": "2",
+        "invt": "2",
+        "fid": "f12",
+        "fs": f"b:{board_code} f:!50",
+        "fields": "f3,f6,f8,f10,f12,f14",
+    })
+    records = [
+        {
+            "code": _normalize_code(item.get("f12")),
+            "name": _safe_text(item.get("f14")),
+            "change_pct": _safe_float(item.get("f3")),
+            "amount": _safe_float(item.get("f6")),
+            "turnover_rate": _safe_float(item.get("f8")),
+            "volume_ratio": _safe_float(item.get("f10")),
+        }
+        for item in rows
+        if _normalize_code(item.get("f12"))
+    ]
+    return pd.DataFrame(
+        records,
+        columns=("code", "name", "change_pct", "amount", "turnover_rate", "volume_ratio"),
+    ).drop_duplicates("code", keep="last")
+
+
+def _fetch_eastmoney_http_pages(params: dict[str, str]) -> list[dict[str, object]]:
+    import requests
+
+    hosts = (
+        "http://79.push2.eastmoney.com/api/qt/clist/get",
+        "http://17.push2.eastmoney.com/api/qt/clist/get",
+        "http://push2.eastmoney.com/api/qt/clist/get",
+    )
+    page_size = 100
+    rows: list[dict[str, object]] = []
+    page = 1
+    while True:
+        request_params = {**params, "pn": str(page), "pz": str(page_size)}
+        payload = None
+        errors: list[str] = []
+        for url in hosts:
+            try:
+                response = requests.get(
+                    url,
+                    params=request_params,
+                    headers={
+                        "User-Agent": "Mozilla/5.0",
+                        "Referer": "http://quote.eastmoney.com/",
+                    },
+                    timeout=15,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                break
+            except Exception as exc:
+                errors.append(f"{url}: {exc}")
+        data = payload.get("data") if isinstance(payload, dict) else None
+        batch = data.get("diff") if isinstance(data, dict) else None
+        if not isinstance(batch, list):
+            raise RuntimeError("EastMoney HTTP board request failed: " + "; ".join(errors))
+        rows.extend(item for item in batch if isinstance(item, dict))
+        total = int(data.get("total") or len(rows))
+        if page * page_size >= total or not batch:
+            break
+        page += 1
+        time.sleep(0.05)
+    return rows
 
 
 def _fetch_akshare_board_fund_flow(
@@ -868,20 +1027,14 @@ def _fetch_akshare_board_fund_flow(
         ("concepts", "概念资金流", "stock_fund_flow_concept"),
     )
     for field, sector_type, fallback_name in specs:
-        frame = pd.DataFrame()
-        try:
-            rank_func = getattr(ak, "stock_sector_fund_flow_rank")
-            frame = rank_func(indicator="今日", sector_type=sector_type)
-        except Exception as primary_exc:
-            try:
-                fallback = getattr(ak, fallback_name)
-                frame = fallback()
-            except Exception as fallback_exc:
-                notes.append(
-                    f"akshare {field} fund flow skipped: "
-                    f"rank={primary_exc}; fallback={fallback_exc}"
-                )
-                continue
+        frame, error = _fetch_akshare_board_flow_frame(
+            ak,
+            sector_type=sector_type,
+            fallback_name=fallback_name,
+        )
+        if error:
+            notes.append(f"akshare {field} fund flow skipped: {error}")
+            continue
         parsed = _parse_board_fund_flow(frame)
         if parsed:
             output[field] = parsed
@@ -891,45 +1044,276 @@ def _fetch_akshare_board_fund_flow(
     return output
 
 
-def _parse_board_fund_flow(df: pd.DataFrame) -> dict[str, dict[str, float]]:
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return {}
-    name_column = next(
-        (
-            column
-            for column in df.columns
-            if any(token in str(column) for token in ("板块名称", "行业名称", "概念名称", "名称"))
-        ),
-        None,
+def _fetch_akshare_board_flow_frame(
+    ak: object,
+    *,
+    sector_type: str,
+    fallback_name: str,
+) -> tuple[pd.DataFrame, str]:
+    """Fetch one board-flow table with the domestic free source fallback."""
+    try:
+        rank_func = getattr(ak, "stock_sector_fund_flow_rank")
+        frame = rank_func(indicator="今日", sector_type=sector_type)
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            return frame, ""
+        primary_error = "rank returned no rows"
+    except Exception as exc:
+        primary_error = str(exc)
+    try:
+        fallback = getattr(ak, fallback_name)
+        frame = fallback()
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            return frame, ""
+        fallback_error = "fallback returned no rows"
+    except Exception as exc:
+        fallback_error = str(exc)
+    return pd.DataFrame(), f"rank={primary_error}; fallback={fallback_error}"
+
+
+def fetch_akshare_board_fund_flow_snapshot() -> tuple[pd.DataFrame, list[str]]:
+    """Return current industry/concept fund flow in the board-heat schema."""
+    notes: list[str] = []
+    try:
+        import akshare as ak
+    except Exception as exc:
+        return pd.DataFrame(), [f"akshare board fund flow unavailable: {exc}"]
+
+    frames: list[pd.DataFrame] = []
+    specs = (
+        ("industry", "行业资金流", "stock_fund_flow_industry"),
+        ("concept", "概念资金流", "stock_fund_flow_concept"),
     )
-    amount_column = next(
-        (
-            column
-            for column in df.columns
-            if any(token in str(column) for token in ("主力净流入-净额", "主力净流入", "净流入", "净额"))
-            and not any(token in str(column) for token in ("占比", "比例", "%"))
-        ),
-        None,
+    for board_type, sector_type, fallback_name in specs:
+        frame, error = _fetch_akshare_board_flow_frame(
+            ak,
+            sector_type=sector_type,
+            fallback_name=fallback_name,
+        )
+        if error:
+            notes.append(f"akshare {board_type} fund flow skipped: {error}")
+            continue
+        normalized = _normalize_board_fund_flow_snapshot(frame, board_type=board_type)
+        if normalized.empty:
+            notes.append(
+                f"akshare {board_type} fund flow skipped: unsupported columns"
+            )
+            continue
+        notes.append(f"akshare {board_type} fund flow loaded: {len(normalized)}")
+        frames.append(normalized)
+    if not frames:
+        return pd.DataFrame(), notes
+    return pd.concat(frames, ignore_index=True), notes
+
+
+def _normalize_board_fund_flow_snapshot(
+    df: pd.DataFrame,
+    *,
+    board_type: str,
+) -> pd.DataFrame:
+    """Normalize board-level price and flow fields from AkShare/THS tables."""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+
+    def find_column(
+        candidates: tuple[str, ...],
+        *,
+        excluded: tuple[str, ...] = (),
+    ) -> object | None:
+        for column in df.columns:
+            text = str(column).strip()
+            if any(token == text or token in text for token in candidates) and not any(
+                token in text for token in excluded
+            ):
+                return column
+        return None
+
+    name_column = find_column(
+        ("板块名称", "行业名称", "概念名称", "名称", "行业"),
+        excluded=("指数", "涨跌幅", "领涨股"),
+    )
+    amount_column = find_column(
+        ("主力净流入-净额", "主力净流入", "净流入", "净额"),
+        excluded=("占比", "比例", "%"),
     )
     if name_column is None or amount_column is None:
-        return {}
-    work = df[[name_column, amount_column]].copy()
-    work["__name"] = work[name_column].map(_safe_text)
-    work["__amount"] = work[amount_column].map(_safe_float)
-    work = work[work["__name"].ne("") & work["__amount"].notna()].copy()
+        return pd.DataFrame()
+    change_column = find_column(
+        ("板块-涨跌幅", "行业-涨跌幅", "涨跌幅"),
+        excluded=("领涨股",),
+    )
+    member_column = find_column(("成分股数量", "公司家数", "成分股数"))
+
+    result = pd.DataFrame({
+        "board_name": df[name_column].map(_safe_text),
+        "main_net_inflow": df[amount_column].map(_safe_float),
+    })
+    result = result[
+        result["board_name"].ne("") & result["main_net_inflow"].notna()
+    ].copy()
+    if result.empty:
+        return result
+    result["board_type"] = board_type
+    result["fund_flow_score"] = (
+        result["main_net_inflow"].rank(method="average", pct=True).mul(100.0).round(4)
+    )
+    result["weighted_change_pct"] = (
+        df.loc[result.index, change_column].map(_safe_float).to_numpy()
+        if change_column is not None
+        else pd.NA
+    )
+    result["member_count"] = (
+        df.loc[result.index, member_column].map(_safe_float).to_numpy()
+        if member_column is not None
+        else pd.NA
+    )
+    result["board_heat_score"] = (
+        pd.to_numeric(result["weighted_change_pct"], errors="coerce")
+        .rank(method="average", pct=True)
+        .mul(100.0)
+        .round(4)
+    )
+    result["data_source"] = "akshare_ths_fund_flow"
+    return result[
+        [
+            "board_type",
+            "board_name",
+            "board_heat_score",
+            "fund_flow_score",
+            "main_net_inflow",
+            "weighted_change_pct",
+            "member_count",
+            "data_source",
+        ]
+    ].drop_duplicates(["board_type", "board_name"], keep="last")
+
+
+def attach_qmt_industry_overlays(
+    universe: pd.DataFrame,
+    membership: pd.DataFrame,
+    board_overlays: pd.DataFrame,
+    *,
+    level_prefix: str = "2",
+    include_fund_flow: bool = False,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Bridge THS industry metrics to the stable Baostock industry universe.
+
+    QMT ``THY`` membership uses numbered hierarchy labels.  AkShare's free
+    industry flow table uses the level-2 labels without that prefix.  Matching
+    those exact names at stock level avoids guessing between the incompatible
+    Baostock and THS industry taxonomies.
+    """
+    result = universe.copy()
+    diagnostics = {
+        "membership_rows": 0,
+        "matched_stock_count": 0,
+        "external_heat_stock_count": 0,
+        "fund_flow_stock_count": 0,
+        "matched_board_count": 0,
+    }
+    if (
+        result.empty
+        or membership.empty
+        or board_overlays.empty
+        or "code" not in result.columns
+        or not {"code", "concepts"}.issubset(membership.columns)
+        or not {"board_type", "board_name"}.issubset(board_overlays.columns)
+    ):
+        return result, diagnostics
+
+    overlays = board_overlays[board_overlays["board_type"].eq("industry")].copy()
+    if overlays.empty:
+        return result, diagnostics
+    overlays["board_name"] = overlays["board_name"].map(_safe_text)
+    overlays = overlays[overlays["board_name"].ne("")].drop_duplicates(
+        "board_name", keep="last"
+    )
+    if overlays.empty:
+        return result, diagnostics
+
+    metrics = overlays.set_index("board_name")
+    available_names = set(metrics.index)
+
+    def median_metric(frame: pd.DataFrame, column: str) -> float:
+        if column not in frame.columns:
+            return float("nan")
+        return float(pd.to_numeric(frame[column], errors="coerce").median())
+
+    bridge_rows: list[dict[str, object]] = []
+    matched_boards: set[str] = set()
+    diagnostics["membership_rows"] = int(len(membership))
+    for row in membership[["code", "concepts"]].itertuples(index=False):
+        code = _normalize_code(row.code)
+        labels = {
+            item.strip()[len(level_prefix):].strip()
+            for item in str(row.concepts or "").split(",")
+            if item.strip().startswith(level_prefix)
+            and item.strip()[len(level_prefix):].strip() in available_names
+        }
+        if not code or not labels:
+            continue
+        matched_boards.update(labels)
+        selected = metrics.loc[sorted(labels)]
+        if isinstance(selected, pd.Series):
+            selected = selected.to_frame().T
+        bridge_rows.append({
+            "code": code,
+            "board_heat_score": median_metric(selected, "board_heat_score"),
+            "board_fund_flow_score": median_metric(selected, "fund_flow_score"),
+            "board_fund_flow_net_amount": median_metric(selected, "main_net_inflow"),
+        })
+    if not bridge_rows:
+        return result, diagnostics
+
+    bridge = pd.DataFrame(bridge_rows).drop_duplicates("code", keep="last").set_index("code")
+    keys = result["code"].map(_normalize_code)
+    heat_values = keys.map(bridge["board_heat_score"])
+    if "board_heat_score" not in result.columns:
+        result["board_heat_score"] = pd.NA
+    result["board_heat_score"] = heat_values.where(
+        heat_values.notna(), result["board_heat_score"]
+    )
+
+    if include_fund_flow:
+        for field in ("board_fund_flow_score", "board_fund_flow_net_amount"):
+            values = keys.map(bridge[field])
+            if field not in result.columns:
+                result[field] = pd.NA
+            result[field] = values.where(values.notna(), result[field])
+
+    diagnostics.update({
+        "matched_stock_count": int(keys.isin(bridge.index).sum()),
+        "external_heat_stock_count": int(heat_values.notna().sum()),
+        "fund_flow_stock_count": int(
+            keys.map(bridge["board_fund_flow_score"]).notna().sum()
+        ) if include_fund_flow else 0,
+        "matched_board_count": len(matched_boards),
+    })
+    return result, diagnostics
+
+
+def _parse_board_fund_flow(df: pd.DataFrame) -> dict[str, dict[str, float]]:
+    work = _normalize_board_fund_flow_snapshot(df, board_type="industry")
     if work.empty:
         return {}
-    work["__score"] = work["__amount"].rank(method="average", pct=True).mul(100.0)
     return {
         name: {
             "net_amount": round(float(amount), 4),
             "score": round(float(score), 4),
         }
-        for name, amount, score in work[["__name", "__amount", "__score"]].itertuples(
+        for name, amount, score in work[
+            ["board_name", "main_net_inflow", "fund_flow_score"]
+        ].itertuples(
             index=False,
             name=None,
         )
     }
+
+
+def _mapping_has_board_field(
+    mapping: dict[str, dict[str, object]],
+    field: str,
+) -> bool:
+    return any(_safe_text(item.get(field)) for item in mapping.values())
 
 
 def _merge_mapping(target: dict[str, dict[str, object]], source: dict[str, dict[str, object]]) -> None:

@@ -34,6 +34,7 @@ export interface PortfolioPositionItem {
   market: string;
   currency: string;
   quantity: number;
+  sellableQuantity: number;
   avgCost: number;
   totalCost: number;
   lastPrice: number;
@@ -190,6 +191,11 @@ export interface PortfolioTradeCreateRequest {
   market?: 'cn' | 'hk' | 'us' | 'jp' | 'kr' | 'tw';
   currency?: string;
   tradeUid?: string;
+  strategy?: string;
+  strategyVersion?: string;
+  signalRunId?: string;
+  strategyAction?: 'initial_entry' | 'add_on' | 'partial_exit' | 'full_exit' | 'manual';
+  initialStopPrice?: number;
   note?: string;
 }
 
@@ -235,8 +241,76 @@ export interface PortfolioTradeListItem {
   price: number;
   fee: number;
   tax: number;
+  strategy?: string | null;
+  strategyVersion?: string | null;
+  signalRunId?: string | null;
+  strategyAction?: string | null;
+  initialStopPrice?: number | null;
   note?: string | null;
   createdAt?: string | null;
+}
+
+export interface PortfolioStrategyHoldingPlan {
+  managed: boolean;
+  status: string;
+  action?: string;
+  symbol: string;
+  market?: string;
+  quantity: number;
+  sellableQuantity: number;
+  projectedNextOpenSellableQuantity?: number;
+  avgCost: number;
+  currentClose?: number;
+  currentRMultiple?: number;
+  activeExitPrice?: number;
+  recommendedSellQuantity?: number;
+  recommendedPartialSellQuantity?: number;
+  executionStatus?: string;
+  reason?: string;
+  addOnPlan?: {
+    status?: string;
+    nextTriggerR?: number;
+    recommendedQuantity?: number;
+    referencePrice?: number;
+    executionSession?: string;
+    minPrice?: number;
+    maxPrice?: number;
+    estimatedNotional?: number;
+    protectiveStopPrice?: number;
+    reason?: string;
+  };
+}
+
+export interface PortfolioStrategyPlanResponse {
+  status: string;
+  strategy: string;
+  strategyVersion: string;
+  account: {
+    accountId: number;
+    accountName: string;
+    asOf: string;
+    market: string;
+    totalCash: number;
+    totalMarketValue: number;
+    totalEquity: number;
+    positionCount: number;
+    managedPositionCount: number;
+    unmanagedPositionCount: number;
+    strategyRiskHeatPct: number;
+    marketRegimeState: string;
+    marketRegimeDate?: string | null;
+  };
+  holdings: PortfolioStrategyHoldingPlan[];
+  rules: Record<string, unknown>;
+  limitations: string[];
+}
+
+export interface PortfolioStrategyAdoptRequest {
+  accountId: number;
+  initialStopPrice: number;
+  asOf?: string;
+  strategy?: string;
+  signalRunId?: string;
 }
 
 export interface PortfolioTradeListResponse {

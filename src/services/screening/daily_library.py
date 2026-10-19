@@ -116,6 +116,71 @@ def load_daily_feature_library(
     return fresh
 
 
+def daily_feature_library_date_coverage(
+    candidates: pd.DataFrame,
+    *,
+    library_path: str | Path,
+    as_of: date,
+) -> dict[str, Any]:
+    """Measure exact-date library coverage for a concrete candidate universe."""
+    if candidates.empty or "code" not in candidates.columns:
+        return {
+            "as_of": as_of.isoformat(),
+            "candidate_count": 0,
+            "matched_count": 0,
+            "missing_count": 0,
+            "coverage_pct": 0.0,
+        }
+    candidate_codes = {
+        code
+        for value in candidates["code"]
+        if (code := normalize_code(value, allow_ticker=True))
+    }
+    library = load_daily_feature_library(library_path, max_age_days=36_500)
+    if library.empty:
+        matched_codes: set[str] = set()
+    else:
+        dates = pd.to_datetime(library.get("daily_latest_date"), errors="coerce").dt.date
+        matched_codes = set(
+            library.loc[dates.eq(as_of), "code"].dropna().astype(str)
+        )
+    matched_count = len(candidate_codes & matched_codes)
+    candidate_count = len(candidate_codes)
+    return {
+        "as_of": as_of.isoformat(),
+        "candidate_count": candidate_count,
+        "matched_count": matched_count,
+        "missing_count": max(candidate_count - matched_count, 0),
+        "coverage_pct": (
+            round(matched_count / candidate_count * 100.0, 4)
+            if candidate_count
+            else 0.0
+        ),
+    }
+
+
+def select_daily_feature_library_date_missing(
+    candidates: pd.DataFrame,
+    *,
+    library_path: str | Path,
+    as_of: date,
+) -> pd.DataFrame:
+    """Return only candidate rows not represented on the exact target date."""
+    if candidates.empty or "code" not in candidates.columns:
+        return candidates.head(0).copy()
+    library = load_daily_feature_library(library_path, max_age_days=36_500)
+    if library.empty:
+        return candidates.copy()
+    dates = pd.to_datetime(library.get("daily_latest_date"), errors="coerce").dt.date
+    current_codes = set(
+        library.loc[dates.eq(as_of), "code"].dropna().astype(str)
+    )
+    normalized_codes = candidates["code"].map(
+        lambda value: normalize_code(value, allow_ticker=True)
+    )
+    return candidates.loc[~normalized_codes.isin(current_codes)].copy()
+
+
 def upsert_daily_feature_library(
     enriched: pd.DataFrame,
     *,

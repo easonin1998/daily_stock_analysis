@@ -1,6 +1,7 @@
 import apiClient from './index';
 import { systemConfigApi } from './systemConfig';
 import { toCamelCase } from './utils';
+import type { PortfolioStrategyPlanResponse } from '../types/portfolio';
 
 const SCREENING_SCREEN_TIMEOUT_MS = 180000;
 const SCREENING_REQUEST_TIMEOUT_MS = 300000;
@@ -120,8 +121,19 @@ export type ScreeningCandidate = {
       referencePrice?: number | null;
       maxPositionWeightPct?: number | null;
       maxPortfolioRiskPerTradePct?: number | null;
+      minPositionWeightPct?: number | null;
       lotSize?: number | null;
       quantityFormula?: string;
+      accountId?: number;
+      accountName?: string;
+      executionStatus?: string;
+      recommendedQuantity?: number;
+      sizingPrice?: number;
+      estimatedNotional?: number;
+      estimatedRiskAmount?: number;
+      estimatedWeightPct?: number;
+      estimatedHeatPct?: number;
+      constraintReason?: string;
     };
     conditionOrders?: Record<string, unknown>;
     holdingPremises?: string[];
@@ -348,6 +360,8 @@ export type ScreeningScreenResponse = {
   resultVariantPoolSize?: number;
   resultVariantRotatedSlots?: number;
   marketRegime?: ScreeningMarketRegime;
+  accountId?: number;
+  portfolioPlan?: PortfolioStrategyPlanResponse;
   notification?: {
     requested: boolean;
     channel: 'feishu' | string;
@@ -364,6 +378,7 @@ export type ScreeningScreenAccepted = {
   strategy: string;
   market: string;
   maxResults: number;
+  accountId?: number | null;
 };
 
 export type ScreeningScreenTaskStatus = {
@@ -470,24 +485,26 @@ export const screeningApi = {
     return toCamelCase<ScreeningStatus>(response.data);
   },
 
-  async screen(payload: { market: string; strategy: string; maxResults: number; notify?: boolean; webBaseUrl?: string }): Promise<ScreeningScreenResponse> {
+  async screen(payload: { market: string; strategy: string; maxResults: number; accountId?: number; notify?: boolean; webBaseUrl?: string }): Promise<ScreeningScreenResponse> {
     const response = await apiClient.post<Record<string, unknown>>('/api/v1/screening/screen', {
       market: payload.market,
       strategy: payload.strategy,
       max_results: payload.maxResults,
       variant_seed: getScreeningVariantSeed(),
+      ...(payload.accountId != null ? { account_id: payload.accountId } : {}),
       ...(payload.notify !== undefined ? { notify: payload.notify } : {}),
       ...(payload.webBaseUrl ? { web_base_url: payload.webBaseUrl } : {}),
     }, { timeout: SCREENING_SCREEN_TIMEOUT_MS });
     return toCamelCase<ScreeningScreenResponse>(response.data);
   },
 
-  async startScreen(payload: { market: string; strategy: string; maxResults: number; notify?: boolean; webBaseUrl?: string }): Promise<ScreeningScreenAccepted> {
+  async startScreen(payload: { market: string; strategy: string; maxResults: number; accountId?: number; notify?: boolean; webBaseUrl?: string }): Promise<ScreeningScreenAccepted> {
     const response = await apiClient.post<Record<string, unknown>>('/api/v1/screening/screen/tasks', {
       market: payload.market,
       strategy: payload.strategy,
       max_results: payload.maxResults,
       variant_seed: getScreeningVariantSeed(),
+      ...(payload.accountId != null ? { account_id: payload.accountId } : {}),
       ...(payload.notify !== undefined ? { notify: payload.notify } : {}),
       ...(payload.webBaseUrl ? { web_base_url: payload.webBaseUrl } : {}),
     });

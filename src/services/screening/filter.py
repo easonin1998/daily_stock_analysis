@@ -9,6 +9,7 @@ from dataclasses import replace
 import pandas as pd
 
 from src.services.screening.models import HardFilterConfig
+from src.services.screening.normalize import is_beijing_stock_code
 
 logger = logging.getLogger(__name__)
 _DAILY_FILTER_DEFAULTS = {
@@ -68,6 +69,16 @@ class SnapshotFieldMissingError(ValueError):
     """Raised when a configured hard filter cannot be evaluated safely."""
 
 
+def exclude_beijing_stock_exchange_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove current and legacy BSE codes while preserving frame metadata."""
+    if df.empty:
+        return df.copy()
+    mask = pd.Series(True, index=df.index)
+    filtered = df.loc[_filter_out_beijing_stocks(df, mask)].copy()
+    filtered.attrs.update(df.attrs)
+    return filtered
+
+
 def apply_hard_filters(df: pd.DataFrame, filters: HardFilterConfig) -> pd.DataFrame:
     """Filter snapshot DataFrame by hard conditions. Returns filtered copy."""
     result = df.copy()
@@ -75,6 +86,9 @@ def apply_hard_filters(df: pd.DataFrame, filters: HardFilterConfig) -> pd.DataFr
         return result
 
     mask = pd.Series(True, index=result.index)
+
+    if filters.exclude_beijing_stock_exchange:
+        mask = _filter_out_beijing_stocks(result, mask)
 
     if filters.exclude_st:
         name_col = _find_col(result, ["name", "股票名称", "名称"]) if mask.any() else None
@@ -197,6 +211,12 @@ def hard_filter_rejection_summary(
         if removed > 0 and len(diagnostics) < limit:
             diagnostics.append(f"{label} removed {removed} ({before}->{after})")
         mask = next_mask
+
+    if filters.exclude_beijing_stock_exchange:
+        record(
+            "exclude_beijing_stock_exchange",
+            _filter_out_beijing_stocks(df, mask),
+        )
 
     if filters.exclude_st:
         name_col = _find_col(df, ["name", "股票名称", "名称"]) if mask.any() else None
@@ -328,6 +348,14 @@ def hard_filter_waterfall(
             step["suggestion"] = suggestion
         steps.append(step)
         mask = next_mask
+
+    if filters.exclude_beijing_stock_exchange:
+        code_col = _find_col(df, ["code", "股票代码", "代码"])
+        record(
+            "exclude_beijing_stock_exchange",
+            _filter_out_beijing_stocks(df, mask),
+            [code_col] if code_col else [],
+        )
 
     if filters.exclude_st:
         name_col = _find_col(df, ["name", "股票名称", "名称"]) if mask.any() else None
@@ -488,6 +516,16 @@ def _find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
         if c in df.columns:
             return c
     return None
+
+
+def _filter_out_beijing_stocks(df: pd.DataFrame, mask: pd.Series) -> pd.Series:
+    code_col = _find_col(df, ["code", "股票代码", "代码"])
+    if not code_col:
+        raise SnapshotFieldMissingError(
+            "Missing required snapshot column for exclude_beijing_stock_exchange filter: code"
+        )
+    excluded = df[code_col].map(is_beijing_stock_code)
+    return mask & ~excluded
 
 
 def _filter_min(

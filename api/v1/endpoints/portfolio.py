@@ -32,6 +32,8 @@ from api.v1.schemas.portfolio import (
     PortfolioPositionAnalysisRequest,
     PortfolioRiskResponse,
     PortfolioSnapshotResponse,
+    PortfolioStrategyAdoptRequest,
+    PortfolioStrategyPlanResponse,
     PortfolioTradeListResponse,
     PortfolioTradeCreateRequest,
 )
@@ -44,6 +46,7 @@ from src.services.portfolio_service import (
     PortfolioOversellError,
     PortfolioService,
 )
+from src.services.portfolio_strategy_service import PortfolioStrategyService
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +184,11 @@ def create_trade(request: PortfolioTradeCreateRequest) -> PortfolioEventCreatedR
             market=request.market,
             currency=request.currency,
             trade_uid=request.trade_uid,
+            strategy=request.strategy,
+            strategy_version=request.strategy_version,
+            signal_run_id=request.signal_run_id,
+            strategy_action=request.strategy_action,
+            initial_stop_price=request.initial_stop_price,
             note=request.note,
         )
         return PortfolioEventCreatedResponse(**data)
@@ -439,6 +447,56 @@ def get_snapshot(
         raise _bad_request(exc)
     except Exception as exc:
         raise _internal_error("Get snapshot failed", exc)
+
+
+@router.get(
+    "/strategy-plan",
+    response_model=PortfolioStrategyPlanResponse,
+    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+    summary="Build the end-of-day strategy plan for one portfolio account",
+)
+def get_strategy_plan(
+    account_id: int = Query(..., description="Portfolio account id"),
+    as_of: Optional[date] = Query(None, description="Completed trading date"),
+    strategy: str = Query("martin_momentum_pullback", max_length=64),
+) -> PortfolioStrategyPlanResponse:
+    try:
+        data = PortfolioStrategyService().get_account_plan(
+            account_id=account_id,
+            as_of=as_of,
+            strategy=strategy,
+        )
+        return PortfolioStrategyPlanResponse(**data)
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Build portfolio strategy plan failed", exc)
+
+
+@router.post(
+    "/positions/{symbol}/strategy",
+    response_model=PortfolioStrategyPlanResponse,
+    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+    summary="Adopt an existing position into strategy management",
+)
+def adopt_strategy_position(
+    symbol: str,
+    request: PortfolioStrategyAdoptRequest,
+) -> PortfolioStrategyPlanResponse:
+    try:
+        data = PortfolioStrategyService().adopt_position(
+            account_id=request.account_id,
+            symbol=symbol,
+            initial_stop_price=request.initial_stop_price,
+            as_of=request.as_of,
+            strategy=request.strategy,
+            signal_run_id=request.signal_run_id,
+        )
+        return PortfolioStrategyPlanResponse(**data)
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Adopt portfolio strategy position failed", exc)
 
 
 @router.post(

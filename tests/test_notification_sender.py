@@ -649,6 +649,8 @@ class TestFeishuSender(unittest.TestCase):
                 "status": "available",
                 "as_of": "2026-10-16",
                 "sector_count": 83,
+                "daily_feature_coverage_pct": 99.86,
+                "industry_coverage_pct": 93.65,
                 "local_heat_status": "available",
                 "external_heat_status": "unavailable",
                 "fund_flow_status": "unavailable",
@@ -658,6 +660,27 @@ class TestFeishuSender(unittest.TestCase):
                     "breadth_ratio": 75.7,
                     "high_adr_leader_count": 15,
                     "change_20d_pct": 12.6,
+                }],
+            },
+            "board_heat_overview": {
+                "status": "available",
+                "observed_at": "2026-10-16T15:05:00+08:00",
+                "trading_date": "2026-10-16",
+                "quote_source": "sina",
+                "industry": [{
+                    "name": "铁路运输业",
+                    "score": 85.3,
+                    "change_pct": 0.95,
+                    "advance_ratio": 71.43,
+                    "amount_share_pct": 0.14,
+                }],
+                "concept_source": "akshare_ths_fund_flow",
+                "concept": [{
+                    "name": "人形机器人",
+                    "score": 98.06,
+                    "change_pct": 1.46,
+                    "fund_flow_score": 98.71,
+                    "member_count": 473,
                 }],
             },
             "theme_overview": {
@@ -677,6 +700,35 @@ class TestFeishuSender(unittest.TestCase):
                 "seed_pool_count": 120,
                 "daily_enrich_count": 120,
                 "warning_count": 1,
+            },
+            "portfolio_plan": {
+                "account": {
+                    "account_id": 1,
+                    "account_name": "实盘模拟",
+                    "as_of": "2026-10-16",
+                    "total_cash": 80000,
+                    "total_equity": 100000,
+                    "position_count": 1,
+                    "managed_position_count": 1,
+                    "strategy_risk_heat_pct": 0.4,
+                },
+                "holdings": [{
+                    "managed": True,
+                    "status": "hold",
+                    "action": "keep_and_review_after_close",
+                    "symbol": "000001",
+                    "quantity": 500,
+                    "sellable_quantity": 500,
+                    "avg_cost": 10.0,
+                    "current_close": 11.0,
+                    "current_r_multiple": 1.2,
+                    "active_exit_price": 10.5,
+                    "add_on_plan": {
+                        "status": "ready",
+                        "recommended_quantity": 200,
+                        "max_price": 11.2,
+                    },
+                }],
             },
             "candidates": [{
                 "code": "600519",
@@ -703,6 +755,11 @@ class TestFeishuSender(unittest.TestCase):
                         "min_position_weight_pct": 12.0,
                         "max_portfolio_risk_per_trade_pct": 0.5,
                         "max_portfolio_heat_pct": 2.5,
+                        "execution_status": "ready",
+                        "recommended_quantity": 600,
+                        "estimated_notional": 912000,
+                        "estimated_weight_pct": 9.12,
+                        "estimated_heat_pct": 0.42,
                     },
                 },
             }],
@@ -720,6 +777,11 @@ class TestFeishuSender(unittest.TestCase):
             item for item in tables if item.get("element_id") == "screening_candidates"
         )
         self.assertEqual(candidate_table["rows"][0]["name"], "1. 贵州茅台\n600519")
+        self.assertEqual(candidate_table["rows"][0]["order"], "600股\n≈912000.00")
+        holding_table = next(
+            item for item in tables if item.get("element_id") == "screening_portfolio_holdings"
+        )
+        self.assertEqual(holding_table["rows"][0]["action"], "可加仓 200股\n竞价≤11.20")
         rendered = "\n".join(
             item.get("content", "")
             for item in card["body"]["elements"]
@@ -728,8 +790,14 @@ class TestFeishuSender(unittest.TestCase):
         self.assertIn("不设固定期限，趋势未破坏则持有", rendered)
         self.assertIn("候选 **1** 只", rendered)
         self.assertIn("条件单计划", rendered)
+        self.assertIn("账户执行摘要", rendered)
+        self.assertIn("账户计划：**600 股**", rendered)
         self.assertIn("中性防守", rendered)
+        self.assertIn("当日行业热度", rendered)
+        self.assertIn("当日题材热度", rendered)
+        self.assertIn("akshare_ths_fund_flow", rendered)
         self.assertIn("行业板块热度", rendered)
+        self.assertIn("日线覆盖 99.86%", rendered)
         self.assertIn("本地量价 **可用**", rendered)
         self.assertIn("题材异动热度", rendered)
         self.assertIn("数据质量", rendered)
@@ -740,6 +808,55 @@ class TestFeishuSender(unittest.TestCase):
         self.assertIn("技术止损/计仓风险 **3.3333%**", rendered)
         self.assertIn("1 ADR 压力 4.0%（不参与计仓）", rendered)
         self.assertIn("http://192.168.1.8:8000/screening?runId=run-1", rendered)
+        self.assertIn(
+            "screening_daily_sectors",
+            {table.get("element_id") for table in tables},
+        )
+        self.assertIn(
+            "screening_daily_concepts",
+            {table.get("element_id") for table in tables},
+        )
+
+    def test_screening_card_hides_stale_theme_rows_and_shows_cache_time(self):
+        card = FeishuSender._build_screening_card_body(
+            {
+                "strategy": "martin_momentum_pullback",
+                "market": "cn",
+                "analysis_date": "2026-10-19",
+                "candidates": [],
+                "theme_overview": {
+                    "status": "stale",
+                    "provider": "dsa_eastmoney_board_change",
+                    "cache_used": True,
+                    "fallback_used": True,
+                    "data_as_of": "2026-10-19 08:30",
+                    "freshness_reason": "回退缓存早于分析日收盘",
+                    "themes": [{
+                        "name": "燃料电池",
+                        "heat_score": 58.99,
+                        "change_pct": 6.55,
+                        "stage": "快速拉升",
+                        "leaders": ["亿华通-U"],
+                    }],
+                },
+            },
+            "",
+        )
+
+        rendered = "\n".join(
+            item.get("content", "")
+            for item in card["body"]["elements"]
+            if isinstance(item, dict)
+        )
+        table_ids = {
+            item.get("element_id")
+            for item in card["body"]["elements"]
+            if item.get("tag") == "table"
+        }
+        self.assertIn("状态 **过期缓存**", rendered)
+        self.assertIn("缓存时间 2026-10-19 08:30", rendered)
+        self.assertIn("旧榜单已隐藏", rendered)
+        self.assertNotIn("screening_themes", table_ids)
 
     def test_screening_card_marks_market_blocked_plan_as_no_order(self):
         card = FeishuSender._build_screening_card_body(

@@ -17,6 +17,7 @@ const pricedPosition: PortfolioPositionItem = {
   market: 'hk',
   currency: 'HKD',
   quantity: 100,
+  sellableQuantity: 100,
   avgCost: 300,
   totalCost: 30000,
   lastPrice: 321.12345,

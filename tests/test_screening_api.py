@@ -2403,7 +2403,12 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             ) as screen_mock,
         ):
             payload = screening_endpoint.screening_start_screen_task(
-                screening_endpoint.ScreeningScreenRequest(market="cn", strategy="martin_momentum_pullback", max_results=3),
+                screening_endpoint.ScreeningScreenRequest(
+                    market="cn",
+                    strategy="martin_momentum_pullback",
+                    max_results=3,
+                    account_id=7,
+                ),
                 http_request=self._request(),
                 config=config,
             )
@@ -2412,12 +2417,14 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
 
         self.assertEqual(payload.task_id, "screen-task-1")
         self.assertEqual(payload.max_results, 3)
+        self.assertEqual(payload.account_id, 7)
         fake_queue.submit_background_task.assert_called_once()
         self.assertEqual(fake_queue.submit_background_task.call_args.kwargs["report_type"], "screening_screen")
         screen_mock.assert_called_once_with(
             strategy="martin_momentum_pullback",
             market="cn",
             max_results=3,
+            account_id=7,
             selection_seed="",
             progress_callback=ANY,
         )
@@ -2518,6 +2525,11 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
                 "local_heat_status": "available",
                 "top_sectors": [{"industry": "通信设备", "local_heat_score": 88.0}],
             },
+            "board_heat_overview": {
+                "status": "available",
+                "trading_date": "2026-10-16",
+                "industry": [{"name": "铁路运输业", "score": 85.3}],
+            },
             "warnings": ["外部热度不可用"],
         }
         hotspot_payload = {
@@ -2564,9 +2576,48 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
         self.assertEqual(payload["strategy_version"], "3.3")
         self.assertEqual(payload["analysis_date"], "2026-10-16")
         self.assertEqual(payload["sector_overview"]["top_sectors"][0]["industry"], "通信设备")
+        self.assertEqual(
+            payload["board_heat_overview"]["industry"][0]["name"],
+            "铁路运输业",
+        )
         self.assertEqual(payload["theme_overview"]["themes"][0]["name"], "光通信")
         self.assertEqual(payload["data_diagnostics"]["daily_enrich_count"], 120)
         self.assertEqual(payload["data_diagnostics"]["warning_count"], 1)
+
+    def test_theme_overview_marks_preclose_fallback_cache_stale(self) -> None:
+        config = self._config(enabled=True)
+        hotspot_payload = {
+            "provider": "free",
+            "provider_used": "dsa_eastmoney_board_change",
+            "cached_at": "2026-10-19T00:30:29Z",
+            "cache_used": True,
+            "fallback_used": True,
+            "stale": False,
+            "hotspots": [{
+                "topic": "燃料电池",
+                "name": "燃料电池",
+                "heat_score": 58.99,
+                "change_pct": 6.55,
+                "stage": "快速拉升",
+                "leaders": ["亿华通-U"],
+            }],
+            "source_errors": ["live refresh failed"],
+        }
+
+        with patch.object(
+            screening_endpoint.ScreeningService,
+            "hotspots",
+            return_value=hotspot_payload,
+        ):
+            overview = screening_endpoint._screening_theme_overview(
+                config,
+                analysis_date="2026-10-19",
+            )
+
+        self.assertEqual(overview["status"], "stale")
+        self.assertTrue(overview["stale"])
+        self.assertEqual(overview["data_as_of"], "2026-10-19 08:30")
+        self.assertEqual(overview["freshness_reason"], "回退缓存早于分析日收盘")
 
     def test_screening_detail_url_rejects_credentials_and_keeps_app_path(self) -> None:
         self.assertEqual(

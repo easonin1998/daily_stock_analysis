@@ -23,6 +23,7 @@ from src.storage import (
     PortfolioFxRate,
     PortfolioPosition,
     PortfolioPositionLot,
+    PortfolioStrategyPosition,
     PortfolioTrade,
     StockDaily,
 )
@@ -172,6 +173,11 @@ class PortfolioRepository:
         price: float,
         fee: float,
         tax: float,
+        strategy: Optional[str] = None,
+        strategy_version: Optional[str] = None,
+        signal_run_id: Optional[str] = None,
+        strategy_action: Optional[str] = None,
+        initial_stop_price: Optional[float] = None,
         note: Optional[str] = None,
         dedup_hash: Optional[str] = None,
     ) -> PortfolioTrade:
@@ -189,6 +195,11 @@ class PortfolioRepository:
                 price=price,
                 fee=fee,
                 tax=tax,
+                strategy=strategy,
+                strategy_version=strategy_version,
+                signal_run_id=signal_run_id,
+                strategy_action=strategy_action,
+                initial_stop_price=initial_stop_price,
                 note=note,
                 dedup_hash=dedup_hash,
             )
@@ -316,6 +327,11 @@ class PortfolioRepository:
         price: float,
         fee: float,
         tax: float,
+        strategy: Optional[str] = None,
+        strategy_version: Optional[str] = None,
+        signal_run_id: Optional[str] = None,
+        strategy_action: Optional[str] = None,
+        initial_stop_price: Optional[float] = None,
         note: Optional[str] = None,
         dedup_hash: Optional[str] = None,
     ) -> PortfolioTrade:
@@ -331,6 +347,11 @@ class PortfolioRepository:
             price=price,
             fee=fee,
             tax=tax,
+            strategy=strategy,
+            strategy_version=strategy_version,
+            signal_run_id=signal_run_id,
+            strategy_action=strategy_action,
+            initial_stop_price=initial_stop_price,
             note=note,
             dedup_hash=dedup_hash,
         )
@@ -705,6 +726,116 @@ class PortfolioRepository:
             return list(rows), total
 
     # ------------------------------------------------------------------
+    # Strategy position state
+    # ------------------------------------------------------------------
+    def get_strategy_position(
+        self,
+        *,
+        account_id: int,
+        symbol: str,
+        market: str,
+        strategy: str,
+    ) -> Optional[PortfolioStrategyPosition]:
+        with self.db.get_session() as session:
+            return session.execute(
+                select(PortfolioStrategyPosition).where(
+                    and_(
+                        PortfolioStrategyPosition.account_id == account_id,
+                        PortfolioStrategyPosition.symbol == symbol,
+                        PortfolioStrategyPosition.market == market,
+                        PortfolioStrategyPosition.strategy == strategy,
+                    )
+                ).limit(1)
+            ).scalar_one_or_none()
+
+    def list_strategy_positions(
+        self,
+        *,
+        account_id: int,
+        strategy: Optional[str] = None,
+    ) -> List[PortfolioStrategyPosition]:
+        with self.db.get_session() as session:
+            query = select(PortfolioStrategyPosition).where(
+                PortfolioStrategyPosition.account_id == account_id
+            )
+            if strategy:
+                query = query.where(PortfolioStrategyPosition.strategy == strategy)
+            rows = session.execute(
+                query.order_by(
+                    PortfolioStrategyPosition.status.asc(),
+                    PortfolioStrategyPosition.symbol.asc(),
+                )
+            ).scalars().all()
+            return list(rows)
+
+    def upsert_strategy_position(
+        self,
+        *,
+        account_id: int,
+        symbol: str,
+        market: str,
+        currency: str,
+        strategy: str,
+        values: Dict[str, Any],
+    ) -> PortfolioStrategyPosition:
+        with self.db.get_session() as session:
+            row = session.execute(
+                select(PortfolioStrategyPosition).where(
+                    and_(
+                        PortfolioStrategyPosition.account_id == account_id,
+                        PortfolioStrategyPosition.symbol == symbol,
+                        PortfolioStrategyPosition.market == market,
+                        PortfolioStrategyPosition.strategy == strategy,
+                    )
+                ).limit(1)
+            ).scalar_one_or_none()
+            if row is None:
+                row = PortfolioStrategyPosition(
+                    account_id=account_id,
+                    symbol=symbol,
+                    market=market,
+                    currency=currency,
+                    strategy=strategy,
+                )
+                session.add(row)
+            for key, value in values.items():
+                if not hasattr(row, key):
+                    raise ValueError(f"Unsupported portfolio strategy state field: {key}")
+                setattr(row, key, value)
+            row.updated_at = datetime.now()
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def delete_strategy_position(
+        self,
+        *,
+        account_id: int,
+        symbol: str,
+        market: str,
+        strategy: Optional[str] = None,
+    ) -> int:
+        with self.db.get_session() as session:
+            conditions = [
+                PortfolioStrategyPosition.account_id == account_id,
+                PortfolioStrategyPosition.symbol == symbol,
+                PortfolioStrategyPosition.market == market,
+            ]
+            if strategy:
+                conditions.append(PortfolioStrategyPosition.strategy == strategy)
+            result = session.execute(
+                delete(PortfolioStrategyPosition).where(and_(*conditions))
+            )
+            session.commit()
+            return int(result.rowcount or 0)
+
+    def get_trade(self, trade_id: int) -> Optional[PortfolioTrade]:
+        with self.db.get_session() as session:
+            return session.execute(
+                select(PortfolioTrade).where(PortfolioTrade.id == trade_id).limit(1)
+            ).scalar_one_or_none()
+
+    # ------------------------------------------------------------------
     # Price / FX
     # ------------------------------------------------------------------
     def get_latest_close(self, symbol: str, as_of: date) -> Optional[float]:
@@ -727,6 +858,32 @@ class PortfolioRepository:
             if row is None or row.close is None:
                 return None
             return float(row.close), row.date
+
+    def get_daily_history(
+        self,
+        *,
+        symbols: List[str],
+        as_of: date,
+        limit: int = 260,
+    ) -> List[StockDaily]:
+        """Return one symbol's latest stored daily bars in chronological order."""
+
+        normalized = [value for value in symbols if value]
+        if not normalized:
+            return []
+        with self.db.get_session() as session:
+            rows = session.execute(
+                select(StockDaily)
+                .where(
+                    and_(
+                        StockDaily.code.in_(normalized),
+                        StockDaily.date <= as_of,
+                    )
+                )
+                .order_by(StockDaily.date.desc())
+                .limit(max(1, int(limit)))
+            ).scalars().all()
+            return list(reversed(rows))
 
     def save_fx_rate(
         self,
